@@ -1,0 +1,13 @@
+python pmc15_caption_20k_builder.py \
+  --input /_results/data/pubmed_parsed_data.json \
+  --output /_results/data/pmc15_caption_20k_pubmedbert.csv \
+  --model-dir /home/b/lokalen/BiomedBERT-base-uncased-abstract-fulltext
+
+python pmc15_caption_20k_builder_randomized_pubmedbert_cpu.py \
+  --input /data/pmc15_captions.parquet \
+  --output /data/pmc15_caption_20k_pubmedbert.csv \
+  --sample-size 20000 \
+  --caption-column caption \
+  --id-column pmcid \
+  --image-column image_path \
+  --model-dir /models/BiomedBERT-base-uncased-abstract-fulltext
