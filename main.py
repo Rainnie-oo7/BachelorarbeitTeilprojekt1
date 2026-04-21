@@ -9,44 +9,66 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
+import matplotlib.pyplot as plt
 from transformers import AutoModel, AutoTokenizer
 
 
 # ============================================================
-# Default prototype texts for BERT fallback
+# Pfade relativ zu main.py
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+DEFAULT_INPUT = (
+    BASE_DIR
+    / "BiomedCLIP_data_pipeline"
+    / "_results"
+    / "data"
+    / "pubmed_open_access_file_list.txt"
+)
+
+DEFAULT_OUTPUT_DIR = BASE_DIR / "sampling_outputs"
+
+
+# ============================================================
+# Prototype texts for BERT fallback
 # ============================================================
 
 DEFAULT_MODALITY_PROTOTYPES: Dict[str, List[str]] = {
     "ct": [
         "computed tomography ct axial coronal sagittal contrast scan",
-        "ct image showing anatomy lesion or organ cross section",
+        "ct image showing anatomy lesion organ cross section",
     ],
     "mri": [
         "magnetic resonance imaging mri t1 t2 flair diffusion gadolinium",
-        "mri image of brain spine joint body soft tissue",
+        "mri image of brain spine body soft tissue joint",
     ],
     "xray": [
         "x ray radiograph chest xray plain film projection ap pa lateral",
-        "radiographic image showing bones lungs chest abdomen or extremities",
+        "radiographic image showing bones lungs chest abdomen extremities",
     ],
     "ultrasound": [
         "ultrasound sonography ultrasonography doppler echography echocardiography",
-        "ultrasound image showing soft tissue vessels fetus or abdominal organs",
+        "ultrasound image showing soft tissue vessels fetus abdominal organs",
     ],
 }
 
 DEFAULT_MR_SUBCLASS_PROTOTYPES: Dict[str, List[str]] = {
     "mr_t1": [
         "mri t1 weighted image t1w pre contrast post contrast gadolinium",
-        "t1 weighted magnetic resonance imaging showing anatomy",
+        "t1 weighted magnetic resonance imaging anatomy",
     ],
     "mr_t2": [
         "mri t2 weighted image t2w fluid bright signal",
-        "t2 weighted magnetic resonance imaging showing edema or fluid",
+        "t2 weighted magnetic resonance imaging edema fluid",
     ],
     "mr_flair": [
         "mri flair fluid attenuated inversion recovery brain lesion",
-        "flair magnetic resonance imaging of brain white matter lesion",
+        "flair magnetic resonance imaging white matter lesion",
+    ],
+    "mr_dwi": [
+        "mri diffusion weighted imaging dwi adc restricted diffusion",
+        "diffusion weighted magnetic resonance imaging acute lesion",
     ],
     "mr_other": [
         "mri magnetic resonance imaging unspecified sequence anatomy pathology",
@@ -56,7 +78,7 @@ DEFAULT_MR_SUBCLASS_PROTOTYPES: Dict[str, List[str]] = {
 
 
 # ============================================================
-# Rule sets
+# Rules
 # ============================================================
 
 RULES_MODALITY = {
@@ -70,20 +92,15 @@ RULES_MODALITY = {
         r"\bdoppler\b",
         r"\bcolor doppler\b",
         r"\bduplex\b",
-        r"\btransabdominal ultrasound\b",
-        r"\btransvaginal ultrasound\b",
-        r"\bus\b",
     ],
     "xray": [
         r"\bx[- ]?ray\b",
         r"\bradiograph\w*\b",
         r"\bplain film\b",
-        r"\bchest film\b",
         r"\bprojection radiograph\w*\b",
         r"\bap view\b",
         r"\bpa view\b",
         r"\blateral view\b",
-        r"\bportable chest\b",
         r"\broentgen\b",
         r"\bröntgen\b",
         r"\bfluoroscopy\b",
@@ -95,10 +112,10 @@ RULES_MODALITY = {
         r"\bcomputed tomography\b",
         r"\bhrct\b",
         r"\bmdct\b",
+        r"\bcontrast[- ]enhanced ct\b",
         r"\baxial ct\b",
         r"\bcoronal ct\b",
         r"\bsagittal ct\b",
-        r"\bcontrast[- ]enhanced ct\b",
     ],
     "mri": [
         r"\bmri\b",
@@ -111,8 +128,6 @@ RULES_MODALITY = {
         r"\bdwi\b",
         r"\badc\b",
         r"\bgadolinium\b",
-        r"\bpostcontrast\b",
-        r"\bprecontrast\b",
         r"\binversion recovery\b",
     ],
 }
@@ -122,11 +137,9 @@ RULES_MR_SUBCLASS = {
         r"\bt1\b",
         r"\bt1[- ]weighted\b",
         r"\bt1w\b",
-        r"\bpostcontrast t1\b",
-        r"\bprecontrast t1\b",
         r"\bgadolinium\b",
-        r"\bspoiled gradient echo\b",
-        r"\b3d t1\b",
+        r"\bpostcontrast\b",
+        r"\bprecontrast\b",
     ],
     "mr_t2": [
         r"\bt2\b",
@@ -139,6 +152,12 @@ RULES_MR_SUBCLASS = {
         r"\bflair\b",
         r"\bfluid attenuated inversion recovery\b",
     ],
+    "mr_dwi": [
+        r"\bdwi\b",
+        r"\bdiffusion[- ]weighted\b",
+        r"\badc\b",
+        r"\brestricted diffusion\b",
+    ],
 }
 
 
@@ -148,15 +167,15 @@ RULES_MR_SUBCLASS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Deterministic nested PMC subset selection with Rules -> CNN -> BERT."
+        description="Deterministic nested subset selection with Rules -> BERT and distribution analysis."
     )
 
-    parser.add_argument("--input", required=True, help="Pfad zur .txt-Datei mit Bildname und Caption")
-    parser.add_argument("--output-dir", required=True, help="Ausgabeordner")
+    parser.add_argument("--input", default=str(DEFAULT_INPUT), help="Pfad zur TXT/CSV/JSONL-Datei")
+    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Ausgabeordner")
     parser.add_argument("--model-dir", required=True, help="Lokaler BERT-Modellordner")
-    parser.add_argument("--cnn-preds", default=None, help="Optionale CSV/Parquet/TXT mit CNN-Vorhersagen")
+
     parser.add_argument("--txt-sep", default="\t", help=r"Separator der TXT-Datei, Standard: \t")
-    parser.add_argument("--txt-has-header", action="store_true", help="Falls TXT eine Kopfzeile hat")
+    parser.add_argument("--txt-has-header", action="store_true")
     parser.add_argument("--image-column", default="image_path")
     parser.add_argument("--caption-column", default="caption")
 
@@ -194,14 +213,13 @@ def parse_txt_line(line: str, sep: str) -> Tuple[str, str]:
     if len(parts) != 2:
         raise ValueError(
             f"Zeile konnte nicht in Bildname + Caption getrennt werden. "
-            f"Erwarteter Separator={repr(sep)}. Zeile: {line[:200]}"
+            f"Separator={repr(sep)}. Zeile: {line[:200]}"
         )
-    image_path, caption = parts[0].strip(), parts[1].strip()
-    return image_path, caption
+    return parts[0].strip(), parts[1].strip()
 
 
 def load_txt_pairs(path: Path, sep: str, has_header: bool, image_column: str, caption_column: str) -> pd.DataFrame:
-    rows: List[dict] = []
+    rows = []
 
     with path.open("r", encoding="utf8") as f:
         for i, line in enumerate(f):
@@ -209,16 +227,15 @@ def load_txt_pairs(path: Path, sep: str, has_header: bool, image_column: str, ca
                 continue
             if i == 0 and has_header:
                 continue
+
             image_path, caption = parse_txt_line(line, sep=sep)
-            rows.append(
-                {
-                    image_column: image_path,
-                    caption_column: caption,
-                }
-            )
+            rows.append({
+                image_column: image_path,
+                caption_column: caption,
+            })
 
     if not rows:
-        raise ValueError("Keine Zeilen in der TXT-Datei gefunden.")
+        raise ValueError("Keine Zeilen gefunden.")
 
     return pd.DataFrame(rows)
 
@@ -248,11 +265,7 @@ def load_microsoft_pipeline_json(path: Path) -> pd.DataFrame:
             if not line:
                 continue
 
-            try:
-                article = json.loads(line)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Fehler beim JSON-Parsen in Zeile {line_no}: {e}") from e
-
+            article = json.loads(line)
             pmcid = str(article.get("pmc", "") or article.get("pmcid", ""))
             pmid = str(article.get("pmid", ""))
             location = str(article.get("location", ""))
@@ -263,18 +276,16 @@ def load_microsoft_pipeline_json(path: Path) -> pd.DataFrame:
                 if not caption:
                     continue
 
-                rows.append(
-                    {
-                        "pmcid": pmcid,
-                        "pmid": pmid,
-                        "location": location,
-                        "image_path": str(fig.get("graphic_ref", "") or ""),
-                        "fig_id": str(fig.get("fig_id", "") or ""),
-                        "fig_label": str(fig.get("fig_label", "") or ""),
-                        "pair_id": str(fig.get("pair_id", "") or ""),
-                        "caption": caption,
-                    }
-                )
+                rows.append({
+                    "pmcid": pmcid,
+                    "pmid": pmid,
+                    "location": location,
+                    "image_path": str(fig.get("graphic_ref", "") or ""),
+                    "fig_id": str(fig.get("fig_id", "") or ""),
+                    "fig_label": str(fig.get("fig_label", "") or ""),
+                    "pair_id": str(fig.get("pair_id", "") or ""),
+                    "caption": caption,
+                })
 
     if not rows:
         raise ValueError("Keine Figure-Captions gefunden.")
@@ -282,27 +293,8 @@ def load_microsoft_pipeline_json(path: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def load_cnn_predictions(path_str: Optional[str]) -> Optional[pd.DataFrame]:
-    if not path_str:
-        return None
-
-    path = Path(path_str)
-    suffix = path.suffix.lower()
-
-    if suffix == ".csv":
-        df = pd.read_csv(path)
-    elif suffix == ".parquet":
-        df = pd.read_parquet(path)
-    elif suffix == ".txt":
-        df = pd.read_csv(path, sep="\t")
-    else:
-        raise ValueError(f"Nicht unterstütztes CNN-Pred-Format: {path}")
-
-    return df
-
-
 # ============================================================
-# Text helpers
+# Helpers
 # ============================================================
 
 def clean_caption(text: str) -> str:
@@ -312,21 +304,24 @@ def clean_caption(text: str) -> str:
 
 
 def make_sample_id(image_path: str, caption: str) -> str:
-    base = f"{image_path}|||{caption}"
-    return hashlib.sha1(base.encode("utf8")).hexdigest()
+    return hashlib.sha1(f"{image_path}|||{caption}".encode("utf8")).hexdigest()
 
 
 def stable_hash_u64(text: str) -> int:
     digest = hashlib.blake2b(text.encode("utf8"), digest_size=8).digest()
-    return int.from_bytes(digest, byteorder="big", signed=False)
+    return int.from_bytes(digest, "big", signed=False)
 
 
 def hash_score(sample_id: str, salt: str) -> int:
     return stable_hash_u64(f"{salt}::{sample_id}")
 
 
+def regex_any(text: str, patterns: List[str]) -> bool:
+    return any(re.search(p, text, flags=re.IGNORECASE) for p in patterns)
+
+
 # ============================================================
-# Embeddings / BERT
+# BERT
 # ============================================================
 
 def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -345,7 +340,7 @@ def encode_texts(
     batch_size: int,
     max_length: int,
 ) -> np.ndarray:
-    vectors: List[np.ndarray] = []
+    vectors = []
     model.eval()
 
     for start in range(0, len(texts), batch_size):
@@ -372,9 +367,9 @@ def build_prototype_embeddings(
     batch_size: int,
     max_length: int,
 ) -> Dict[str, np.ndarray]:
-    result: Dict[str, np.ndarray] = {}
+    result = {}
     for label, texts in prototypes.items():
-        embs = encode_texts(texts, tokenizer, model, batch_size=batch_size, max_length=max_length)
+        embs = encode_texts(texts, tokenizer, model, batch_size, max_length)
         proto = embs.mean(axis=0)
         proto = proto / np.linalg.norm(proto)
         result[label] = proto
@@ -385,7 +380,7 @@ def score_against_prototypes(
     text_embeddings: np.ndarray,
     prototype_embeddings: Dict[str, np.ndarray],
 ) -> pd.DataFrame:
-    score_dict: Dict[str, np.ndarray] = {}
+    score_dict = {}
     for label, proto in prototype_embeddings.items():
         score_dict[label] = text_embeddings @ proto
 
@@ -410,19 +405,14 @@ def score_against_prototypes(
 # Rules
 # ============================================================
 
-def regex_any(text: str, patterns: List[str]) -> bool:
-    return any(re.search(p, text, flags=re.IGNORECASE) for p in patterns)
-
-
 def rule_based_modality(caption: str) -> Optional[str]:
     caption = caption.lower()
-
     matches = []
+
     for label, patterns in RULES_MODALITY.items():
         if regex_any(caption, patterns):
             matches.append(label)
 
-    # harte Priorität bei expliziten Einzelfällen
     if "mri" in matches:
         return "mri"
     if "ct" in matches:
@@ -446,54 +436,8 @@ def rule_based_mr_subclass(caption: str) -> Optional[str]:
 
 
 # ============================================================
-# Classification orchestration: Rules -> CNN -> BERT
+# Classification: Rules -> BERT
 # ============================================================
-
-def merge_cnn_predictions(
-    df: pd.DataFrame,
-    cnn_df: Optional[pd.DataFrame],
-    image_column: str,
-) -> pd.DataFrame:
-    df = df.copy()
-
-    df["cnn_modality"] = None
-    df["cnn_mr_subclass"] = None
-    df["cnn_confidence"] = np.nan
-
-    if cnn_df is None:
-        return df
-
-    cnn_df = cnn_df.copy()
-
-    # Erwartete Mindestspalte:
-    # entweder sample_id oder image_path
-    if "sample_id" in cnn_df.columns:
-        df = df.merge(
-            cnn_df[["sample_id"] + [c for c in ["cnn_modality", "cnn_mr_subclass", "cnn_confidence"] if c in cnn_df.columns]],
-            on="sample_id",
-            how="left",
-            suffixes=("", "_y"),
-        )
-    elif image_column in cnn_df.columns:
-        df = df.merge(
-            cnn_df[[image_column] + [c for c in ["cnn_modality", "cnn_mr_subclass", "cnn_confidence"] if c in cnn_df.columns]],
-            on=image_column,
-            how="left",
-            suffixes=("", "_y"),
-        )
-    else:
-        raise ValueError(
-            "CNN-Pred-Datei braucht entweder 'sample_id' oder die gleiche Bildspalte wie --image-column."
-        )
-
-    for col in ["cnn_modality", "cnn_mr_subclass", "cnn_confidence"]:
-        alt = f"{col}_y"
-        if alt in df.columns:
-            df[col] = df[alt]
-            df = df.drop(columns=[alt])
-
-    return df
-
 
 def classify_modalities_and_mr_subclasses(
     df: pd.DataFrame,
@@ -506,11 +450,9 @@ def classify_modalities_and_mr_subclasses(
 ) -> pd.DataFrame:
     df = df.copy()
 
-    # Rules
     df["rule_modality"] = df[caption_column].map(rule_based_modality)
     df["rule_mr_subclass"] = df[caption_column].map(rule_based_mr_subclass)
 
-    # BERT fallback nur für Zeilen ohne Regelentscheidung
     need_bert_mod = df["rule_modality"].isna()
     need_bert_mr = (df["rule_modality"] == "mri") & df["rule_mr_subclass"].isna()
 
@@ -522,22 +464,15 @@ def classify_modalities_and_mr_subclasses(
     df["bert_mr_score"] = np.nan
     df["bert_mr_margin"] = np.nan
 
+    modality_proto_embs = None
+    mr_proto_embs = None
+
     if need_bert_mod.any():
         texts = df.loc[need_bert_mod, caption_column].tolist()
-        text_embs = encode_texts(
-            texts,
-            tokenizer=tokenizer,
-            model=model,
-            batch_size=batch_size,
-            max_length=max_length,
-        )
+        text_embs = encode_texts(texts, tokenizer, model, batch_size, max_length)
 
         modality_proto_embs = build_prototype_embeddings(
-            DEFAULT_MODALITY_PROTOTYPES,
-            tokenizer=tokenizer,
-            model=model,
-            batch_size=batch_size,
-            max_length=max_length,
+            DEFAULT_MODALITY_PROTOTYPES, tokenizer, model, batch_size, max_length
         )
 
         scored = score_against_prototypes(text_embs, modality_proto_embs)
@@ -549,20 +484,10 @@ def classify_modalities_and_mr_subclasses(
 
     if need_bert_mr.any():
         texts = df.loc[need_bert_mr, caption_column].tolist()
-        text_embs = encode_texts(
-            texts,
-            tokenizer=tokenizer,
-            model=model,
-            batch_size=batch_size,
-            max_length=max_length,
-        )
+        text_embs = encode_texts(texts, tokenizer, model, batch_size, max_length)
 
         mr_proto_embs = build_prototype_embeddings(
-            DEFAULT_MR_SUBCLASS_PROTOTYPES,
-            tokenizer=tokenizer,
-            model=model,
-            batch_size=batch_size,
-            max_length=max_length,
+            DEFAULT_MR_SUBCLASS_PROTOTYPES, tokenizer, model, batch_size, max_length
         )
 
         scored = score_against_prototypes(text_embs, mr_proto_embs)
@@ -572,7 +497,6 @@ def classify_modalities_and_mr_subclasses(
         df.loc[idx, "bert_mr_score"] = scored["top_score"].values
         df.loc[idx, "bert_mr_margin"] = scored["score_margin"].values
 
-    # finale Modality
     final_modality = []
     decision_source_modality = []
 
@@ -580,9 +504,6 @@ def classify_modalities_and_mr_subclasses(
         if pd.notna(row["rule_modality"]):
             final_modality.append(row["rule_modality"])
             decision_source_modality.append("rule")
-        elif pd.notna(row.get("cnn_modality", None)):
-            final_modality.append(row["cnn_modality"])
-            decision_source_modality.append("cnn")
         elif pd.notna(row["bert_modality"]) and float(row["bert_modality_margin"]) >= bert_margin_threshold:
             final_modality.append(row["bert_modality"])
             decision_source_modality.append("bert_fallback")
@@ -593,7 +514,6 @@ def classify_modalities_and_mr_subclasses(
     df["final_modality"] = final_modality
     df["decision_source_modality"] = decision_source_modality
 
-    # finale MR-Unterklasse
     final_mr_subclass = []
     decision_source_mr = []
 
@@ -606,9 +526,6 @@ def classify_modalities_and_mr_subclasses(
         if pd.notna(row["rule_mr_subclass"]):
             final_mr_subclass.append(row["rule_mr_subclass"])
             decision_source_mr.append("rule")
-        elif pd.notna(row.get("cnn_mr_subclass", None)):
-            final_mr_subclass.append(row["cnn_mr_subclass"])
-            decision_source_mr.append("cnn")
         elif pd.notna(row["bert_mr_subclass"]) and float(row["bert_mr_margin"]) >= bert_margin_threshold:
             final_mr_subclass.append(row["bert_mr_subclass"])
             decision_source_mr.append("bert_fallback")
@@ -623,10 +540,16 @@ def classify_modalities_and_mr_subclasses(
 
 
 # ============================================================
-# Deterministic master selection
+# Master subset
 # ============================================================
 
-def build_master_subset(df: pd.DataFrame, master_pool_size: int, subset_large_size: int, subset_small_size: int, salt_master: str) -> pd.DataFrame:
+def build_master_subset(
+    df: pd.DataFrame,
+    master_pool_size: int,
+    subset_large_size: int,
+    subset_small_size: int,
+    salt_master: str,
+) -> pd.DataFrame:
     df = df.copy()
     df["master_score"] = df["sample_id"].map(lambda s: hash_score(s, salt_master))
     df = df.sort_values("master_score", kind="mergesort").reset_index(drop=True)
@@ -640,7 +563,6 @@ def build_master_subset(df: pd.DataFrame, master_pool_size: int, subset_large_si
 
     df["is_in_large_subset"] = df["master_rank"] < min(subset_large_size, len(df))
     df["is_in_small_subset"] = df["master_rank"] < min(subset_small_size, len(df))
-
     return df
 
 
@@ -649,11 +571,6 @@ def build_master_subset(df: pd.DataFrame, master_pool_size: int, subset_large_si
 # ============================================================
 
 def assign_bins_by_rank(df: pd.DataFrame, rank_col: str, subset_size: int, n_bins: int) -> pd.Series:
-    if subset_size <= 0:
-        raise ValueError("subset_size muss > 0 sein.")
-    if n_bins <= 0:
-        raise ValueError("n_bins muss > 0 sein.")
-
     bin_size = math.ceil(subset_size / n_bins)
     bins = (df[rank_col] // bin_size).clip(upper=n_bins - 1)
     return bins.astype(int)
@@ -665,40 +582,34 @@ def distributed_take(
     bin_col: str,
     score_col: str,
 ) -> pd.DataFrame:
-    """
-    Deterministische, möglichst verteilte Auswahl.
-    Vorgehen:
-    1. innerhalb jedes Bins nach score sortieren
-    2. round-robin aus allen nicht-leeren Bins
-    """
     if len(df_candidates) == 0:
         return df_candidates.copy()
 
-    groups: Dict[int, pd.DataFrame] = {}
+    groups = {}
     for b, sub in df_candidates.groupby(bin_col, sort=True):
-        groups[int(b)] = sub.sort_values(score_col, kind="mergesort").reset_index(drop=True)
+        groups[int(b)] = sub.sort_values(score_col, kind="mergesort").copy().reset_index(drop=False)
 
     bin_ids = sorted(groups.keys())
     pointers = {b: 0 for b in bin_ids}
-    selected_idx = []
+    selected_original_indices = []
 
-    while len(selected_idx) < target_n:
+    while len(selected_original_indices) < target_n:
         progress = False
 
         for b in bin_ids:
             ptr = pointers[b]
             group = groups[b]
             if ptr < len(group):
-                selected_idx.append(group.index[ptr] if "orig_local_idx" not in group.columns else group.loc[ptr, "orig_local_idx"])
+                selected_original_indices.append(group.loc[ptr, "index"])
                 pointers[b] += 1
                 progress = True
-                if len(selected_idx) >= target_n:
+                if len(selected_original_indices) >= target_n:
                     break
 
         if not progress:
             break
 
-    return df_candidates.loc[selected_idx].copy()
+    return df_candidates.loc[selected_original_indices].copy()
 
 
 def select_class_members_distributed(
@@ -716,16 +627,10 @@ def select_class_members_distributed(
         return pool.copy(), pool.copy()
 
     pool["class_score"] = pool["sample_id"].map(lambda s: hash_score(s, f"{salt_class}::{modality}"))
-    pool["bin_id"] = assign_bins_by_rank(pool, rank_col=rank_col, subset_size=len(df_subset), n_bins=n_bins)
-
-    pool = pool.sort_values(["bin_id", "class_score"], kind="mergesort").copy()
-    pool["orig_local_idx"] = pool.index
+    pool["bin_id"] = assign_bins_by_rank(pool, rank_col, subset_size=len(df_subset), n_bins=n_bins)
 
     selected_large = distributed_take(
-        df_candidates=pool,
-        target_n=min(target_large, len(pool)),
-        bin_col="bin_id",
-        score_col="class_score",
+        pool, min(target_large, len(pool)), bin_col="bin_id", score_col="class_score"
     )
 
     selected_large = selected_large.sort_values("class_score", kind="mergesort").reset_index(drop=True)
@@ -755,16 +660,10 @@ def select_mr_subclass_members_distributed(
         return pool.copy(), pool.copy()
 
     pool["mr_score"] = pool["sample_id"].map(lambda s: hash_score(s, f"{salt_mr}::{subclass}"))
-    pool["bin_id"] = assign_bins_by_rank(pool, rank_col=rank_col, subset_size=len(df_subset), n_bins=n_bins)
-
-    pool = pool.sort_values(["bin_id", "mr_score"], kind="mergesort").copy()
-    pool["orig_local_idx"] = pool.index
+    pool["bin_id"] = assign_bins_by_rank(pool, rank_col, subset_size=len(df_subset), n_bins=n_bins)
 
     selected_large = distributed_take(
-        df_candidates=pool,
-        target_n=min(target_large, len(pool)),
-        bin_col="bin_id",
-        score_col="mr_score",
+        pool, min(target_large, len(pool)), bin_col="bin_id", score_col="mr_score"
     )
 
     selected_large = selected_large.sort_values("mr_score", kind="mergesort").reset_index(drop=True)
@@ -777,20 +676,103 @@ def select_mr_subclass_members_distributed(
 
 
 # ============================================================
+# Distribution analysis
+# ============================================================
+
+def compute_distribution_metrics(df_selected: pd.DataFrame, n_bins: int, subset_size: int, rank_col: str) -> pd.DataFrame:
+    if len(df_selected) == 0:
+        return pd.DataFrame(columns=["bin_id", "count", "fraction"])
+
+    tmp = df_selected.copy()
+    tmp["bin_id"] = assign_bins_by_rank(tmp, rank_col=rank_col, subset_size=subset_size, n_bins=n_bins)
+
+    counts = tmp["bin_id"].value_counts().sort_index()
+    all_bins = pd.Index(range(n_bins), name="bin_id")
+    counts = counts.reindex(all_bins, fill_value=0)
+
+    out = pd.DataFrame({
+        "bin_id": counts.index,
+        "count": counts.values,
+    })
+    out["fraction"] = out["count"] / max(len(df_selected), 1)
+    return out
+
+
+def summarize_distribution(bin_df: pd.DataFrame) -> pd.DataFrame:
+    counts = bin_df["count"].to_numpy(dtype=float)
+
+    if len(counts) == 0:
+        return pd.DataFrame([{
+            "n_bins": 0,
+            "total_selected": 0,
+            "mean_per_bin": np.nan,
+            "std_per_bin": np.nan,
+            "min_bin": np.nan,
+            "max_bin": np.nan,
+            "coef_var": np.nan,
+            "max_abs_dev_from_mean": np.nan,
+            "normalized_l1_to_uniform": np.nan,
+        }])
+
+    mean_val = counts.mean()
+    std_val = counts.std(ddof=0)
+    min_val = counts.min()
+    max_val = counts.max()
+    max_abs_dev = np.max(np.abs(counts - mean_val))
+
+    # normierte L1-Abweichung von idealer Gleichverteilung
+    probs = counts / counts.sum() if counts.sum() > 0 else np.zeros_like(counts)
+    uniform = np.full_like(probs, 1.0 / len(probs), dtype=float)
+    normalized_l1 = np.abs(probs - uniform).sum()
+
+    return pd.DataFrame([{
+        "n_bins": len(counts),
+        "total_selected": int(counts.sum()),
+        "mean_per_bin": mean_val,
+        "std_per_bin": std_val,
+        "min_bin": min_val,
+        "max_bin": max_val,
+        "coef_var": (std_val / mean_val) if mean_val > 0 else np.nan,
+        "max_abs_dev_from_mean": max_abs_dev,
+        "normalized_l1_to_uniform": normalized_l1,
+    }])
+
+
+def save_distribution_plot(bin_df: pd.DataFrame, out_path: Path, title: str) -> None:
+    plt.figure(figsize=(12, 4))
+    plt.bar(bin_df["bin_id"], bin_df["count"])
+    plt.xlabel("Bin")
+    plt.ylabel("Anzahl ausgewählter Samples")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+
+def save_class_pie_chart(df_subset: pd.DataFrame, out_path: Path, title: str) -> None:
+    counts = df_subset["final_modality"].fillna("unresolved").value_counts()
+
+    plt.figure(figsize=(6, 6))
+    plt.pie(counts.values, labels=counts.index, autopct="%1.1f%%")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+
+# ============================================================
 # Main
 # ============================================================
 
 def main() -> None:
     args = parse_args()
 
-    output_dir = Path(args.output_dir)
+    input_path = Path(args.input).expanduser().resolve()
+    output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --------------------------
-    # 1) Laden
-    # --------------------------
     df = load_table(
-        path_str=args.input,
+        path_str=str(input_path),
         sep=args.txt_sep,
         has_header=args.txt_has_header,
         image_column=args.image_column,
@@ -810,15 +792,11 @@ def main() -> None:
         make_sample_id(img, cap)
         for img, cap in zip(df[args.image_column], df[args.caption_column])
     ]
-
     df = df.drop_duplicates(subset=["sample_id"]).reset_index(drop=True)
 
     if len(df) == 0:
         raise ValueError("Nach Bereinigung sind keine Samples übrig geblieben.")
 
-    # --------------------------
-    # 2) Master-Subset bauen
-    # --------------------------
     df_master = build_master_subset(
         df=df,
         master_pool_size=args.master_pool_size,
@@ -828,24 +806,13 @@ def main() -> None:
     )
 
     df_large = df_master[df_master["is_in_large_subset"]].copy().reset_index(drop=True)
+    df_small = df_master[df_master["is_in_small_subset"]].copy().reset_index(drop=True)
 
-    # --------------------------
-    # 3) CNN-Predictions mergen
-    # --------------------------
-    cnn_df = load_cnn_predictions(args.cnn_preds)
-    df_large = merge_cnn_predictions(df_large, cnn_df=cnn_df, image_column=args.image_column)
-
-    # --------------------------
-    # 4) BERT initialisieren
-    # --------------------------
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, use_fast=True)
     model = AutoModel.from_pretrained(args.model_dir, local_files_only=True)
     model.to("cpu")
     model.eval()
 
-    # --------------------------
-    # 5) Klassifikation
-    # --------------------------
     df_large = classify_modalities_and_mr_subclasses(
         df=df_large,
         tokenizer=tokenizer,
@@ -856,23 +823,16 @@ def main() -> None:
         caption_column=args.caption_column,
     )
 
-    # small subset ist erste Teilmenge von large subset
-    df_large = df_large.sort_values("master_rank", kind="mergesort").reset_index(drop=True)
     df_small = df_large[df_large["master_rank"] < args.subset_small_size].copy().reset_index(drop=True)
 
-    # --------------------------
-    # 6) Basisausgaben
-    # --------------------------
     df_large.to_csv(output_dir / "subset_large_400k_scored.csv", index=False)
     df_small.to_csv(output_dir / "subset_small_200k_scored.csv", index=False)
 
-    # --------------------------
-    # 7) Klassenselektion: US/XR/CT/MRI
-    # large zuerst, small = prefix davon
-    # --------------------------
-    class_summaries = []
+    save_class_pie_chart(df_large, output_dir / "class_pie_large.png", "Klassenverteilung im 400k-Subset")
+    save_class_pie_chart(df_small, output_dir / "class_pie_small.png", "Klassenverteilung im 200k-Subset")
 
     modalities = ["ultrasound", "xray", "ct", "mri"]
+    class_summary_rows = []
 
     for modality in modalities:
         sel_large, sel_small = select_class_members_distributed(
@@ -888,19 +848,35 @@ def main() -> None:
         sel_large.to_csv(output_dir / f"{modality}_large_selected.csv", index=False)
         sel_small.to_csv(output_dir / f"{modality}_small_selected.csv", index=False)
 
-        class_summaries.append({
+        large_bin_df = compute_distribution_metrics(sel_large, args.bins_large, len(df_large), "master_rank")
+        small_bin_df = compute_distribution_metrics(sel_small, args.bins_large, len(df_large), "master_rank")
+
+        large_bin_df.to_csv(output_dir / f"{modality}_large_bin_distribution.csv", index=False)
+        small_bin_df.to_csv(output_dir / f"{modality}_small_bin_distribution.csv", index=False)
+
+        summarize_distribution(large_bin_df).to_csv(output_dir / f"{modality}_large_distribution_summary.csv", index=False)
+        summarize_distribution(small_bin_df).to_csv(output_dir / f"{modality}_small_distribution_summary.csv", index=False)
+
+        save_distribution_plot(
+            large_bin_df,
+            output_dir / f"{modality}_large_distribution.png",
+            f"{modality}: Verteilung der 40k-Auswahl über das 400k-Subset"
+        )
+        save_distribution_plot(
+            small_bin_df,
+            output_dir / f"{modality}_small_distribution.png",
+            f"{modality}: Verteilung der 20k-Auswahl über das 400k-Subset"
+        )
+
+        class_summary_rows.append({
             "label": modality,
             "available_in_large_subset": int((df_large["final_modality"] == modality).sum()),
             "selected_large": len(sel_large),
             "selected_small": len(sel_small),
         })
 
-    # --------------------------
-    # 8) MR-Unterklassen
-    # --------------------------
-    mr_subclasses = ["mr_t1", "mr_t2", "mr_flair", "mr_other"]
-
-    mr_summaries = []
+    mr_subclasses = ["mr_t1", "mr_t2", "mr_flair", "mr_dwi", "mr_other"]
+    mr_summary_rows = []
 
     for subclass in mr_subclasses:
         sel_large, sel_small = select_mr_subclass_members_distributed(
@@ -916,7 +892,27 @@ def main() -> None:
         sel_large.to_csv(output_dir / f"{subclass}_large_selected.csv", index=False)
         sel_small.to_csv(output_dir / f"{subclass}_small_selected.csv", index=False)
 
-        mr_summaries.append({
+        large_bin_df = compute_distribution_metrics(sel_large, args.bins_large, len(df_large), "master_rank")
+        small_bin_df = compute_distribution_metrics(sel_small, args.bins_large, len(df_large), "master_rank")
+
+        large_bin_df.to_csv(output_dir / f"{subclass}_large_bin_distribution.csv", index=False)
+        small_bin_df.to_csv(output_dir / f"{subclass}_small_bin_distribution.csv", index=False)
+
+        summarize_distribution(large_bin_df).to_csv(output_dir / f"{subclass}_large_distribution_summary.csv", index=False)
+        summarize_distribution(small_bin_df).to_csv(output_dir / f"{subclass}_small_distribution_summary.csv", index=False)
+
+        save_distribution_plot(
+            large_bin_df,
+            output_dir / f"{subclass}_large_distribution.png",
+            f"{subclass}: Verteilung der Auswahl über das 400k-Subset"
+        )
+        save_distribution_plot(
+            small_bin_df,
+            output_dir / f"{subclass}_small_distribution.png",
+            f"{subclass}: Verteilung der Auswahl über das 400k-Subset"
+        )
+
+        mr_summary_rows.append({
             "label": subclass,
             "available_in_large_subset": int(
                 ((df_large["final_modality"] == "mri") & (df_large["final_mr_subclass"] == subclass)).sum()
@@ -925,28 +921,16 @@ def main() -> None:
             "selected_small": len(sel_small),
         })
 
-    # --------------------------
-    # 9) Reports
-    # --------------------------
-    class_summary_df = pd.DataFrame(class_summaries)
-    mr_summary_df = pd.DataFrame(mr_summaries)
-
-    class_summary_df.to_csv(output_dir / "class_summary.csv", index=False)
-    mr_summary_df.to_csv(output_dir / "mr_subclass_summary.csv", index=False)
+    pd.DataFrame(class_summary_rows).to_csv(output_dir / "class_summary.csv", index=False)
+    pd.DataFrame(mr_summary_rows).to_csv(output_dir / "mr_subclass_summary.csv", index=False)
 
     print("\n===== Fertig =====")
-    print(f"Eingabe: {args.input}")
+    print(f"Eingabe: {input_path}")
     print(f"Gesamt geladen: {len(df)}")
     print(f"Master-Pool: {len(df_master)}")
     print(f"Large subset: {len(df_large)}")
     print(f"Small subset: {len(df_small)}")
     print(f"Ausgabeordner: {output_dir}")
-
-    print("\nKlassenübersicht:")
-    print(class_summary_df.to_string(index=False))
-
-    print("\nMR-Unterklassenübersicht:")
-    print(mr_summary_df.to_string(index=False))
 
 
 if __name__ == "__main__":

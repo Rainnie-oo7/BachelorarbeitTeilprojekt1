@@ -1,4 +1,3 @@
 BiomedCLIP_data_pipeline/
-alte/
 .idea/
 *.iml
