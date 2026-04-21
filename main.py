@@ -6,32 +6,25 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-import matplotlib.pyplot as plt
 from transformers import AutoModel, AutoTokenizer
 
 
 # ============================================================
-# Pfade relativ zu main.py
+# Projektpfade
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent
 
-DEFAULT_INPUT = (
-    BASE_DIR
-    / "BiomedCLIP_data_pipeline"
-    / "_results"
-    / "data"
-    / "pubmed_open_access_file_list.txt"
-)
-
-DEFAULT_OUTPUT_DIR = BASE_DIR / "sampling_outputs"
+DEFAULT_INPUT_JSONL = PROJECT_ROOT / "_results" / "data" / "pubmed_parsed_data.jsonl"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "sampling_outputs"
 
 
 # ============================================================
-# Prototype texts for BERT fallback
+# BERT-Prototypen
 # ============================================================
 
 DEFAULT_MODALITY_PROTOTYPES: Dict[str, List[str]] = {
@@ -92,6 +85,8 @@ RULES_MODALITY = {
         r"\bdoppler\b",
         r"\bcolor doppler\b",
         r"\bduplex\b",
+        r"\btransabdominal ultrasound\b",
+        r"\btransvaginal ultrasound\b",
     ],
     "xray": [
         r"\bx[- ]?ray\b",
@@ -138,8 +133,8 @@ RULES_MR_SUBCLASS = {
         r"\bt1[- ]weighted\b",
         r"\bt1w\b",
         r"\bgadolinium\b",
-        r"\bpostcontrast\b",
-        r"\bprecontrast\b",
+        r"\bpost[- ]?contrast\b",
+        r"\bpre[- ]?contrast\b",
     ],
     "mr_t2": [
         r"\bt2\b",
@@ -167,17 +162,12 @@ RULES_MR_SUBCLASS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Deterministic nested subset selection with Rules -> BERT and distribution analysis."
+        description="Deterministic nested sampling from PMC pipeline JSONL with Rules -> BERT."
     )
 
-    parser.add_argument("--input", default=str(DEFAULT_INPUT), help="Pfad zur TXT/CSV/JSONL-Datei")
+    parser.add_argument("--input", default=str(DEFAULT_INPUT_JSONL), help="Pfad zu pubmed_parsed_data.jsonl")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Ausgabeordner")
-    parser.add_argument("--model-dir", required=True, help="Lokaler BERT-Modellordner")
-
-    parser.add_argument("--txt-sep", default="\t", help=r"Separator der TXT-Datei, Standard: \t")
-    parser.add_argument("--txt-has-header", action="store_true")
-    parser.add_argument("--image-column", default="image_path")
-    parser.add_argument("--caption-column", default="caption")
+    parser.add_argument("--model-dir", required=True, help="Lokaler Modellordner, z. B. BiomedBERT")
 
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-length", type=int, default=64)
@@ -193,7 +183,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mr-small-per-subclass", type=int, default=4000)
     parser.add_argument("--mr-large-per-subclass", type=int, default=8000)
 
-    parser.add_argument("--bins-small", type=int, default=100)
     parser.add_argument("--bins-large", type=int, default=100)
 
     parser.add_argument("--salt-master", default="pmc15m_master_v1")
@@ -204,59 +193,10 @@ def parse_args() -> argparse.Namespace:
 
 
 # ============================================================
-# Loading
+# Laden / Flatten
 # ============================================================
 
-def parse_txt_line(line: str, sep: str) -> Tuple[str, str]:
-    line = line.rstrip("\n")
-    parts = line.split(sep, maxsplit=1)
-    if len(parts) != 2:
-        raise ValueError(
-            f"Zeile konnte nicht in Bildname + Caption getrennt werden. "
-            f"Separator={repr(sep)}. Zeile: {line[:200]}"
-        )
-    return parts[0].strip(), parts[1].strip()
-
-
-def load_txt_pairs(path: Path, sep: str, has_header: bool, image_column: str, caption_column: str) -> pd.DataFrame:
-    rows = []
-
-    with path.open("r", encoding="utf8") as f:
-        for i, line in enumerate(f):
-            if not line.strip():
-                continue
-            if i == 0 and has_header:
-                continue
-
-            image_path, caption = parse_txt_line(line, sep=sep)
-            rows.append({
-                image_column: image_path,
-                caption_column: caption,
-            })
-
-    if not rows:
-        raise ValueError("Keine Zeilen gefunden.")
-
-    return pd.DataFrame(rows)
-
-
-def load_table(path_str: str, sep: str, has_header: bool, image_column: str, caption_column: str) -> pd.DataFrame:
-    path = Path(path_str)
-    suffix = path.suffix.lower()
-
-    if suffix == ".txt":
-        return load_txt_pairs(path, sep=sep, has_header=has_header, image_column=image_column, caption_column=caption_column)
-    if suffix == ".csv":
-        return pd.read_csv(path)
-    if suffix == ".parquet":
-        return pd.read_parquet(path)
-    if suffix in {".json", ".jsonl"}:
-        return load_microsoft_pipeline_json(path)
-
-    raise ValueError(f"Nicht unterstütztes Format: {path}")
-
-
-def load_microsoft_pipeline_json(path: Path) -> pd.DataFrame:
+def load_pmc_pipeline_jsonl(path: Path) -> pd.DataFrame:
     rows: List[dict] = []
 
     with path.open("r", encoding="utf8") as f:
@@ -265,7 +205,11 @@ def load_microsoft_pipeline_json(path: Path) -> pd.DataFrame:
             if not line:
                 continue
 
-            article = json.loads(line)
+            try:
+                article = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"JSON-Fehler in Zeile {line_no}: {e}") from e
+
             pmcid = str(article.get("pmc", "") or article.get("pmcid", ""))
             pmid = str(article.get("pmid", ""))
             location = str(article.get("location", ""))
@@ -273,22 +217,26 @@ def load_microsoft_pipeline_json(path: Path) -> pd.DataFrame:
 
             for fig in figures:
                 caption = str(fig.get("fig_caption", "") or "").strip()
+                graphic_ref = str(fig.get("graphic_ref", "") or "").strip()
+
                 if not caption:
                     continue
 
-                rows.append({
-                    "pmcid": pmcid,
-                    "pmid": pmid,
-                    "location": location,
-                    "image_path": str(fig.get("graphic_ref", "") or ""),
-                    "fig_id": str(fig.get("fig_id", "") or ""),
-                    "fig_label": str(fig.get("fig_label", "") or ""),
-                    "pair_id": str(fig.get("pair_id", "") or ""),
-                    "caption": caption,
-                })
+                rows.append(
+                    {
+                        "pmcid": pmcid,
+                        "pmid": pmid,
+                        "location": location,
+                        "image_path": graphic_ref,
+                        "fig_id": str(fig.get("fig_id", "") or ""),
+                        "fig_label": str(fig.get("fig_label", "") or ""),
+                        "pair_id": str(fig.get("pair_id", "") or ""),
+                        "caption": caption,
+                    }
+                )
 
     if not rows:
-        raise ValueError("Keine Figure-Captions gefunden.")
+        raise ValueError("Keine Figure-Captions in pubmed_parsed_data.jsonl gefunden.")
 
     return pd.DataFrame(rows)
 
@@ -303,8 +251,9 @@ def clean_caption(text: str) -> str:
     return text.strip()
 
 
-def make_sample_id(image_path: str, caption: str) -> str:
-    return hashlib.sha1(f"{image_path}|||{caption}".encode("utf8")).hexdigest()
+def make_sample_id(image_path: str, caption: str, pair_id: str = "") -> str:
+    base = f"{pair_id}|||{image_path}|||{caption}"
+    return hashlib.sha1(base.encode("utf8")).hexdigest()
 
 
 def stable_hash_u64(text: str) -> int:
@@ -436,7 +385,7 @@ def rule_based_mr_subclass(caption: str) -> Optional[str]:
 
 
 # ============================================================
-# Classification: Rules -> BERT
+# Klassifikation: Rules -> BERT
 # ============================================================
 
 def classify_modalities_and_mr_subclasses(
@@ -464,17 +413,12 @@ def classify_modalities_and_mr_subclasses(
     df["bert_mr_score"] = np.nan
     df["bert_mr_margin"] = np.nan
 
-    modality_proto_embs = None
-    mr_proto_embs = None
-
     if need_bert_mod.any():
         texts = df.loc[need_bert_mod, caption_column].tolist()
         text_embs = encode_texts(texts, tokenizer, model, batch_size, max_length)
-
         modality_proto_embs = build_prototype_embeddings(
             DEFAULT_MODALITY_PROTOTYPES, tokenizer, model, batch_size, max_length
         )
-
         scored = score_against_prototypes(text_embs, modality_proto_embs)
         idx = df.index[need_bert_mod]
 
@@ -485,11 +429,9 @@ def classify_modalities_and_mr_subclasses(
     if need_bert_mr.any():
         texts = df.loc[need_bert_mr, caption_column].tolist()
         text_embs = encode_texts(texts, tokenizer, model, batch_size, max_length)
-
         mr_proto_embs = build_prototype_embeddings(
             DEFAULT_MR_SUBCLASS_PROTOTYPES, tokenizer, model, batch_size, max_length
         )
-
         scored = score_against_prototypes(text_embs, mr_proto_embs)
         idx = df.index[need_bert_mr]
 
@@ -540,7 +482,7 @@ def classify_modalities_and_mr_subclasses(
 
 
 # ============================================================
-# Master subset
+# Master-Subset
 # ============================================================
 
 def build_master_subset(
@@ -567,7 +509,7 @@ def build_master_subset(
 
 
 # ============================================================
-# Distributed deterministic selection
+# Verteilte Auswahl
 # ============================================================
 
 def assign_bins_by_rank(df: pd.DataFrame, rank_col: str, subset_size: int, n_bins: int) -> pd.Series:
@@ -629,10 +571,7 @@ def select_class_members_distributed(
     pool["class_score"] = pool["sample_id"].map(lambda s: hash_score(s, f"{salt_class}::{modality}"))
     pool["bin_id"] = assign_bins_by_rank(pool, rank_col, subset_size=len(df_subset), n_bins=n_bins)
 
-    selected_large = distributed_take(
-        pool, min(target_large, len(pool)), bin_col="bin_id", score_col="class_score"
-    )
-
+    selected_large = distributed_take(pool, min(target_large, len(pool)), "bin_id", "class_score")
     selected_large = selected_large.sort_values("class_score", kind="mergesort").reset_index(drop=True)
     selected_large["selected_large_rank"] = np.arange(len(selected_large), dtype=np.int64)
 
@@ -662,10 +601,7 @@ def select_mr_subclass_members_distributed(
     pool["mr_score"] = pool["sample_id"].map(lambda s: hash_score(s, f"{salt_mr}::{subclass}"))
     pool["bin_id"] = assign_bins_by_rank(pool, rank_col, subset_size=len(df_subset), n_bins=n_bins)
 
-    selected_large = distributed_take(
-        pool, min(target_large, len(pool)), bin_col="bin_id", score_col="mr_score"
-    )
-
+    selected_large = distributed_take(pool, min(target_large, len(pool)), "bin_id", "mr_score")
     selected_large = selected_large.sort_values("mr_score", kind="mergesort").reset_index(drop=True)
     selected_large["selected_large_rank"] = np.arange(len(selected_large), dtype=np.int64)
 
@@ -676,7 +612,7 @@ def select_mr_subclass_members_distributed(
 
 
 # ============================================================
-# Distribution analysis
+# Verteilungsanalyse
 # ============================================================
 
 def compute_distribution_metrics(df_selected: pd.DataFrame, n_bins: int, subset_size: int, rank_col: str) -> pd.DataFrame:
@@ -720,7 +656,6 @@ def summarize_distribution(bin_df: pd.DataFrame) -> pd.DataFrame:
     max_val = counts.max()
     max_abs_dev = np.max(np.abs(counts - mean_val))
 
-    # normierte L1-Abweichung von idealer Gleichverteilung
     probs = counts / counts.sum() if counts.sum() > 0 else np.zeros_like(counts)
     uniform = np.full_like(probs, 1.0 / len(probs), dtype=float)
     normalized_l1 = np.abs(probs - uniform).sum()
@@ -771,27 +706,20 @@ def main() -> None:
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    df = load_table(
-        path_str=str(input_path),
-        sep=args.txt_sep,
-        has_header=args.txt_has_header,
-        image_column=args.image_column,
-        caption_column=args.caption_column,
-    )
+    if not input_path.exists():
+        raise FileNotFoundError(f"Eingabedatei nicht gefunden: {input_path}")
 
-    if args.caption_column not in df.columns:
-        raise ValueError(f"Caption-Spalte '{args.caption_column}' nicht gefunden.")
-    if args.image_column not in df.columns:
-        raise ValueError(f"Bildspalte '{args.image_column}' nicht gefunden.")
+    df = load_pmc_pipeline_jsonl(input_path)
 
     df = df.copy()
-    df[args.caption_column] = df[args.caption_column].map(clean_caption)
-    df = df[df[args.caption_column].astype(bool)].reset_index(drop=True)
+    df["caption"] = df["caption"].map(clean_caption)
+    df = df[df["caption"].astype(bool)].reset_index(drop=True)
 
     df["sample_id"] = [
-        make_sample_id(img, cap)
-        for img, cap in zip(df[args.image_column], df[args.caption_column])
+        make_sample_id(img, cap, pair_id)
+        for img, cap, pair_id in zip(df["image_path"], df["caption"], df["pair_id"])
     ]
+
     df = df.drop_duplicates(subset=["sample_id"]).reset_index(drop=True)
 
     if len(df) == 0:
@@ -806,7 +734,6 @@ def main() -> None:
     )
 
     df_large = df_master[df_master["is_in_large_subset"]].copy().reset_index(drop=True)
-    df_small = df_master[df_master["is_in_small_subset"]].copy().reset_index(drop=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, use_fast=True)
     model = AutoModel.from_pretrained(args.model_dir, local_files_only=True)
@@ -820,7 +747,7 @@ def main() -> None:
         batch_size=args.batch_size,
         max_length=args.max_length,
         bert_margin_threshold=args.bert_margin_threshold,
-        caption_column=args.caption_column,
+        caption_column="caption",
     )
 
     df_small = df_large[df_large["master_rank"] < args.subset_small_size].copy().reset_index(drop=True)
