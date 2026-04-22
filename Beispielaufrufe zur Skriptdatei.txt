@@ -1,0 +1,5 @@
+python classify_open_pmc_arrow.py \
+  --dataset_root /home/b/open_pmc_arrow \
+  --output_csv /home/b/open_pmc_arrow/test_500.csv \
+  --biomedbert_path /home/b/Dokumente/biomedbert \
+  --limit 500

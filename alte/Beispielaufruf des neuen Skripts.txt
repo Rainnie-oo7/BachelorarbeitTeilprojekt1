@@ -1,0 +1,16 @@
+python /home/b/PycharmProjects/ba1pmc/build_master_pool.py
+
+Oder
+
+python /home/b/PycharmProjects/ba1pmc/build_master_pool.py \
+  --oa-list-path /home/b/PycharmProjects/ba1pmc/BiomedCLIP_data_pipeline/_results/data/pubmed_open_access_file_list.txt \
+  --target-pairs 100000 \
+  --buffer-factor 1.0
+
+
+Was man danach bekommt
+Im Ordner _results/data/:
+
+master_pool_100k.parquet
+master_pool_100k.csv
+master_pool_progress.json
