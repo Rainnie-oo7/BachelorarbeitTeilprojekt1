@@ -272,7 +272,13 @@ class OpenPMCViewer:
 
         image_name = csv_row.get("image", meta.get("image", ""))
         pmc_id = csv_row.get("pmc_id", meta.get("PMC_ID", ""))
-        pred_label = csv_row.get("pred_label", "")
+        rules_short_label = csv_row.get("pred_label_short", "")
+        rules_short_reason = csv_row.get("decision_reason_short", "")
+        rules_short_pattern = csv_row.get("matched_pattern_short", "")
+
+        rules_long_label = csv_row.get("pred_label_long", csv_row.get("pred_label", ""))
+        rules_long_reason = csv_row.get("decision_reason_long", "")
+        rules_long_pattern = csv_row.get("matched_pattern_long", "")
         modality_gt = csv_row.get("modality_gt", meta.get("modality", ""))
 
         caption = csv_row.get("caption", "")
@@ -295,7 +301,15 @@ PMC_ID: {pmc_id}
 Image: {image_name}
 
 modality_gt: {modality_gt}
-Rules+BERT pred_label aus CSV: {pred_label}
+Rules+BERT / kurze Regeln:
+Label: {rules_short_label}
+Reason: {rules_short_reason}
+Pattern: {rules_short_pattern}
+
+Rules+BERT / lange Regeln:
+Label: {rules_long_label}
+Reason: {rules_long_reason}
+Pattern: {rules_long_pattern}
 {cnn_text}
 
 Caption:

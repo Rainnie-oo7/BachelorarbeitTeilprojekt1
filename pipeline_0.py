@@ -28,6 +28,7 @@ import argparse
 from pathlib import Path
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
+from itertools import zip_longest
 
 import torch
 import pandas as pd
@@ -118,15 +119,17 @@ def extract_text_from_row(row) -> Tuple[str, dict]:
 # ============================================================
 
 RULE_LABELS_ORDER = [
-    "ct_pet",
-    "mri",
+    "ct_kombimodalitaet_spect+ct_pet+ct",
+    "mrt_hirn",
+    "mrt_body",
     "ct",
-    "pet",
-    "ultrasound",
+    "xray_fluoroskopie_angiographie",
     "xray",
-    "endoscopy",
-    "pathology",
+    "us",
     "microscopy",
+    "pathology",
+    "surgery_real",
+    "endoscopy",
     "chart_or_diagram",
 ]
 # xray
@@ -135,9 +138,9 @@ RULE_LABELS_ORDER = [
 ## mrt_hirn_flair
 ## mrt_hirn_t1
 ## mrt_hirn_t2
-### mrt_hirn_t1_c
+## mrt_hirn_t1_c zu mrt_hirn
 ### mrt_prostata_t1
-### mrt_prostata_t2
+### mrt_prostata_t2 zu mrt_body
 # ct
 # ct_kombimodalitaet_spect+ct_pet+ct
 
@@ -149,152 +152,482 @@ RULE_LABELS_ORDER = [
 #=10 Klassen
 #chart_or_diagram
 #endoscopy
-RULES: Dict[str, List[str]] = {
-    "ct_kombimodalitaet_spect+ct_pet+ct": [
-        r"\bpet\s*/\s*ct\b",
-        r"\bpet\s*-\s*ct\b",
-        r"\bpetct\b",
-        r"\bfused\s+pet\s+ct\b",
-        r"\bhybrid\s+pet\s+ct\b",
-        r"\bcombined\s+pet\s+ct\b",
-        r"\bco[- ]registered\s+pet\s+ct\b",
-    ],
-    "mri_hirn": [
-        r"\bmri\b",
-        r"\bmr\b",
-        r"\bmagnetic resonance\b",
-        r"\bt1\b",
-        r"\bt2\b",
-        r"\bflair\b",
-        r"\bdwi\b",
-        r"\badc\b",
-        r"\bgadolinium\b",
-        r"\bmrcp\b",
-        r"\bfmri\b",
-    ],
-    "ct": [
-        r"\bct\b",
-        r"\bcomputed tomography\b",
-        r"\bcomputed tomographic\b",
-        r"\bhelical ct\b",
-        r"\bmultidetector ct\b",
-        r"\bhrct\b",
-        r"\bcect\b",
-        r"\baxial ct\b",
-        r"\bcoronal ct\b",
-        r"\bsagittal ct\b",
-        r"\bhounsfield\b",
-    ],
-    "pet": [
-        r"\bpet\b",
-        r"\bpositron emission tomography\b",
-        r"\bfdg pet\b",
-        r"\bpet scan\b",
-        r"\bpet image\b",
-        r"\btracer uptake\b",
-        r"\bsuv(max)?\b",
-    ],
-    "ultrasound": [
-        r"\bultrasound\b",
-        r"\bultrasonography\b",
-        r"\bsonography\b",
-        r"\bsonographic\b",
-        r"\bechography\b",
-        r"\bechocardiography\b",
-        r"\bdoppler\b",
-        r"\bduplex\b",
-        r"\btransvaginal\b",
-        r"\btransrectal\b",
-        r"\btransabdominal\b",
-        r"\bcolor doppler\b",
-    ],
-    "xray": [
-        r"\bx[- ]?ray\b",
-        r"\bradiograph\b",
-        r"\bradiographic\b",
-        r"\bplain film\b",
-        r"\bchest film\b",
-        r"\bportable chest\b",
-        r"\bap view\b",
-        r"\bpa view\b",
-        r"\blateral view\b",
-        r"\bfluoroscopy\b",
-        r"\bfluoroscopic\b",
-        r"\bc[- ]arm\b",
-    ],
-    "endoscopy": [
-        r"\bendoscopy\b",
-        r"\bcolonoscopy\b",
-        r"\bgastroscopy\b",
-        r"\besophagogastroduodenoscopy\b",
-        r"\blaparoscopy\b",
-        r"\bbronchoscopy\b",
-        r"\bduodenoscopy\b",
-        r"\benteroscopy\b",
-        r"\bcolono fiberscope\b",
-        r"\bcf\b",
-    ],
-    "pathology": [
-        r"\bpathological findings\b",
-        r"\bbiopsy\b",
-        r"\bbiopsy findings\b",
-        r"\bhistopathology\b",
-        r"\bpathology\b",
-        r"\btissue specimen\b",
-        r"\bcell infiltration\b",
-        r"\beosinophil counts\b",
-    ],
-    "microscopy": [
-        r"\bmicroscopy\b",
-        r"\bmicroscopic\b",
-        r"\bhistology\b",
-        r"\bimmunohistochemistry\b",
-        r"\bh\s*&\s*e\b",
-        r"\bhematoxylin\b",
-        r"\beosin\b",
-        r"\btissue section\b",
-        r"\bpathology slide\b",
-        r"\bstaining\b",
-        r"\bcells\/hpf\b",
-        r"\bhigh[- ]power field\b",
-    ],
-    "chart_or_diagram": [
-        r"\bchart\b",
-        r"\bgraph\b",
-        r"\bplot\b",
-        r"\bdiagram\b",
-        r"\bschematic\b",
-        r"\bworkflow\b",
-        r"\bhistogram\b",
-        r"\bbox plot\b",
-        r"\broc curve\b",
-        r"\bsurvival curve\b",
-        r"\bkaplan[- ]meier\b",
-        r"\bbar graph\b",
-        r"\bline graph\b",
-        r"\bscatter plot\b",
-        r"\bclinical course\b",
-        r"\btherapeutic management\b",
-        r"\bbody weight changes\b",
-    ],
-}
+# Kurze Regeln
+# Kurze RULES MRT HIRN – Sublisten
+MRT_HIRN_T1_SHORT = [
+    r"\bbrain\b.*\bt1\b",
+    r"\bhead\b.*\bt1\b",
+    r"\bcerebr\w*\b.*\bt1\b",
+    r"\bcranial\b.*\bt1\b",
+    r"\bt1[- ]weighted\b.*\bbrain\b",
+    r"\bbrain\s+mri\b.*\bt1\b",
+]
+MRT_HIRN_T2_SHORT = [
+    r"\bbrain\b.*\bt2\b",
+    r"\bhead\b.*\bt2\b",
+    r"\bcerebr\w*\b.*\bt2\b",
+    r"\bcranial\b.*\bt2\b",
+    r"\bt2[- ]weighted\b.*\bbrain\b",
+    r"\bbrain\s+mri\b.*\bt2\b",
+]
+MRT_HIRN_FLAIR_SHORT = [
+    r"\bbrain\b.*\bflair\b",
+    r"\bcranial\b.*\bflair\b",
+    r"\bcerebr\w*\b.*\bflair\b",
+    r"\bhead\b.*\bflair\b",
+    r"\bflair\b.*\bbrain\b",
+    r"\bfluid[- ]attenuated inversion recovery\b",
+]
+MRT_HIRN_T1_C_SHORT = [
+    r"\bbrain\b.*\bt1\s*\+\s*c\b",
+    r"\bpost[- ]contrast\b.*\bbrain\b.*\bmri\b",
+    r"\bgadolinium[- ]enhanced\b.*\bbrain\b.*\bmri\b",
+    r"\bcontrast[- ]enhanced\b.*\bbrain\b.*\bmri\b",
+    r"\bt1\s*\+\s*c\b.*\bbrain\b",
+    r"\bt1\s+with\s+contrast\b.*\bbrain\b",
+]
+# Kurze RULES MRT BODY – Sublisten
+MRT_PROSTATA_T1_SHORT = [
+    r"\bprostat\w*\b.*\bt1\b",
+    r"\bt1[- ]weighted\b.*\bprostat\w*\b",
+    r"\bprostate\s+mri\b.*\bt1\b",
+    r"\bpelvic\s+mri\b.*\bprostat\w*\b.*\bt1\b",
+]
+MRT_PROSTATA_T2_SHORT = [
+    r"\bprostat\w*\b.*\bt2\b",
+    r"\bt2[- ]weighted\b.*\bprostat\w*\b",
+    r"\bprostate\s+mri\b.*\bt2\b",
+    r"\bpelvic\s+mri\b.*\bprostat\w*\b.*\bt2\b",
+    r"\bzonal anatomy\b.*\bprostat\w*\b.*\bt2\b",
+]
+MRT_BODY_GENERAL_SHORT = [
+    r"\bpelvic\s+mri\b",
+    r"\bpelvic\s+mr\b",
+    r"\bprostate\s+mri\b",
+    r"\bprostate\s+mr\b",
+    r"\bmpmri\b",
+    r"\bmultiparametric\s+mri\b.*\bprostat\w*\b",
+    r"\babdominal\s+mri\b",
+    r"\bbreast\s+mri\b",
+    r"\bliver\s+mri\b",
+    r"\bkidney\s+mri\b",
+    r"\brenal\s+mri\b",
+    r"\bspine\s+mri\b",
+    r"\bknee\s+mri\b",
+    r"\bcardiac\s+mri\b",
+    r"\bheart\s+mri\b",
+]
+# Lange RULES MRT HIRN – Sublisten
+MRT_HIRN_T1_LONG = [
+    r"\bbrain\b.*\bt1\b",
+    r"\bhead\b.*\bt1\b",
+    r"\bcerebr\w*\b.*\bt1\b",
+    r"\bcranial\b.*\bt1\b",
+    r"\bt1[- ]weighted\b.*\bbrain\b",
+    r"\bbrain\s+mri\b.*\bt1\b",
+]
+MRT_HIRN_T2_LONG = [
+    r"\bbrain\b.*\bt2\b",
+    r"\bhead\b.*\bt2\b",
+    r"\bcerebr\w*\b.*\bt2\b",
+    r"\bcranial\b.*\bt2\b",
+    r"\bt2[- ]weighted\b.*\bbrain\b",
+    r"\bbrain\s+mri\b.*\bt2\b",
+]
+MRT_HIRN_FLAIR_LONG = [
+    r"\bbrain\b.*\bflair\b",
+    r"\bcranial\b.*\bflair\b",
+    r"\bcerebr\w*\b.*\bflair\b",
+    r"\bhead\b.*\bflair\b",
+    r"\bflair\b.*\bbrain\b",
+    r"\bfluid[- ]attenuated inversion recovery\b",
+]
+MRT_HIRN_T1_C_LONG = [
+    r"\bbrain\b.*\bt1\s*\+\s*c\b",
+    r"\bbrain\b.*\bt1\s*post[- ]contrast\b",
+    r"\bpost[- ]contrast\b.*\bbrain\b.*\bmri\b",
+    r"\bgadolinium[- ]enhanced\b.*\bbrain\b.*\bmri\b",
+    r"\bcontrast[- ]enhanced\b.*\bbrain\b.*\bmri\b",
+    r"\bt1\s*\+\s*c\b.*\bbrain\b",
+    r"\bt1\s+with\s+contrast\b.*\bbrain\b",
+]
+
+# RULES MRT BODY – Sublisten
+MRT_PROSTATA_T1_LONG = [
+    r"\bprostat\w*\b.*\bt1\b",
+    r"\bt1[- ]weighted\b.*\bprostat\w*\b",
+    r"\bprostate\s+mri\b.*\bt1\b",
+    r"\bpelvic\s+mri\b.*\bprostat\w*\b.*\bt1\b",
+]
+MRT_PROSTATA_T2_LONG = [
+    r"\bprostat\w*\b.*\bt2\b",
+    r"\bt2[- ]weighted\b.*\bprostat\w*\b",
+    r"\bprostate\s+mri\b.*\bt2\b",
+    r"\bpelvic\s+mri\b.*\bprostat\w*\b.*\bt2\b",
+    r"\bzonal anatomy\b.*\bprostat\w*\b.*\bt2\b",
+]
+MRT_BODY_GENERAL_LONG = [
+    r"\bpelvic\s+mri\b",
+    r"\bpelvic\s+mr\b",
+    r"\bprostate\s+mri\b",
+    r"\bprostate\s+mr\b",
+    r"\bmpmri\b",
+    r"\bmultiparametric\s+mri\b.*\bprostat\w*\b",
+    r"\babdominal\s+mri\b",
+    r"\bbreast\s+mri\b",
+    r"\bliver\s+mri\b",
+    r"\bkidney\s+mri\b",
+    r"\brenal\s+mri\b",
+    r"\bspine\s+mri\b",
+    r"\bknee\s+mri\b",
+    r"\bcardiac\s+mri\b",
+    r"\bheart\s+mri\b",
+    r"\bwhole[- ]body\s+mri\b",
+
+    r"\bmri\b.*\bprostat\w*\b",
+    r"\bmr\b.*\bprostat\w*\b",
+    r"\bmri\b.*\bpelvi\w*\b",
+    r"\bmr\b.*\bpelvi\w*\b",
+    r"\bdiffusion[- ]weighted\b.*\bprostat\w*\b",
+    r"\bdwi\b.*\bprostat\w*\b",
+    r"\badc\b.*\bprostat\w*\b",
+    r"\bdynamic contrast[- ]enhanced\b.*\bprostat\w*\b",
+    r"\bdce\b.*\bprostat\w*\b",
+
+    r"\babdominal\s+mr\b",
+    r"\bbreast\s+mr\b",
+    r"\bliver\s+mr\b",
+    r"\bkidney\s+mr\b",
+    r"\brenal\s+mr\b",
+    r"\bspine\s+mr\b",
+    r"\bknee\s+mr\b",
+    r"\bcardiac\s+mr\b",
+    r"\bheart\s+mr\b",
+]
+
+def interleave_patterns(*pattern_lists):
+    mixed = []
+    for group in zip_longest(*pattern_lists):
+        for pattern in group:
+            if pattern is not None:
+                mixed.append(pattern)
+    return mixed
+# Ich wollte Hirn zusammenfassen und Prostata (auch auf viel Koerper trainiert, hiess aber durch CNN so)
+# Interleave kurze Regeln (Kartenmisch-artig) quasi da Reihenfolge jeweiliger Klasse gleich wichtig ist m1 = [a, b] und m2 = [c, d] wird m_hirn = [a, c, b, d]
+MRT_HIRN_RULES_SHORT = interleave_patterns(
+    MRT_HIRN_T1_SHORT,
+    MRT_HIRN_T2_SHORT,
+    MRT_HIRN_FLAIR_SHORT,
+    MRT_HIRN_T1_C_SHORT,
+)
+MRT_BODY_RULES_SHORT = interleave_patterns(
+    MRT_PROSTATA_T1_SHORT,
+    MRT_PROSTATA_T2_SHORT,
+    MRT_BODY_GENERAL_SHORT,
+)
+# Interleave lange Regeln
+MRT_HIRN_RULES_LONG = interleave_patterns(
+    MRT_HIRN_T1_LONG,
+    MRT_HIRN_T2_LONG,
+    MRT_HIRN_FLAIR_LONG,
+    MRT_HIRN_T1_C_LONG,
+)
+MRT_BODY_RULES_LONG = interleave_patterns(
+    MRT_PROSTATA_T1_LONG,
+    MRT_PROSTATA_T2_LONG,
+    MRT_BODY_GENERAL_LONG,
+)
+# Weitere Regeln - kurze
+CT_HYBRID_RULES_SHORT = [
+    r"\bpet\s*/\s*ct\b",
+    r"\bpet-ct\b",
+    r"\bspect\s*/\s*ct\b",
+    r"\bspect-ct\b",
+    r"\bfused\s+(pet|spect)\s*[-/]?\s*ct\b",
+    r"\bhybrid\s+(pet|spect)\s*[-/]?\s*ct\b",
+    r"\bco[- ]registered\s+(pet|spect)\s+(and\s+)?ct\b",
+]
+CT_RULES_SHORT = [
+    r"\bct\b",
+    r"\bcomputed tomography\b",
+    r"\baxial ct\b",
+    r"\bcoronal ct\b",
+    r"\bsagittal ct\b",
+    r"\bcontrast[- ]enhanced ct\b",
+    r"\bhelical ct\b",
+    r"\bmdct\b",
+    r"\bhrct\b",
+]
+XRAY_ANGIOGRAPHY_RULES_SHORT = [
+    r"\bangioplast\w*\b",
+    r"\bpta\b",
+    r"\bptca\b",
+    r"\bpci\b",
+    r"\bfluoroscopy\b",
+    r"\bc[- ]arm\b",
+    r"\bangiograph\w*\b",
+    r"\bdsa\b",
+]
+XRAY_RULES_SHORT = [
+    r"\bx[- ]?ray\b",
+    r"\bradiograph\b",
+    r"\bplain film\b",
+    r"\bap view\b",
+    r"\bpa view\b",
+    r"\blateral view\b",
+]
+US_RULES_SHORT = [
+    r"\bultrasound\b",
+    r"\bsonograph\w*\b",
+    r"\bechograph\w*\b",
+    r"\bdoppler\b",
+]
+MICROSCOPY_RULES_SHORT = [
+    r"\bmicroscopy\b",
+    r"\bhistology\b",
+    r"\bimmunohistochemistry\b",
+    r"\bh\s*&\s*e\b",
+]
+
+PATHOLOGY_RULES_SHORT = [
+    r"\bpathology\b",
+    r"\bbiopsy\b",
+    r"\bpathological findings\b",
+]
+
+SURGERY_RULES_SHORT = [
+    r"\bintraoperative\b",
+    r"\bsurgical findings\b",
+    r"\boperation\b",
+]
+
+ENDOSCOPY_RULES_SHORT = [
+    r"\bendoscopy\b",
+    r"\bcolonoscopy\b",
+]
+
+CHART_RULES_SHORT = [
+    r"\bchart\b",
+    r"\bgraph\b",
+    r"\bplot\b",
+]
+
+# Weitere Regeln - lange
+CT_HYBRID_RULES_LONG = [
+    r"\bpet\s*/\s*ct\b",
+    r"\bpet\s*-\s*ct\b",
+    r"\bpetct\b",
+    r"\bfused\s+pet\s*[-/]?\s*ct\b",
+    r"\bhybrid\s+pet\s*[-/]?\s*ct\b",
+    r"\bcombined\s+pet\s*[-/]?\s*ct\b",
+    r"\bco[- ]registered\s+pet\s+(and\s+)?ct\b",
+    r"\bspect\s*/\s*ct\b",
+    r"\bspect\s*-\s*ct\b",
+    r"\bspectct\b",
+    r"\bfused\s+spect\s*[-/]?\s*ct\b",
+    r"\bhybrid\s+spect\s*[-/]?\s*ct\b",
+    r"\bcombined\s+spect\s*[-/]?\s*ct\b",
+    r"\bco[- ]registered\s+spect\s+(and\s+)?ct\b",
+    r"\bsingle[- ]photon emission computed tomography\s+(and|with)\s+ct\b",
+    r"\bpositron emission tomography\s+(and|with)\s+computed tomography\b",
+]
+CT_RULES_LONG = [
+    r"\bct\b",
+    r"\bct scan\b",
+    r"\bcomputed tomography\b",
+    r"\bcomputed tomograph\w*\b",
+    r"\baxial ct\b",
+    r"\bcoronal ct\b",
+    r"\bsagittal ct\b",
+    r"\bcontrast[- ]enhanced ct\b",
+    r"\bnon[- ]contrast ct\b",
+    r"\bhelical ct\b",
+    r"\bmultidetector ct\b",
+    r"\bmdct\b",
+    r"\bhrct\b",
+    r"\bcect\b",
+    r"\bhounsfield\b",
+]
+XRAY_ANGIOGRAPHY_RULES_LONG = [
+    r"\bangioplast\w*\b",
+    r"\angiography\w*\b",
+    r"\bballoon angioplasty\b",
+    r"\bpercutaneous transluminal angioplasty\b",
+    r"\bpta\b",
+    r"\bptca\b",
+    r"\bcoronary angioplasty\b",
+    r"\bstent placement\b",
+    r"\bpercutaneous coronary intervention\b",
+    r"\bpci\b",
+    r"\bfluoroscopy\b",
+    r"\bfluoroscopic\b",
+    r"\bc[- ]arm\b",
+    r"\bx[- ]ray guided\b",
+    r"\bfluoroscopic guidance\b",
+    r"\breal[- ]time x[- ]ray\b",
+    r"\bangiograph\w*\b",
+    r"\bdigital subtraction angiography\b",
+    r"\bdsa\b",
+    r"\bcatheter angiography\b",
+]
+XRAY_RULES_LONG = [
+    r"\bx[- ]?ray\b",
+    r"\bxray\b",
+    r"\bradiograph\b",
+    r"\bradiographic\b",
+    r"\bprojection radiography\b",
+    r"\bplain film\b",
+    r"\bchest film\b",
+    r"\bportable chest\b",
+    r"\bportable x[- ]ray\b",
+    r"\bap view\b",
+    r"\bpa view\b",
+    r"\blateral view\b",
+    r"\bfrontal radiograph\b",
+    r"\blateral radiograph\b",
+    r"\bpanoramic radiograph\b",
+    r"\bdorsoplantar projection\b",
+]
+US_RULES_LONG = [
+    r"\bultrasound\b",
+    r"\bsonograph\w*\b",
+    r"\bultrasonograph\w*\b",
+    r"\bechograph\w*\b",
+    r"\bechocardiograph\w*\b",
+    r"\bdoppler\b",
+    r"\bduplex sonograph\w*\b",
+    r"\bendoscopic ultrasound\b",
+    r"\beus\b",
+    r"\bb[- ]mode ultrasound\b",
+    r"\bcolor doppler\b",
+    r"\bpower doppler\b",
+    r"\btransvaginal\b",
+    r"\btransrectal\b",
+    r"\btransabdominal\b",
+]
+MICROSCOPY_RULES_LONG = [
+    r"\bmicroscopy\b",
+    r"\bmicroscopic\b",
+    r"\bhistology\b",
+    r"\bhistologic\w*\b",
+    r"\bimmunohistochemistry\b",
+    r"\bihc\b",
+    r"\bh\s*&\s*e\b",
+    r"\bhematoxylin\b",
+    r"\beosin\b",
+    r"\btissue section\b",
+    r"\bpathology slide\b",
+    r"\bstaining\b",
+    r"\bcells\/hpf\b",
+    r"\bhigh[- ]power field\b",
+]
+PATHOLOGY_RULES_LONG = [
+    r"\bpathological findings\b",
+    r"\bpathology\b",
+    r"\bpathologic\w*\b",
+    r"\bbiopsy\b",
+    r"\bbiopsy findings\b",
+    r"\btissue specimen\b",
+    r"\bcell infiltration\b",
+    r"\beosinophil counts\b",
+    r"\binflammatory cell infiltration\b",
+]
+SURGERY_RULES_LONG = [
+    r"\bintraoperative\b",
+    r"\boperative findings\b",
+    r"\bsurgical findings\b",
+    r"\bsurgery\b",
+    r"\bsurgical view\b",
+    r"\boperation\b",
+    r"\bresected specimen\b",
+    r"\bgross specimen\b",
+    r"\bmacroscopic\b",
+    r"\bclinical photograph\b",
+    r"\bphotograph\b",
+    r"\bphoto\b",
+    r"\bwound\b",
+    r"\blesion photograph\b",
+]
+ENDOSCOPY_RULES_LONG = [
+    r"\bendoscopy\b",
+    r"\bendoscopic\b",
+    r"\bcolonoscopy\b",
+    r"\bgastroscopy\b",
+    r"\besophagogastroduodenoscopy\b",
+    r"\blaparoscopy\b",
+    r"\bbronchoscopy\b",
+    r"\bduodenoscopy\b",
+    r"\benteroscopy\b",
+    r"\bcolono fiberscope\b",
+    r"\bcf\b",
+]
+CHART_RULES_LONG = [
+    r"\bchart\b",
+    r"\bgraph\b",
+    r"\bplot\b",
+    r"\bdiagram\b",
+    r"\bschematic\b",
+    r"\bworkflow\b",
+    r"\bhistogram\b",
+    r"\bbox plot\b",
+    r"\broc curve\b",
+    r"\bsurvival curve\b",
+    r"\bkaplan[- ]meier\b",
+    r"\bbar graph\b",
+    r"\bline graph\b",
+    r"\bscatter plot\b",
+    r"\bclinical course\b",
+    r"\btherapeutic management\b",
+    r"\bbody weight changes\b",
+    r"\btimeline\b",
+]
+# RULES
+RULES_SHORT = [
+    ("ct_kombimodalitaet_spect+ct_pet+ct", CT_HYBRID_RULES_SHORT),
+    ("mrt_hirn", MRT_HIRN_RULES_SHORT),
+    ("mrt_body", MRT_BODY_RULES_SHORT),
+    ("ct", CT_RULES_SHORT),
+    ("xray_fluoroskopie_angiographie", XRAY_ANGIOGRAPHY_RULES_SHORT),
+    ("xray", XRAY_RULES_SHORT),
+    ("us", US_RULES_SHORT),
+    ("microscopy", MICROSCOPY_RULES_SHORT),
+    ("pathology", PATHOLOGY_RULES_SHORT),
+    ("surgery_real", SURGERY_RULES_SHORT),
+    ("endoscopy", ENDOSCOPY_RULES_SHORT),
+    ("chart_or_diagram", CHART_RULES_SHORT),
+]
+RULES_LONG = [
+    ("ct_kombimodalitaet_spect+ct_pet+ct", CT_HYBRID_RULES_LONG),
+    ("mrt_hirn", MRT_HIRN_RULES_LONG),
+    ("mrt_body", MRT_BODY_RULES_LONG),
+    ("ct", CT_RULES_LONG),
+    ("xray_fluoroskopie_angiographie", XRAY_ANGIOGRAPHY_RULES_LONG),
+    ("xray", XRAY_RULES_LONG),
+    ("us", US_RULES_LONG),
+    ("microscopy", MICROSCOPY_RULES_LONG),
+    ("pathology", PATHOLOGY_RULES_LONG),
+    ("surgery_real", SURGERY_RULES_LONG),
+    ("endoscopy", ENDOSCOPY_RULES_LONG),
+    ("chart_or_diagram", CHART_RULES_LONG),
+]
 
 
 def contains_any(text: str, patterns: List[str]) -> bool:
     return any(re.search(p, text) for p in patterns)
 
 
-def rule_based_classify(text: str) -> Tuple[Optional[str], str]:
+def rule_based_classify_with_rules(text: str, rules):
     t = normalize_for_rules(text)
 
     if not t:
-        return None, "empty_text"
+        return None, "empty_text", ""
 
-    for label in RULE_LABELS_ORDER:
-        if contains_any(t, RULES[label]):
-            return label, f"rule:{label}"
+    for label, patterns in rules:
+        for pattern in patterns:
+            if re.search(pattern, t):
+                return label, f"rule:{label}", pattern
 
-    return None, "no_rule_match"
+    return None, "no_rule_match", ""
 
 
 # ============================================================
@@ -304,44 +637,81 @@ def rule_based_classify(text: str) -> Tuple[Optional[str], str]:
 CLASS_TEXTS: Dict[str, str] = {
     "xray": (
         "X-ray radiography, radiograph, plain radiograph, chest x-ray, abdominal x-ray, "
-        "skeletal radiograph, projection radiography, AP view, PA view, lateral view, "
-        "portable x-ray, fluoroscopic x-ray image, c-arm x-ray guidance."
+        "skeletal radiograph, projection radiography, conventional x-ray, AP view, PA view, "
+        "lateral view, portable x-ray, panoramic radiograph, dorsoplantar projection, "
+        "plain film, frontal radiograph, lateral radiograph."
     ),
+
+    "xray_fluoroskopie_angiographie": (
+        "Fluoroscopy, fluoroscopic x-ray imaging, real-time x-ray imaging, c-arm fluoroscopy, "
+        "x-ray guided interventional procedure, fluoroscopic guidance, contrast fluoroscopy, "
+        "angiography, angiographic image, digital subtraction angiography, DSA, catheter angiography, "
+        "vascular intervention, angioplasty, balloon angioplasty, percutaneous transluminal angioplasty, "
+        "PTA, PTCA, coronary angioplasty, stent placement, percutaneous coronary intervention, PCI."
+    ),
+
+    "us": (
+        "Ultrasound imaging, sonography, ultrasonography, echography, echocardiography, "
+        "B-mode ultrasound, doppler ultrasound, duplex sonography, endoscopic ultrasound, EUS, "
+        "color doppler, power doppler, sonographic examination, ultrasonographic image."
+    ),
+
+    "mrt_hirn": (
+        "Brain MRI, cranial MRI, cerebral MRI, neuro MRI, head MRI, magnetic resonance imaging of the brain, "
+        "T1-weighted brain MRI, T2-weighted brain MRI, FLAIR brain MRI, fluid-attenuated inversion recovery, "
+        "DWI brain MRI, ADC brain MRI, contrast-enhanced T1 brain MRI, gadolinium-enhanced brain MRI, "
+        "post-contrast brain MRI, axial brain MRI, sagittal brain MRI, coronal brain MRI."
+    ),
+
+    "mrt_body": (
+        "Body MRI, magnetic resonance imaging outside the brain, abdominal MRI, pelvic MRI, prostate MRI, "
+        "breast MRI, liver MRI, renal MRI, kidney MRI, cardiac MRI, heart MRI, spine MRI, knee MRI, "
+        "whole-body MRI, multiparametric prostate MRI, mpMRI, prostate T1-weighted MRI, prostate T2-weighted MRI, "
+        "diffusion-weighted prostate MRI, ADC map of prostate MRI, dynamic contrast-enhanced prostate MRI, DCE MRI, "
+        "pelvic MR imaging of the prostate gland."
+    ),
+
     "ct": (
-        "Computed tomography, CT scan, axial CT, coronal CT, sagittal CT, contrast-enhanced CT, "
-        "non-contrast CT, computed tomographic imaging, Hounsfield units, helical CT."
+        "Computed tomography, CT scan, computed tomographic image, axial CT, coronal CT, sagittal CT, "
+        "contrast-enhanced CT, non-contrast CT, helical CT, multidetector CT, MDCT, HRCT, "
+        "brain CT, chest CT, abdominal CT, pelvic CT, Hounsfield units."
     ),
-    "mri": (
-        "Magnetic resonance imaging, MRI, MR image, T1-weighted, T2-weighted, FLAIR, DWI, "
-        "diffusion-weighted imaging, gadolinium-enhanced MRI."
-    ),
-    "ultrasound": (
-        "Ultrasound imaging, ultrasonography, sonography, echography, echocardiography, "
-        "doppler ultrasound, duplex sonography."
-    ),
-    "pet": (
-        "Positron emission tomography, PET scan, FDG PET, PET imaging, metabolic imaging, "
-        "PET tracer uptake."
-    ),
+
     "ct_kombimodalitaet_spect+ct_pet+ct": (
-        "Combined PET CT imaging, fused PET CT, PET-CT, PET CT scan, hybrid PET CT."
+        "Hybrid CT imaging with PET or SPECT, PET/CT, PET-CT, fused PET-CT image, hybrid PET/CT imaging, "
+        "co-registered PET and CT, combined positron emission tomography and computed tomography, "
+        "SPECT/CT, SPECT-CT, fused SPECT-CT image, hybrid single-photon emission computed tomography and CT, "
+        "nuclear medicine hybrid imaging, tracer uptake co-registered with CT anatomy."
     ),
-    "endoscopy": (
-        "Endoscopy, colonoscopy, gastroscopy, bronchoscopy, enteroscopy, laparoscopic view, "
-        "endoscopic findings, mucosal findings."
-    ),
-    "pathology": (
-        "Pathology, pathological findings, biopsy findings, tissue pathology, inflammatory cells, "
-        "eosinophil counts, pathological examination."
-    ),
+
     "microscopy": (
         "Microscopy, microscopic image, histology, histopathology, pathology slide, tissue section, "
-        "H and E stain, immunohistochemistry, staining."
+        "H and E stain, hematoxylin and eosin staining, immunohistochemistry, IHC staining, "
+        "cells per high-power field, microscopic tissue morphology."
     ),
+
+    "pathology": (
+        "Pathology, pathological findings, biopsy findings, tissue pathology, biopsy specimen, "
+        "inflammatory cells, eosinophil counts, pathological examination, tissue specimen, "
+        "cell infiltration, histopathological diagnosis."
+    ),
+
+    "surgery_real": (
+        "Real clinical photograph, surgical photograph, intraoperative photograph, operative findings, "
+        "surgical field, surgical view, macroscopic specimen, resected specimen, gross specimen, "
+        "wound photograph, lesion photograph, real-world medical image from operation or clinical examination."
+    ),
+
+    "endoscopy": (
+        "Endoscopy, colonoscopy, gastroscopy, bronchoscopy, enteroscopy, duodenoscopy, laparoscopic view, "
+        "endoscopic findings, mucosal findings, colono fiberscope, gastrointestinal endoscopy."
+    ),
+
     "chart_or_diagram": (
         "Chart, graph, plot, line graph, bar chart, histogram, box plot, schematic, workflow figure, "
-        "timeline, clinical course figure, therapeutic management chart."
+        "timeline, clinical course figure, therapeutic management chart, Kaplan-Meier curve, ROC curve."
     ),
+
     "unknown": (
         "Unknown or not identifiable modality, insufficient information, unclear caption."
     ),
@@ -551,28 +921,34 @@ def classify_dataset(
         text, meta = extract_text_from_row(row)
         text = normalize_text(text)
 
-        label, reason = rule_based_classify(text)
+        label_short, reason_short, matched_pattern_short = rule_based_classify_with_rules(text, RULES_SHORT)
+
+        label_long, reason_long, matched_pattern_long = rule_based_classify_with_rules(text, RULES_LONG)
 
         rec = {
             "row_id": idx,
             "pmc_id": meta.get("PMC_ID", ""),
             "image": meta.get("image", ""),
             "modality_gt": meta.get("modality", ""),
+
             "caption": text,
             "sub_caption": meta.get("sub_caption", ""),
             "full_caption": meta.get("full_caption", ""),
             "intext_refs_summary": meta.get("intext_refs_summary", ""),
             "intext_refs": meta.get("intext_refs", ""),
-            "pred_label": label if label is not None else "",
-            "decision_source": "rule" if label is not None else "",
-            "decision_reason": reason,
-            "bert_score": None,
-            "bert_top2": None,
+
+            "pred_label_short": label_short if label_short is not None else "unknown",
+            "decision_reason_short": reason_short,
+            "matched_pattern_short": matched_pattern_short,
+
+            "pred_label_long": label_long if label_long is not None else "unknown",
+            "decision_reason_long": reason_long,
+            "matched_pattern_long": matched_pattern_long,
         }
 
         records.append(rec)
 
-        if label is None:
+        if label_long or label_short is None:
             fallback_record_positions.append(len(records) - 1)
             fallback_texts.append(text)
 

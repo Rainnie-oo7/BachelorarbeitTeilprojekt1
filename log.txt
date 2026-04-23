@@ -1,0 +1,75 @@
+Gefundene Arrow-Dateien: 59
+Lade Arrow-Shards: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 59/59 [00:00<00:00, 95.00it/s]
+Gesamtanzahl Zeilen: 1745049
+Spalten: ['__key__', '__url__', 'jpg', 'jsonl']
+Text wird aus row['jsonl'] extrahiert.
+
+===== DEBUG: Erstes Sample =====
+Spalten: ['__key__', '__url__', 'jpg', 'jsonl']
+__key__: <class 'str'>
+__url__: <class 'str'>
+jpg: <class 'PIL.JpegImagePlugin.JpegImageFile'>
+jsonl: <class 'bytes'>
+
+jsonl Vorschau:
+b'{"PMC_ID": "PMC9474956", "image": "train-0000-000000.jpg", "sub_caption": "Findings after prednisolone administration. a Colonoscopy findings: disappearance of the redness and edema of the colonic mucosa. b Pathological findings of biopsy from colonoscopy: improvement of inflammatory cell infiltration and numerous eosinophil counts, 1\\u201310 cells/HPF", "full_caption": "Preoperative CT and intraoperative findings. a Preoperative CT: a poor contrast effect on the small intestine. b Intraoperative findings: strangulated bowel obstruction caused by an intestinal mesenteric hiatal hernia. White arrow: intestinal mesenteric hiatal hernia", "intext_refs_summary": "", "intext_refs": "A 5-year-old male was taken to a nearby clinic with complaints of abdominal pain and vomiting. Blood examination '
+
+JSON Keys:
+['PMC_ID', 'image', 'sub_caption', 'full_caption', 'intext_refs_summary', 'intext_refs', 'modality']
+
+PMC_ID: PMC9474956
+image: train-0000-000000.jpg
+modality: N
+full_caption: Preoperative CT and intraoperative findings. a Preoperative CT: a poor contrast effect on the small intestine. b Intraoperative findings: strangulated bowel obstruction caused by an intestinal mesenteric hiatal hernia. White arrow: intestinal mesenteric hiatal hernia
+sub_caption: Findings after prednisolone administration. a Colonoscopy findings: disappearance of the redness and edema of the colonic mucosa. b Pathological findings of biopsy from colonoscopy: improvement of inflammatory cell infiltration and numerous eosinophil counts, 1–10 cells/HPF
+Prüfe modality-Verteilung: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2000/2000 [00:00<00:00, 3672.21it/s]
+
+===== modality-Verteilung (Ausschnitt) =====
+R: 1021
+N: 524
+M: 406
+V: 49
+
+Limit aktiv: 500 Zeilen
+
+Wende Regeln an ...
+Rule-Klassifikation: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 500/500 [00:00<00:00, 1077.06it/s]
+
+Rule-Treffer: 423
+BERT-Fallback nötig für: 77
+
+Lade BERT-Modell ...
+Loading weights: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 199/199 [00:00<00:00, 3745.38it/s]
+BERT-Fallback läuft ...
+BERT-Batches: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2/2 [00:04<00:00,  2.04s/it]
+
+CSV gespeichert unter:
+/home/b/PycharmProjects/ba1pmc/test_500.csv
+
+===== Verteilung pred_label =====
+pred_label
+ct                  146
+mri                 130
+microscopy           93
+xray                 53
+pathology            25
+ultrasound           24
+chart_or_diagram     16
+pet                   9
+endoscopy             3
+ct_pet                1
+Name: count, dtype: int64
+
+===== Verteilung decision_source =====
+decision_source
+rule             423
+bert_fallback     77
+Name: count, dtype: int64
+
+===== Verteilung modality_gt =====
+modality_gt
+R    260
+N    131
+M     98
+V     11
+Name: count, dtype: int64
