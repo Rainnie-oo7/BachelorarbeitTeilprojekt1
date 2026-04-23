@@ -1,3 +1,5 @@
-BiomedCLIP_data_pipeline/
+PMC-41GB/
+sampling_outputs/
+.git/
 .idea/
 *.iml

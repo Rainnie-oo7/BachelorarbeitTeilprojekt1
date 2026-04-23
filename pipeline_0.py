@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""
-Arrow-Shards einlesen und Captions mit Rules + BERT klassifizieren.
 
-Erwartete Ordnerstruktur:
+"""
+open-pmc Arrow/WebDataset Klassifikation mit Rules + BERT
+
+Erwartete Struktur:
 dataset_root/
     data-00000-of-00059.arrow
     ...
@@ -11,15 +12,11 @@ dataset_root/
     state.json
 
 Beispiel:
-python classify_open_pmc_arrow.py \
-    --dataset_root /pfad/zum/open_pmc_dataset \
-    --output_csv /pfad/zu/output/open_pmc_classified.csv \
-    --biomedbert_path /home/b/Dokumente/biomedbert
-
-Optional:
-    --limit 10000
-    --batch_size 64
-    --bert_threshold 0.30
+python pipeline_open_pmc.py \
+    --dataset_root /home/b/open_pmc \
+    --output_csv /home/b/open_pmc_classified.csv \
+    --biomedbert_path /home/b/Dokumente/biomedbert \
+    --limit 1000
 """
 
 from __future__ import annotations
@@ -27,87 +24,16 @@ from __future__ import annotations
 import os
 import re
 import json
-import math
-import glob
 import argparse
 from pathlib import Path
+from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import pandas as pd
 from tqdm import tqdm
-
 from datasets import Dataset, concatenate_datasets
 from transformers import AutoTokenizer, AutoModel
-
-
-# ============================================================
-# Konfiguration
-# ============================================================
-
-TEXT_COLUMN_CANDIDATES = [
-    "caption",
-    "captions",
-    "txt",
-    "text",
-    "sentence",
-    "report",
-    "description",
-    "input",
-]
-
-# Reihenfolge ist wichtig:
-# - explizite Kombiklassen zuerst
-# - danach klare Einzelmodalitäten
-RULE_LABELS_ORDER = [
-    "ct_pet",
-    "mri",
-    "ct",
-    "pet",
-    "ultrasound",
-    "xray",
-    "microscopy",
-    "chart_or_diagram",
-]
-
-CLASS_TEXTS: Dict[str, str] = {
-    "xray": (
-        "X-ray radiography, radiograph, plain film, chest x-ray, abdominal x-ray, "
-        "skeletal radiograph, projection radiography, AP view, PA view, lateral view, "
-        "portable x-ray, fluoroscopic x-ray image, c-arm x-ray guidance, radiographic examination."
-    ),
-    "ct": (
-        "Computed tomography, CT scan, axial CT, coronal CT, sagittal CT, contrast-enhanced CT, "
-        "non-contrast CT, computed tomographic imaging, Hounsfield units, helical CT."
-    ),
-    "mri": (
-        "Magnetic resonance imaging, MRI, MR image, T1-weighted, T2-weighted, FLAIR, DWI, "
-        "diffusion-weighted imaging, gadolinium-enhanced MRI, sagittal MR, axial MR, coronal MR."
-    ),
-    "ultrasound": (
-        "Ultrasound imaging, ultrasonography, sonography, echography, echocardiography, "
-        "doppler ultrasound, duplex sonography, transvaginal ultrasound, abdominal ultrasound."
-    ),
-    "pet": (
-        "Positron emission tomography, PET scan, FDG PET, PET imaging, metabolic imaging, "
-        "PET tracer uptake, positron emission tomographic image."
-    ),
-    "ct_pet": (
-        "Combined PET/CT imaging, fused PET CT, PET-CT, PET/CT scan, hybrid PET CT, "
-        "co-registered CT and PET image, attenuation-corrected PET CT."
-    ),
-    "microscopy": (
-        "Microscopy, microscopic image, histology, histopathology, immunohistochemistry, "
-        "hematoxylin eosin staining, H&E stain, tissue section, pathology slide."
-    ),
-    "chart_or_diagram": (
-        "Chart, graph, plot, bar chart, line graph, diagram, schematic illustration, "
-        "workflow figure, histogram, box plot, survival curve, ROC curve."
-    ),
-    "unknown": (
-        "Unknown or not identifiable imaging modality, insufficient information, unclear caption."
-    ),
-}
 
 
 # ============================================================
@@ -125,19 +51,84 @@ def normalize_text(text: str) -> str:
 
 def normalize_for_rules(text: str) -> str:
     text = normalize_text(text).lower()
-    # vereinfachte Trennung
     text = re.sub(r"[_/\\\-]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
 # ============================================================
+# JSONL aus WebDataset parsen
+# ============================================================
+
+def parse_jsonl_field(x):
+    if x is None:
+        return {}
+
+    if isinstance(x, bytes):
+        x = x.decode("utf-8", errors="ignore")
+
+    if isinstance(x, str):
+        x = x.strip()
+        if not x:
+            return {}
+        try:
+            return json.loads(x)
+        except Exception:
+            return {}
+
+    return {}
+
+
+def extract_text_from_row(row) -> Tuple[str, dict]:
+    """
+    Extrahiert den Text für die Modalitätsklassifikation.
+
+    Priorität:
+    - full_caption + sub_caption
+    - nur full_caption
+    - nur sub_caption
+    - dann intext_refs_summary
+    - dann intext_refs
+    """
+    meta = parse_jsonl_field(row.get("jsonl"))
+
+    full_caption = str(meta.get("full_caption", "") or "").strip()
+    sub_caption = str(meta.get("sub_caption", "") or "").strip()
+    intext_refs_summary = str(meta.get("intext_refs_summary", "") or "").strip()
+    intext_refs = str(meta.get("intext_refs", "") or "").strip()
+
+    if full_caption and sub_caption:
+        text = full_caption + " " + sub_caption
+    elif full_caption:
+        text = full_caption
+    elif sub_caption:
+        text = sub_caption
+    elif intext_refs_summary:
+        text = intext_refs_summary
+    elif intext_refs:
+        text = intext_refs
+    else:
+        text = ""
+
+    return text, meta
+
+
+# ============================================================
 # Harte Regeln
 # ============================================================
 
-def contains_any(text: str, patterns: List[str]) -> bool:
-    return any(re.search(p, text) for p in patterns)
-
+RULE_LABELS_ORDER = [
+    "ct_pet",
+    "mri",
+    "ct",
+    "pet",
+    "ultrasound",
+    "xray",
+    "endoscopy",
+    "pathology",
+    "microscopy",
+    "chart_or_diagram",
+]
 
 RULES: Dict[str, List[str]] = {
     "ct_pet": [
@@ -146,8 +137,8 @@ RULES: Dict[str, List[str]] = {
         r"\bpetct\b",
         r"\bfused\s+pet\s+ct\b",
         r"\bhybrid\s+pet\s+ct\b",
-        r"\bco[- ]registered\s+pet\s+ct\b",
         r"\bcombined\s+pet\s+ct\b",
+        r"\bco[- ]registered\s+pet\s+ct\b",
     ],
     "mri": [
         r"\bmri\b",
@@ -212,11 +203,32 @@ RULES: Dict[str, List[str]] = {
         r"\bfluoroscopic\b",
         r"\bc[- ]arm\b",
     ],
+    "endoscopy": [
+        r"\bendoscopy\b",
+        r"\bcolonoscopy\b",
+        r"\bgastroscopy\b",
+        r"\besophagogastroduodenoscopy\b",
+        r"\blaparoscopy\b",
+        r"\bbronchoscopy\b",
+        r"\bduodenoscopy\b",
+        r"\benteroscopy\b",
+        r"\bcolono fiberscope\b",
+        r"\bcf\b",
+    ],
+    "pathology": [
+        r"\bpathological findings\b",
+        r"\bbiopsy\b",
+        r"\bbiopsy findings\b",
+        r"\bhistopathology\b",
+        r"\bpathology\b",
+        r"\btissue specimen\b",
+        r"\bcell infiltration\b",
+        r"\beosinophil counts\b",
+    ],
     "microscopy": [
         r"\bmicroscopy\b",
         r"\bmicroscopic\b",
         r"\bhistology\b",
-        r"\bhistopathology\b",
         r"\bimmunohistochemistry\b",
         r"\bh\s*&\s*e\b",
         r"\bhematoxylin\b",
@@ -224,6 +236,8 @@ RULES: Dict[str, List[str]] = {
         r"\btissue section\b",
         r"\bpathology slide\b",
         r"\bstaining\b",
+        r"\bcells\/hpf\b",
+        r"\bhigh[- ]power field\b",
     ],
     "chart_or_diagram": [
         r"\bchart\b",
@@ -240,15 +254,18 @@ RULES: Dict[str, List[str]] = {
         r"\bbar graph\b",
         r"\bline graph\b",
         r"\bscatter plot\b",
+        r"\bclinical course\b",
+        r"\btherapeutic management\b",
+        r"\bbody weight changes\b",
     ],
 }
 
 
+def contains_any(text: str, patterns: List[str]) -> bool:
+    return any(re.search(p, text) for p in patterns)
+
+
 def rule_based_classify(text: str) -> Tuple[Optional[str], str]:
-    """
-    Gibt (label, reason) zurück.
-    Falls keine Regel greift: (None, "no_rule_match")
-    """
     t = normalize_for_rules(text)
 
     if not t:
@@ -262,8 +279,55 @@ def rule_based_classify(text: str) -> Tuple[Optional[str], str]:
 
 
 # ============================================================
-# BERT-Fallback
+# Zero-Shot-artiger BERT-Fallback
 # ============================================================
+
+CLASS_TEXTS: Dict[str, str] = {
+    "xray": (
+        "X-ray radiography, radiograph, plain radiograph, chest x-ray, abdominal x-ray, "
+        "skeletal radiograph, projection radiography, AP view, PA view, lateral view, "
+        "portable x-ray, fluoroscopic x-ray image, c-arm x-ray guidance."
+    ),
+    "ct": (
+        "Computed tomography, CT scan, axial CT, coronal CT, sagittal CT, contrast-enhanced CT, "
+        "non-contrast CT, computed tomographic imaging, Hounsfield units, helical CT."
+    ),
+    "mri": (
+        "Magnetic resonance imaging, MRI, MR image, T1-weighted, T2-weighted, FLAIR, DWI, "
+        "diffusion-weighted imaging, gadolinium-enhanced MRI."
+    ),
+    "ultrasound": (
+        "Ultrasound imaging, ultrasonography, sonography, echography, echocardiography, "
+        "doppler ultrasound, duplex sonography."
+    ),
+    "pet": (
+        "Positron emission tomography, PET scan, FDG PET, PET imaging, metabolic imaging, "
+        "PET tracer uptake."
+    ),
+    "ct_pet": (
+        "Combined PET CT imaging, fused PET CT, PET-CT, PET CT scan, hybrid PET CT."
+    ),
+    "endoscopy": (
+        "Endoscopy, colonoscopy, gastroscopy, bronchoscopy, enteroscopy, laparoscopic view, "
+        "endoscopic findings, mucosal findings."
+    ),
+    "pathology": (
+        "Pathology, pathological findings, biopsy findings, tissue pathology, inflammatory cells, "
+        "eosinophil counts, pathological examination."
+    ),
+    "microscopy": (
+        "Microscopy, microscopic image, histology, histopathology, pathology slide, tissue section, "
+        "H and E stain, immunohistochemistry, staining."
+    ),
+    "chart_or_diagram": (
+        "Chart, graph, plot, line graph, bar chart, histogram, box plot, schematic, workflow figure, "
+        "timeline, clinical course figure, therapeutic management chart."
+    ),
+    "unknown": (
+        "Unknown or not identifiable modality, insufficient information, unclear caption."
+    ),
+}
+
 
 class BertCaptionClassifier:
     def __init__(
@@ -304,6 +368,7 @@ class BertCaptionClassifier:
 
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
+
             enc = self.tokenizer(
                 batch,
                 padding=True,
@@ -327,8 +392,8 @@ class BertCaptionClassifier:
         threshold: float = 0.30,
         batch_size: int = 32,
     ) -> List[Dict]:
-        text_embs = self._encode_texts(texts, batch_size=batch_size)  # [N, D]
-        sims = text_embs @ self.label_embs.T  # [N, C]
+        text_embs = self._encode_texts(texts, batch_size=batch_size)
+        sims = text_embs @ self.label_embs.T
 
         results = []
         for i in range(sims.shape[0]):
@@ -353,16 +418,16 @@ class BertCaptionClassifier:
 
 
 # ============================================================
-# Arrow-Dateien einlesen
+# Arrow-Dateien laden
 # ============================================================
 
 def find_arrow_files(dataset_root: Path) -> List[Path]:
-    files = sorted(dataset_root.glob("data-*.arrow"))
-    return files
+    return sorted(dataset_root.glob("data-*.arrow"))
 
 
 def load_arrow_shards(arrow_files: List[Path]) -> Dataset:
     datasets_list = []
+
     for fp in tqdm(arrow_files, desc="Lade Arrow-Shards"):
         ds = Dataset.from_file(str(fp))
         datasets_list.append(ds)
@@ -376,26 +441,54 @@ def load_arrow_shards(arrow_files: List[Path]) -> Dataset:
     return concatenate_datasets(datasets_list)
 
 
-def choose_text_column(columns: List[str]) -> str:
-    lower_map = {c.lower(): c for c in columns}
+# ============================================================
+# Debug / Übersicht
+# ============================================================
 
-    for cand in TEXT_COLUMN_CANDIDATES:
-        if cand.lower() in lower_map:
-            return lower_map[cand.lower()]
+def inspect_first_sample(ds: Dataset):
+    sample = ds[0]
 
-    # Fallback: erste String-ähnliche Spalte, die typisch klingt
-    for c in columns:
-        cl = c.lower()
-        if any(token in cl for token in ["text", "caption", "txt", "report", "desc"]):
-            return c
+    print("\n===== DEBUG: Erstes Sample =====")
+    print("Spalten:", ds.column_names)
 
-    raise ValueError(
-        f"Keine Text-/Caption-Spalte gefunden. Vorhandene Spalten: {columns}"
-    )
+    for k, v in sample.items():
+        print(f"{k}: {type(v)}")
+
+    raw_jsonl = sample.get("jsonl")
+    if isinstance(raw_jsonl, bytes):
+        preview = raw_jsonl[:800]
+    else:
+        preview = str(raw_jsonl)[:800]
+
+    print("\njsonl Vorschau:")
+    print(preview)
+
+    meta = parse_jsonl_field(raw_jsonl)
+    print("\nJSON Keys:")
+    print(list(meta.keys()))
+
+    print("\nPMC_ID:", meta.get("PMC_ID"))
+    print("image:", meta.get("image"))
+    print("modality:", meta.get("modality"))
+    print("full_caption:", str(meta.get("full_caption", ""))[:300])
+    print("sub_caption:", str(meta.get("sub_caption", ""))[:300])
+
+
+def inspect_modality_distribution(ds: Dataset, limit: int = 5000):
+    counter = Counter()
+
+    n = min(len(ds), limit)
+    for i in tqdm(range(n), desc="Prüfe modality-Verteilung"):
+        meta = parse_jsonl_field(ds[i].get("jsonl"))
+        counter[meta.get("modality", "MISSING")] += 1
+
+    print("\n===== modality-Verteilung (Ausschnitt) =====")
+    for key, value in counter.most_common():
+        print(f"{key}: {value}")
 
 
 # ============================================================
-# Hauptlogik
+# Hauptklassifikation
 # ============================================================
 
 def classify_dataset(
@@ -405,6 +498,7 @@ def classify_dataset(
     limit: Optional[int],
     batch_size: int,
     bert_threshold: float,
+    inspect_only: bool = False,
 ):
     arrow_files = find_arrow_files(dataset_root)
     if not arrow_files:
@@ -412,47 +506,44 @@ def classify_dataset(
 
     print(f"Gefundene Arrow-Dateien: {len(arrow_files)}")
     ds = load_arrow_shards(arrow_files)
+
     print(f"Gesamtanzahl Zeilen: {len(ds)}")
     print(f"Spalten: {ds.column_names}")
+    print("Text wird aus row['jsonl'] extrahiert.")
 
-    # Erstes Sample anschauen
-    sample = ds[0]
+    inspect_first_sample(ds)
+    inspect_modality_distribution(ds, limit=2000)
 
-    print("\nKeys im Sample:")
-    for k in sample.keys():
-        print(k, type(sample[k]))
-
-    print("\njsonl Inhalt (roh):")
-    print(sample["jsonl"][:350000])
-
-    text_col = choose_text_column(ds.column_names)
-    print(f"Verwendete Textspalte: {text_col}")
+    if inspect_only:
+        print("\ninspect_only=True -> keine Klassifikation ausgeführt.")
+        return
 
     if limit is not None:
         ds = ds.select(range(min(limit, len(ds))))
-        print(f"Limit aktiv: {len(ds)} Zeilen")
-
-    # Für Ausgabe nützliche Zusatzspalten
-    extra_cols = []
-    for c in ["__key__", "__url__"]:
-        if c in ds.column_names:
-            extra_cols.append(c)
+        print(f"\nLimit aktiv: {len(ds)} Zeilen")
 
     records = []
     fallback_texts = []
-    fallback_indices = []
+    fallback_record_positions = []
 
-    print("Wende Regeln an ...")
+    print("\nWende Regeln an ...")
     for idx in tqdm(range(len(ds)), desc="Rule-Klassifikation"):
         row = ds[idx]
-        text = normalize_text(row.get(text_col, ""))
+        text, meta = extract_text_from_row(row)
+        text = normalize_text(text)
 
         label, reason = rule_based_classify(text)
 
         rec = {
             "row_id": idx,
-            "text_column": text_col,
+            "pmc_id": meta.get("PMC_ID", ""),
+            "image": meta.get("image", ""),
+            "modality_gt": meta.get("modality", ""),
             "caption": text,
+            "sub_caption": meta.get("sub_caption", ""),
+            "full_caption": meta.get("full_caption", ""),
+            "intext_refs_summary": meta.get("intext_refs_summary", ""),
+            "intext_refs": meta.get("intext_refs", ""),
             "pred_label": label if label is not None else "",
             "decision_source": "rule" if label is not None else "",
             "decision_reason": reason,
@@ -460,49 +551,46 @@ def classify_dataset(
             "bert_top2": None,
         }
 
-        for c in extra_cols:
-            rec[c] = row.get(c, None)
-
         records.append(rec)
 
         if label is None:
-            fallback_indices.append(idx)
+            fallback_record_positions.append(len(records) - 1)
             fallback_texts.append(text)
 
-    print(f"Rule-Treffer: {len(records) - len(fallback_indices)}")
-    print(f"BERT-Fallback nötig für: {len(fallback_indices)}")
+    print(f"\nRule-Treffer: {len(records) - len(fallback_texts)}")
+    print(f"BERT-Fallback nötig für: {len(fallback_texts)}")
 
-    if fallback_indices:
+    if fallback_texts:
         if not biomedbert_path:
-            print("Warnung: Kein --biomedbert_path angegeben. Unklare Fälle werden als 'unknown' gesetzt.")
-            for idx in fallback_indices:
-                records[idx]["pred_label"] = "unknown"
-                records[idx]["decision_source"] = "no_bert_available"
-                records[idx]["decision_reason"] = "rule_failed_and_no_bert_model"
+            print("Warnung: Kein --biomedbert_path angegeben. Unklare Fälle werden auf 'unknown' gesetzt.")
+            for pos in fallback_record_positions:
+                records[pos]["pred_label"] = "unknown"
+                records[pos]["decision_source"] = "no_bert_available"
+                records[pos]["decision_reason"] = "rule_failed_and_no_bert_model"
         else:
-            print("Lade BERT-Modell ...")
+            print("\nLade BERT-Modell ...")
             bert_clf = BertCaptionClassifier(model_path=biomedbert_path)
 
             print("BERT-Fallback läuft ...")
             for start in tqdm(range(0, len(fallback_texts), batch_size), desc="BERT-Batches"):
                 sub_texts = fallback_texts[start:start + batch_size]
-                sub_preds = bert_clf.predict_batch(
+                sub_positions = fallback_record_positions[start:start + batch_size]
+
+                preds = bert_clf.predict_batch(
                     sub_texts,
                     threshold=bert_threshold,
                     batch_size=min(16, batch_size)
                 )
-                sub_ids = fallback_indices[start:start + batch_size]
 
-                for real_idx, pred in zip(sub_ids, sub_preds):
-                    records[real_idx]["pred_label"] = pred["label"]
-                    records[real_idx]["decision_source"] = "bert_fallback"
-                    records[real_idx]["decision_reason"] = "rule_failed"
-                    records[real_idx]["bert_score"] = pred["score"]
-                    records[real_idx]["bert_top2"] = json.dumps(pred["top2"], ensure_ascii=False)
+                for pos, pred in zip(sub_positions, preds):
+                    records[pos]["pred_label"] = pred["label"]
+                    records[pos]["decision_source"] = "bert_fallback"
+                    records[pos]["decision_reason"] = "rule_failed"
+                    records[pos]["bert_score"] = pred["score"]
+                    records[pos]["bert_top2"] = json.dumps(pred["top2"], ensure_ascii=False)
 
     df = pd.DataFrame(records)
 
-    # Leere Captions markieren
     empty_mask = df["caption"].fillna("").astype(str).str.strip().eq("")
     df.loc[empty_mask, "pred_label"] = "unknown"
     df.loc[empty_mask, "decision_source"] = "empty_text"
@@ -510,13 +598,17 @@ def classify_dataset(
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_csv, index=False, encoding="utf-8")
-    print(f"\nFertig. CSV gespeichert unter:\n{output_csv}")
 
-    print("\nVerteilung:")
+    print(f"\nCSV gespeichert unter:\n{output_csv}")
+
+    print("\n===== Verteilung pred_label =====")
     print(df["pred_label"].value_counts(dropna=False))
 
-    print("\nDecision Source:")
+    print("\n===== Verteilung decision_source =====")
     print(df["decision_source"].value_counts(dropna=False))
+
+    print("\n===== Verteilung modality_gt =====")
+    print(df["modality_gt"].value_counts(dropna=False).head(20))
 
 
 # ============================================================
@@ -525,18 +617,49 @@ def classify_dataset(
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_root", type=str, required=True,
-                        help="Ordner mit data-*.arrow, dataset_info.json, state.json")
-    parser.add_argument("--output_csv", type=str, required=True,
-                        help="Pfad zur Ausgabedatei (.csv)")
-    parser.add_argument("--biomedbert_path", type=str, default=None,
-                        help="Lokaler Pfad zu BiomedBERT/PubMedBERT")
-    parser.add_argument("--limit", type=int, default=None,
-                        help="Optionales Zeilenlimit zum Testen")
-    parser.add_argument("--batch_size", type=int, default=64,
-                        help="Batchgröße für Fallback-Verarbeitung")
-    parser.add_argument("--bert_threshold", type=float, default=0.30,
-                        help="Mindestscore für BERT-Zuordnung, sonst unknown")
+
+    parser.add_argument(
+        "--dataset_root",
+        type=str,
+        required=True,
+        help="Ordner mit data-*.arrow, dataset_info.json, state.json"
+    )
+    parser.add_argument(
+        "--output_csv",
+        type=str,
+        required=True,
+        help="Pfad zur Ausgabe-CSV"
+    )
+    parser.add_argument(
+        "--biomedbert_path",
+        type=str,
+        default=None,
+        help="Lokaler Pfad zu BiomedBERT/PubMedBERT"
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optionales Limit für erste Tests"
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=64,
+        help="Batchgröße für den BERT-Fallback"
+    )
+    parser.add_argument(
+        "--bert_threshold",
+        type=float,
+        default=0.30,
+        help="Schwelle für BERT-Fallback, sonst unknown"
+    )
+    parser.add_argument(
+        "--inspect_only",
+        action="store_true",
+        help="Nur Struktur/Beispiele ausgeben, keine Klassifikation"
+    )
+
     return parser.parse_args()
 
 
@@ -553,6 +676,7 @@ def main():
         limit=args.limit,
         batch_size=args.batch_size,
         bert_threshold=args.bert_threshold,
+        inspect_only=args.inspect_only,
     )
 
 
