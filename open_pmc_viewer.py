@@ -10,7 +10,106 @@ from PIL import Image, ImageTk
 import io
 import tkinter as tk
 from tkinter import ttk, messagebox
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
 
+CNN_MODEL_PATH = "/home/b/PycharmProjects/ba2roco/cnn/convu_try_3t.pth"
+
+CLASS_NAMES_CNN = [
+    'xray',
+    'xray_fluoroskopie_angiographie',
+    'us',
+    'mrt_hirn_flair',
+    'mrt_hirn_t1',
+    'mrt_hirn_t2',
+    'mrt_hirn_t1_c',
+    'mrt_prostata_t1',
+    'mrt_prostata_t2',
+    'ct',
+    'ct_kombimodalitaet_spect+ct_pet+ct'
+]
+#mrt_hirn zusamenfassen
+#mrt_body zusammenfassen
+#microscopy
+#pathology
+#surgery_real
+#=10 Klassen
+#chart_or_diagram
+#endoscopy
+
+
+class SimpleCNN(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+def load_cnn_model(model_path, class_names):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = SimpleCNN(num_classes=len(class_names))
+
+    checkpoint = torch.load(model_path, map_location=device)
+
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
+
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
+
+    return model, transform, device
+
+@torch.no_grad()
+def predict_with_cnn(pil_img, model, transform, device, class_names):
+    img = pil_img.convert("RGB")
+    x = transform(img).unsqueeze(0).to(device)
+
+    logits = model(x)
+    probs = torch.softmax(logits, dim=1)[0]
+
+    pred_idx = int(torch.argmax(probs).item())
+    pred_label = class_names[pred_idx]
+    pred_prob = float(probs[pred_idx].item())
+
+    topk = torch.topk(probs, k=min(3, len(class_names)))
+
+    top3 = []
+    for idx, prob in zip(topk.indices.tolist(), topk.values.tolist()):
+        top3.append((class_names[idx], float(prob)))
+
+    return pred_label, pred_prob, top3
 
 def parse_jsonl_field(x):
     if x is None:
@@ -70,12 +169,16 @@ def bytes_to_pil_image(x):
 
 
 class OpenPMCViewer:
-    def __init__(self, root, ds, df):
+    def __init__(self, root, ds, df, cnn_model=None, cnn_transform=None, cnn_device=None):
         self.root = root
         self.ds = ds
         self.df = df.reset_index(drop=True)
         self.index = 0
         self.photo = None
+
+        self.cnn_model = cnn_model
+        self.cnn_transform = cnn_transform
+        self.cnn_device = cnn_device
 
         self.root.title("Open-PMC Bild-CSV Viewer")
 
@@ -138,6 +241,26 @@ class OpenPMCViewer:
 
         pil_img = bytes_to_pil_image(ds_row["jpg"])
 
+        rules_bert_label = csv_row.get("pred_label", "")
+        cnn_text = "CNN prediction: nicht geladen"
+
+        if self.cnn_model is not None:
+            try:
+                cnn_label, cnn_prob, cnn_top3 = predict_with_cnn(
+                    pil_img,
+                    self.cnn_model,
+                    self.cnn_transform,
+                    self.cnn_device,
+                    CLASS_NAMES_CNN
+                )
+
+                cnn_text = f"CNN prediction: {cnn_label} ({cnn_prob:.4f})\n"
+                cnn_text += "CNN top3:\n"
+                for label_name, prob in cnn_top3:
+                    cnn_text += f"  - {label_name}: {prob:.4f}\n"
+
+            except Exception as e:
+                cnn_text = f"CNN-Fehler: {e}"
         # Bild skalieren
         max_w, max_h = 900, 650
         pil_img.thumbnail((max_w, max_h))
@@ -172,7 +295,8 @@ PMC_ID: {pmc_id}
 Image: {image_name}
 
 modality_gt: {modality_gt}
-pred_label: {pred_label}
+Rules+BERT pred_label aus CSV: {pred_label}
+{cnn_text}
 
 Caption:
 {caption}
@@ -262,11 +386,40 @@ def main():
     print("Lade Arrow-Dataset...")
     ds = load_arrow_shards(dataset_root)
 
+    CLASS_NAMES_CNN = [
+        'xray',
+        'xray_fluoroskopie_angiographie',
+        'us',
+        'mrt_hirn_flair',
+        'mrt_hirn_t1',
+        'mrt_hirn_t2',
+        'mrt_hirn_t1_c',
+        'mrt_prostata_t1',
+        'mrt_prostata_t2',
+        'ct',
+        'ct_kombimodalitaet_spect+ct_pet+ct'
+    ]
+
+    CNN_MODEL_PATH = "/home/b/PycharmProjects/ba2roco/cnn/convu_try_3t.pth"
+
+    print("Lade CNN-Modell...")
+    cnn_model, cnn_transform, cnn_device = load_cnn_model(
+        CNN_MODEL_PATH,
+        CLASS_NAMES_CNN
+    )
+    print(f"CNN geladen auf: {cnn_device}")
     print("Starte Viewer...")
     root = tk.Tk()
     root.geometry("1100x950")
 
-    app = OpenPMCViewer(root, ds, df)
+    app = OpenPMCViewer(
+        root,
+        ds,
+        df,
+        cnn_model=cnn_model,
+        cnn_transform=cnn_transform,
+        cnn_device=cnn_device
+    )
     root.mainloop()
 
 

@@ -129,9 +129,28 @@ RULE_LABELS_ORDER = [
     "microscopy",
     "chart_or_diagram",
 ]
+# xray
+# xray_fluoroskopie_angiographie
+# us
+## mrt_hirn_flair
+## mrt_hirn_t1
+## mrt_hirn_t2
+### mrt_hirn_t1_c
+### mrt_prostata_t1
+### mrt_prostata_t2
+# ct
+# ct_kombimodalitaet_spect+ct_pet+ct
 
+#mrt_hirn zusamenfassen
+#mrt_body zusammenfassen
+#microscopy
+#pathology
+#surgery_real
+#=10 Klassen
+#chart_or_diagram
+#endoscopy
 RULES: Dict[str, List[str]] = {
-    "ct_pet": [
+    "ct_kombimodalitaet_spect+ct_pet+ct": [
         r"\bpet\s*/\s*ct\b",
         r"\bpet\s*-\s*ct\b",
         r"\bpetct\b",
@@ -140,7 +159,7 @@ RULES: Dict[str, List[str]] = {
         r"\bcombined\s+pet\s+ct\b",
         r"\bco[- ]registered\s+pet\s+ct\b",
     ],
-    "mri": [
+    "mri_hirn": [
         r"\bmri\b",
         r"\bmr\b",
         r"\bmagnetic resonance\b",
@@ -304,7 +323,7 @@ CLASS_TEXTS: Dict[str, str] = {
         "Positron emission tomography, PET scan, FDG PET, PET imaging, metabolic imaging, "
         "PET tracer uptake."
     ),
-    "ct_pet": (
+    "ct_kombimodalitaet_spect+ct_pet+ct": (
         "Combined PET CT imaging, fused PET CT, PET-CT, PET CT scan, hybrid PET CT."
     ),
     "endoscopy": (
