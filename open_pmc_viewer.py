@@ -301,15 +301,12 @@ PMC_ID: {pmc_id}
 Image: {image_name}
 
 modality_gt: {modality_gt}
-Rules+BERT / kurze Regeln:
-Label: {rules_short_label}
-Reason: {rules_short_reason}
-Pattern: {rules_short_pattern}
 
-Rules+BERT / lange Regeln:
-Label: {rules_long_label}
-Reason: {rules_long_reason}
-Pattern: {rules_long_pattern}
+kurze Regeln: ||| lange Regeln:
+Label: {rules_short_label} ||| {rules_long_label}
+Reason: {rules_short_reason} ||| {rules_long_reason}
+Pattern: {rules_short_pattern} ||| {rules_long_pattern}
+
 {cnn_text}
 
 Caption:

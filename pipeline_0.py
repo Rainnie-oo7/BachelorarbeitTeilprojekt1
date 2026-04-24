@@ -126,6 +126,7 @@ RULE_LABELS_ORDER = [
     "xray_fluoroskopie_angiographie",
     "xray",
     "us",
+
     "microscopy",
     "pathology",
     "surgery_real",
@@ -360,6 +361,7 @@ CT_RULES_SHORT = [
 ]
 XRAY_ANGIOGRAPHY_RULES_SHORT = [
     r"\bangioplast\w*\b",
+    r"\bangiography\w*\b",
     r"\bpta\b",
     r"\bptca\b",
     r"\bpci\b",
@@ -480,6 +482,8 @@ XRAY_RULES_LONG = [
     r"\bchest film\b",
     r"\bportable chest\b",
     r"\bportable x[- ]ray\b",
+    r"\broentgen\b",
+    r"\br\s*[öo]ntgen\b"
     r"\bap view\b",
     r"\bpa view\b",
     r"\blateral view\b",
@@ -581,15 +585,29 @@ CHART_RULES_LONG = [
     r"\bbody weight changes\b",
     r"\btimeline\b",
 ]
+LABEL_PRIORITY = {
+    "xray_fluoroskopie_angiographie": 100,
+    "us": 90,
+    "ct_kombimodalitaet_spect+ct_pet+ct": 85,
+    "mrt_hirn": 80,
+    "mrt_body": 70,
+    "ct": 60,
+    "xray": 55,
+    "microscopy": 54,
+    "pathology": 50,
+    "surgery_real": 45,
+    "endoscopy": 35,
+    "chart_or_diagram": 34,
+}
 # RULES
 RULES_SHORT = [
+    ("xray_fluoroskopie_angiographie", XRAY_ANGIOGRAPHY_RULES_SHORT),
+    ("us", US_RULES_SHORT),
     ("ct_kombimodalitaet_spect+ct_pet+ct", CT_HYBRID_RULES_SHORT),
     ("mrt_hirn", MRT_HIRN_RULES_SHORT),
     ("mrt_body", MRT_BODY_RULES_SHORT),
     ("ct", CT_RULES_SHORT),
-    ("xray_fluoroskopie_angiographie", XRAY_ANGIOGRAPHY_RULES_SHORT),
     ("xray", XRAY_RULES_SHORT),
-    ("us", US_RULES_SHORT),
     ("microscopy", MICROSCOPY_RULES_SHORT),
     ("pathology", PATHOLOGY_RULES_SHORT),
     ("surgery_real", SURGERY_RULES_SHORT),
@@ -597,13 +615,13 @@ RULES_SHORT = [
     ("chart_or_diagram", CHART_RULES_SHORT),
 ]
 RULES_LONG = [
+    ("xray_fluoroskopie_angiographie", XRAY_ANGIOGRAPHY_RULES_LONG),
+    ("us", US_RULES_LONG),
     ("ct_kombimodalitaet_spect+ct_pet+ct", CT_HYBRID_RULES_LONG),
     ("mrt_hirn", MRT_HIRN_RULES_LONG),
     ("mrt_body", MRT_BODY_RULES_LONG),
     ("ct", CT_RULES_LONG),
-    ("xray_fluoroskopie_angiographie", XRAY_ANGIOGRAPHY_RULES_LONG),
     ("xray", XRAY_RULES_LONG),
-    ("us", US_RULES_LONG),
     ("microscopy", MICROSCOPY_RULES_LONG),
     ("pathology", PATHOLOGY_RULES_LONG),
     ("surgery_real", SURGERY_RULES_LONG),
@@ -616,18 +634,64 @@ def contains_any(text: str, patterns: List[str]) -> bool:
     return any(re.search(p, text) for p in patterns)
 
 
-def rule_based_classify_with_rules(text: str, rules):
+def rule_based_classify_with_rules(text: str, rules, label_priority=None):
     t = normalize_for_rules(text)
 
     if not t:
-        return None, "empty_text", ""
+        return "unknown", "empty_text", "", {}
+
+    if label_priority is None:
+        label_priority = {}
+
+    hits = {}
 
     for label, patterns in rules:
         for pattern in patterns:
             if re.search(pattern, t):
-                return label, f"rule:{label}", pattern
+                if label not in hits:
+                    hits[label] = {
+                        "score": 0,
+                        "patterns": [],
+                    }
 
-    return None, "no_rule_match", ""
+                hits[label]["score"] += 1
+                hits[label]["patterns"].append(pattern)
+
+    if not hits:
+        return "unknown", "no_rule_match", "", {}
+
+    # Zusatzlogik: starke Bildtyp-Klassen gegen zufällige Modalitätswörter schützen
+    # Beispiel: intraoperative findings + CT im Text.
+    strong_context_labels = [
+        "surgery_real",
+        "pathology",
+        "microscopy",
+        "endoscopy",
+        "chart_or_diagram",
+    ]
+
+    for label in strong_context_labels:
+        if label in hits:
+            hits[label]["score"] += 3
+
+    # Priorität als Tie-Breaker
+    best_label = sorted(
+        hits.keys(),
+        key=lambda label: (
+            hits[label]["score"],
+            label_priority.get(label, 0)
+        ),
+        reverse=True
+    )[0]
+
+    matched_patterns = hits[best_label]["patterns"]
+
+    return (
+        best_label,
+        f"parallel_rule:{best_label}; hits={hits[best_label]['score']}",
+        " | ".join(matched_patterns[:5]),
+        hits,
+    )
 
 
 # ============================================================
@@ -921,10 +985,17 @@ def classify_dataset(
         text, meta = extract_text_from_row(row)
         text = normalize_text(text)
 
-        label_short, reason_short, matched_pattern_short = rule_based_classify_with_rules(text, RULES_SHORT)
+        label_short, reason_short, matched_pattern_short, all_hits_short = rule_based_classify_with_rules(
+            text,
+            RULES_LONG,
+            LABEL_PRIORITY
+        )
 
-        label_long, reason_long, matched_pattern_long = rule_based_classify_with_rules(text, RULES_LONG)
-
+        label_long, reason_long, matched_pattern_long, all_hits_long = rule_based_classify_with_rules(
+            text,
+            RULES_LONG,
+            LABEL_PRIORITY
+        )
         rec = {
             "row_id": idx,
             "pmc_id": meta.get("PMC_ID", ""),
@@ -945,7 +1016,8 @@ def classify_dataset(
             "decision_reason_long": reason_long,
             "matched_pattern_long": matched_pattern_long,
         }
-
+        rec["all_rule_hits_short"] = json.dumps(all_hits_short, ensure_ascii=False)
+        rec["all_rule_hits_long"] = json.dumps(all_hits_long, ensure_ascii=False)
         records.append(rec)
 
         if label_long or label_short is None:
