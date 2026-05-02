@@ -761,8 +761,8 @@ CLASS_TEXTS: Dict[str, str] = {
     ),
 
     "surgery_real": (
-        "Real clinical photograph, surgical photograph, intraoperative photograph, operative findings, "
-        "surgical field, surgical view, macroscopic specimen, resected specimen, gross specimen, "
+        "Real clinical photograph, photo, a photo of, photograph, surgical photograph, intraoperative photograph, operative findings, "
+        "surgical field, surgical view, surgical photo, photo of surgery, photo of surgical, gross, macroscopic specimen, resected specimen, gross specimen, "
         "wound photograph, lesion photograph, real-world medical image from operation or clinical examination."
     ),
 
@@ -987,7 +987,7 @@ def classify_dataset(
 
         label_short, reason_short, matched_pattern_short, all_hits_short = rule_based_classify_with_rules(
             text,
-            RULES_LONG,
+            RULES_SHORT,
             LABEL_PRIORITY
         )
 
