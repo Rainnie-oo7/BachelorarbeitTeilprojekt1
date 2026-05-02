@@ -12,30 +12,260 @@ dataset_root/
     state.json
 
 Beispiel:
-python pipeline_open_pmc.py \
-    --dataset_root /home/b/open_pmc \
-    --output_csv /home/b/open_pmc_classified.csv \
-    --biomedbert_path /home/b/Dokumente/biomedbert \
-    --limit 1000
+python make_CLS/pipeline_0.py \
+  --dataset_root /home/user/PycharmProjects/ba1pmc/PMC-41GB \
+  --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/test_500.csv \
+  --biomedbert_path /home/user/Dokumente/biomedbert \
+  --llamamistral_path /home/user/Dokumente/llamamistral \
+  --per_class 50 \
+  --limit 500
 """
 
 from __future__ import annotations
 
 import os
+import os.path as osp
+from pathlib import Path
+import numpy as np
+from PIL import Image
 import re
 import json
 import argparse
-from pathlib import Path
+
+import hashlib
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
+import io
 from itertools import zip_longest
 
 import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+import torch.nn.functional as F
 import pandas as pd
 from tqdm import tqdm
 from datasets import Dataset, concatenate_datasets
 from transformers import AutoTokenizer, AutoModel
+from transformers import AutoModelForCausalLM
+from vllm import LLM, SamplingParams
 
+# Finale Klassen u. Mapping
+FINAL_CLASSES = [
+    "xray",
+    "xray_fluoroskopie_angiographie",
+    "us",
+    "mrt_hirn",
+    "mrt_body",
+    "ct",
+    "ct_kombimodalitaet_spect+ct_pet+ct"
+]
+CNN1_CLASS_NAMES = {
+    "mrt_prostata_t1"
+    "mrt_prostata_t2"
+    "mrt_hirn_flair'"
+    "mrt_hirn_t1"
+    "mrt_hirn_t2"
+    "mrt_hirn_t1_c"
+    "ct",
+    "ct_kombimodalitaet_spect+ct_pet+ct",
+    "xray",
+    "xray_fluoroskopie_angiographie",
+    "us"
+}
+CNN1_MAPPING = {
+    "mrt_prostata_t1": "mrt_body",
+    "mrt_prostata_t2": "mrt_body",
+    "mrt_hirn_flair": "mrt_hirn",
+    "mrt_hirn_t1": "mrt_hirn",
+    "mrt_hirn_t2": "mrt_hirn",
+    "mrt_hirn_t1_c": "mrt_hirn",
+
+    "ct": "ct",
+    "ct_kombimodalitaet_spect+ct_pet+ct": "ct_kombimodalitaet_spect+ct_pet+ct",
+    "xray": "xray",
+    "xray_fluoroskopie_angiographie": "xray_fluoroskopie_angiographie",
+    "us": "us",
+}
+CNN2_CLASS_NAMES = {
+    "xray",
+    "xray_fluoroskopie_angiographie",
+    "mrt_hirn",
+    "mrt_body"
+}
+CNN2_MAPPING = {
+    "xray": "xray",
+    "xray_fluoroskopie_angiographie": "xray_fluoroskopie_angiographie",
+    "mrt_hirn": "mrt_hirn",
+    "mrt_body": "mrt_body",
+}
+WEIGHTS = {
+    "rules": 0.2,
+    "bert": 0.2,
+    "cnn1": 0.2,
+    "cnn2": 0.2,
+    "llm": 0.2
+}
+# gen. LLM (vLLM READY)
+class LocalLLM:
+    def __init__(self, model_path: str):
+        model_path = Path(osp.normpath(model_path))
+
+        if not model_path.exists():
+            raise FileNotFoundError(f"LLM Pfad existiert nicht: {model_path}")
+
+        print("Initialize LLM von:", model_path)
+
+        try:
+            self.llm = LLM(model=str(model_path))
+            self.params = SamplingParams(temperature=0.0, max_tokens=64)
+            self.use_vllm = True
+        except Exception as e:
+            print("vLLM nicht verfügbar -> fallback transformers:", e)
+            self.tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True)
+            self.model = AutoModelForCausalLM.from_pretrained(str(model_path),
+                device_map="auto", torch_dtype=torch.float16, local_files_only=True)
+            self.use_vllm = False
+
+    def batch_predict(self, texts):
+        prompts = [
+            f"""Classify into one of {FINAL_CLASSES}.
+Return JSON: {{"label": "...", "confidence": 0.0}}
+
+{text}
+"""
+            for text in texts
+        ]
+
+        results = []
+
+        if self.use_vllm:
+            outputs = self.llm.generate(prompts, self.params)
+
+            for out in outputs:
+                text = out.outputs[0].text
+                try:
+                    js = json.loads(text[text.find("{"):])
+                    results.append((js["label"], js["confidence"]))
+                except:
+                    results.append(("unknown", 0.0))
+
+        else:
+            for p in prompts:
+                inputs = self.tokenizer(p, return_tensors="pt").to(self.model.device)
+                out = self.model.generate(**inputs, max_new_tokens=64)
+                decoded = self.tokenizer.decode(out[0], skip_special_tokens=True)
+
+                try:
+                    js = json.loads(decoded[decoded.find("{"):])
+                    results.append((js["label"], js["confidence"]))
+                except:
+                    results.append(("unknown", 0.0))
+
+        return results
+
+class SimpleCNN(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
+"""
+# CNN Mapping -> FINAL_CLASSES
+# Top 1 -> Score (kein 0.7 mrt, 0.2 us usw. Softmax, sondern direktes 'mrt')
+# def cnn_to_scores(label, mapping):
+#     scores = {c: 0.0 for c in FINAL_CLASSES}
+# 
+#     if label in mapping:
+#         mapped = mapping[label]
+#         scores[mapped] = 1.0
+# 
+#     return scores
+"""
+# CNN Mapping -> FINAL_CLASSES
+# mit Top-3 (Variante, besserer Ueberblick in einem Viewer o.ae)
+def map_scores_to_final(full_scores, mapping):
+    final_scores = {c: 0.0 for c in FINAL_CLASSES}
+
+    for cls, prob in full_scores.items():
+        if cls in mapping:
+            final_cls = mapping[cls]
+            final_scores[final_cls] += prob
+
+    return final_scores
+
+# Final-Classes Fusion
+def fuse_scores(rule, bert, cnn1, cnn2, llm):
+    final = {}
+    contrib = {}
+
+    for label in FINAL_CLASSES:
+        contrib[label] = {
+            "rules": WEIGHTS["rules"] * rule.get(label, 0),
+            "bert": WEIGHTS["bert"] * bert.get(label, 0),
+            "cnn1": WEIGHTS["cnn1"] * cnn1.get(label, 0),
+            "cnn2": WEIGHTS["cnn2"] * cnn2.get(label, 0),
+            "llm": WEIGHTS["llm"] * (llm[1] if llm[0] == label else 0),
+        }
+
+        final[label] = sum(contrib[label].values())
+
+    sorted_labels = sorted(final.items(), key=lambda x: x[1], reverse=True)
+
+    top1, top2 = sorted_labels[0], sorted_labels[1]
+    uncertain = (top1[1] - top2[1]) < 0.1
+
+    explanation = sorted(contrib[top1[0]].items(), key=lambda x: x[1], reverse=True)
+
+    return top1[0], final, contrib, explanation, uncertain
+
+# ============================================================
+# Hash-Sampling (100k Ziel)
+# ============================================================
+def stable_hash(text):
+    return int(hashlib.md5(text.encode()).hexdigest(), 16)
+
+def select_balanced(records, per_class):
+    buckets = {c: [] for c in FINAL_CLASSES}
+
+    for r in records:
+        label = r["final_label"]
+        if label in buckets:
+            buckets[label].append(r)
+
+    final = []
+    for c in buckets:
+        sorted_bucket = sorted(
+            buckets[c],
+            key=lambda x: stable_hash(x["caption"])
+        )
+        final.extend(sorted_bucket[:per_class])
+
+    return final
 
 # ============================================================
 # Text-Normalisierung
@@ -113,6 +343,32 @@ def extract_text_from_row(row) -> Tuple[str, dict]:
 
     return text, meta
 
+# ============================================================
+# Bild-Extractor aus Arrow
+# ============================================================
+
+def get_image_from_row(row):
+    img = row.get("image", None)
+
+    if img is None:
+        return None
+
+    try:
+        # Bytes (meistens)
+        if isinstance(img, bytes):
+            return Image.open(io.BytesIO(img)).convert("RGB")
+
+        # HF datasets Image-Objekt
+        if hasattr(img, "convert"):
+            return img.convert("RGB")
+
+        if isinstance(img, np.ndarray):
+            return Image.fromarray(img).convert("RGB")
+
+    except Exception:
+        return None
+
+    return None
 
 # ============================================================
 # Harte Regeln
@@ -133,28 +389,7 @@ RULE_LABELS_ORDER = [
     "endoscopy",
     "chart_or_diagram",
 ]
-# xray
-# xray_fluoroskopie_angiographie
-# us
-## mrt_hirn_flair
-## mrt_hirn_t1
-## mrt_hirn_t2
-## mrt_hirn_t1_c zu mrt_hirn
-### mrt_prostata_t1
-### mrt_prostata_t2 zu mrt_body
-# ct
-# ct_kombimodalitaet_spect+ct_pet+ct
 
-#mrt_hirn zusamenfassen
-#mrt_body zusammenfassen
-#microscopy
-#pathology
-#surgery_real
-#=10 Klassen
-#chart_or_diagram
-#endoscopy
-# Kurze Regeln
-# Kurze RULES MRT HIRN – Sublisten
 MRT_HIRN_T1_SHORT = [
     r"\bbrain\b.*\bt1\b",
     r"\bhead\b.*\bt1\b",
@@ -693,9 +928,73 @@ def rule_based_classify_with_rules(text: str, rules, label_priority=None):
         hits,
     )
 
+# ============================================================
+# CNN1 Wrapper u. CNN2 Wrapper
+# ============================================================
+def predict_with_cnn(model, image, transform, device, class_names):
+    if image is None:
+        return [], {}
+
+    try:
+        img_tensor = transform(image).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            logits = model(img_tensor)
+            probs = F.softmax(logits, dim=1)[0]  # shape: [num_classes]
+
+        probs = probs.cpu().numpy()
+
+        # Top-3
+        top_indices = probs.argsort()[-3:][::-1]
+
+        top3 = []
+        for idx in top_indices:
+            label = class_names[idx]
+            prob = float(probs[idx])
+            top3.append((label, prob))
+
+        full_scores = {
+            class_names[i]: float(probs[i])
+            for i in range(len(class_names))
+        }
+
+        return top3, full_scores
+
+    except Exception:
+        return [], {}
+# ============================================================
+# CNN1 Wrapper u. CNN2 Wrapper
+# ============================================================
+def run_cnn1(model, image, transform, device):
+    if image is None:
+        return "unknown"
+
+    try:
+        img_tensor = transform(image).unsqueeze(0).to(device)
+        with torch.no_grad():
+            output = model(img_tensor)
+            _, pred = torch.max(output, 1)
+        return str(pred.item())
+    except:
+        return "unknown"
+
+def run_cnn2(model, image, transform, device):
+    if image is None:
+        return "unknown"
+
+    try:
+        img_tensor = transform(image).unsqueeze(0).to(device)
+        with torch.no_grad():
+            output = model(img_tensor)
+            _, pred = torch.max(output, 1)
+        return str(pred.item())
+    except:
+        return "unknown"
+
+
 
 # ============================================================
-# Zero-Shot-artiger BERT-Fallback
+# Zero-Shot-artige BERT-Klassifikation
 # ============================================================
 
 CLASS_TEXTS: Dict[str, str] = {
@@ -705,7 +1004,6 @@ CLASS_TEXTS: Dict[str, str] = {
         "lateral view, portable x-ray, panoramic radiograph, dorsoplantar projection, "
         "plain film, frontal radiograph, lateral radiograph."
     ),
-
     "xray_fluoroskopie_angiographie": (
         "Fluoroscopy, fluoroscopic x-ray imaging, real-time x-ray imaging, c-arm fluoroscopy, "
         "x-ray guided interventional procedure, fluoroscopic guidance, contrast fluoroscopy, "
@@ -713,20 +1011,17 @@ CLASS_TEXTS: Dict[str, str] = {
         "vascular intervention, angioplasty, balloon angioplasty, percutaneous transluminal angioplasty, "
         "PTA, PTCA, coronary angioplasty, stent placement, percutaneous coronary intervention, PCI."
     ),
-
     "us": (
         "Ultrasound imaging, sonography, ultrasonography, echography, echocardiography, "
         "B-mode ultrasound, doppler ultrasound, duplex sonography, endoscopic ultrasound, EUS, "
         "color doppler, power doppler, sonographic examination, ultrasonographic image."
     ),
-
     "mrt_hirn": (
         "Brain MRI, cranial MRI, cerebral MRI, neuro MRI, head MRI, magnetic resonance imaging of the brain, "
         "T1-weighted brain MRI, T2-weighted brain MRI, FLAIR brain MRI, fluid-attenuated inversion recovery, "
         "DWI brain MRI, ADC brain MRI, contrast-enhanced T1 brain MRI, gadolinium-enhanced brain MRI, "
         "post-contrast brain MRI, axial brain MRI, sagittal brain MRI, coronal brain MRI."
     ),
-
     "mrt_body": (
         "Body MRI, magnetic resonance imaging outside the brain, abdominal MRI, pelvic MRI, prostate MRI, "
         "breast MRI, liver MRI, renal MRI, kidney MRI, cardiac MRI, heart MRI, spine MRI, knee MRI, "
@@ -734,53 +1029,44 @@ CLASS_TEXTS: Dict[str, str] = {
         "diffusion-weighted prostate MRI, ADC map of prostate MRI, dynamic contrast-enhanced prostate MRI, DCE MRI, "
         "pelvic MR imaging of the prostate gland."
     ),
-
     "ct": (
         "Computed tomography, CT scan, computed tomographic image, axial CT, coronal CT, sagittal CT, "
         "contrast-enhanced CT, non-contrast CT, helical CT, multidetector CT, MDCT, HRCT, "
         "brain CT, chest CT, abdominal CT, pelvic CT, Hounsfield units."
     ),
-
     "ct_kombimodalitaet_spect+ct_pet+ct": (
         "Hybrid CT imaging with PET or SPECT, PET/CT, PET-CT, fused PET-CT image, hybrid PET/CT imaging, "
         "co-registered PET and CT, combined positron emission tomography and computed tomography, "
         "SPECT/CT, SPECT-CT, fused SPECT-CT image, hybrid single-photon emission computed tomography and CT, "
         "nuclear medicine hybrid imaging, tracer uptake co-registered with CT anatomy."
     ),
-
     "microscopy": (
         "Microscopy, microscopic image, histology, histopathology, pathology slide, tissue section, "
         "H and E stain, hematoxylin and eosin staining, immunohistochemistry, IHC staining, "
         "cells per high-power field, microscopic tissue morphology."
     ),
-
     "pathology": (
         "Pathology, pathological findings, biopsy findings, tissue pathology, biopsy specimen, "
         "inflammatory cells, eosinophil counts, pathological examination, tissue specimen, "
         "cell infiltration, histopathological diagnosis."
     ),
-
     "surgery_real": (
         "Real clinical photograph, photo, a photo of, photograph, surgical photograph, intraoperative photograph, operative findings, "
         "surgical field, surgical view, surgical photo, photo of surgery, photo of surgical, gross, macroscopic specimen, resected specimen, gross specimen, "
         "wound photograph, lesion photograph, real-world medical image from operation or clinical examination."
     ),
-
     "endoscopy": (
         "Endoscopy, colonoscopy, gastroscopy, bronchoscopy, enteroscopy, duodenoscopy, laparoscopic view, "
         "endoscopic findings, mucosal findings, colono fiberscope, gastrointestinal endoscopy."
     ),
-
     "chart_or_diagram": (
         "Chart, graph, plot, line graph, bar chart, histogram, box plot, schematic, workflow figure, "
         "timeline, clinical course figure, therapeutic management chart, Kaplan-Meier curve, ROC curve."
     ),
-
     "unknown": (
         "Unknown or not identifiable modality, insufficient information, unclear caption."
     ),
 }
-
 
 class BertCaptionClassifier:
     def __init__(
@@ -895,7 +1181,7 @@ def load_arrow_shards(arrow_files: List[Path]) -> Dataset:
 
 
 # ============================================================
-# Debug / Übersicht
+# Inspizieren/Distr/Debug/Übersicht
 # ============================================================
 
 def inspect_first_sample(ds: Dataset):
@@ -926,7 +1212,7 @@ def inspect_first_sample(ds: Dataset):
     print("full_caption:", str(meta.get("full_caption", ""))[:300])
     print("sub_caption:", str(meta.get("sub_caption", ""))[:300])
 
-
+# Labels-Verteilung aus mitgelief. Metadaten
 def inspect_modality_distribution(ds: Dataset, limit: int = 5000):
     counter = Counter()
 
@@ -938,7 +1224,23 @@ def inspect_modality_distribution(ds: Dataset, limit: int = 5000):
     print("\n===== modality-Verteilung (Ausschnitt) =====")
     for key, value in counter.most_common():
         print(f"{key}: {value}")
+# Labels-Verteilung aus meinen Ergebnissen
+def inspect_final_distribution(records, limit=None):
+    counter = Counter()
 
+    if limit is not None:
+        records = records[:limit]
+
+    for r in records:
+        label = r.get("final_label", "MISSING")
+        counter[label] += 1
+
+    print("\n===== FINAL LABEL VERTEILUNG =====")
+    total = sum(counter.values())
+
+    for key, value in counter.most_common():
+        perc = (value / total) * 100 if total > 0 else 0
+        print(f"{key}: {value} ({perc:.2f}%)")
 
 # ============================================================
 # Hauptklassifikation
@@ -948,9 +1250,11 @@ def classify_dataset(
     dataset_root: Path,
     output_csv: Path,
     biomedbert_path: Optional[str],
+    llamamistral_path: str,
     limit: Optional[int],
     batch_size: int,
     bert_threshold: float,
+    per_class: int,
     inspect_only: bool = False,
 ):
     arrow_files = find_arrow_files(dataset_root)
@@ -976,86 +1280,128 @@ def classify_dataset(
         print(f"\nLimit aktiv: {len(ds)} Zeilen")
 
     records = []
-    fallback_texts = []
-    fallback_record_positions = []
 
-    print("\nWende Regeln an ...")
-    for idx in tqdm(range(len(ds)), desc="Rule-Klassifikation"):
+    print("\nInitialize models & preparing batch ...")
+    batch_texts = []
+    batch_indices = []
+
+    print("\nInitialize LLaMaMistral ...")
+    # LLaMaMistral initialisieren
+    llm = LocalLLM(model_path=llamamistral_path)
+
+    print("\nInitialize BERT ...")
+    # BERT initialisieren
+    bert_clf = None
+    if biomedbert_path:
+        bert_clf = BertCaptionClassifier(model_path=biomedbert_path)
+
+    for idx in tqdm(range(len(ds)), desc="Prepare LLM Batch"):
         row = ds[idx]
         text, meta = extract_text_from_row(row)
         text = normalize_text(text)
 
-        label_short, reason_short, matched_pattern_short, all_hits_short = rule_based_classify_with_rules(
-            text,
-            RULES_SHORT,
-            LABEL_PRIORITY
+        batch_texts.append(text)
+        batch_indices.append((idx, meta, text, row))
+
+    # Complete vLLM LLaMa Mistral
+    llm_results = llm.batch_predict(batch_texts)
+
+    records = []
+
+    device = "cpu"
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # CNN1 laden
+    cnn1_model = SimpleCNN(num_classes=11)
+    cnn1_model.load_state_dict(torch.load("cnn1.pth", map_location=device))
+    cnn1_model.to(device).eval()
+
+    # CNN2 laden
+    cnn2_model = SimpleCNN(num_classes=4)
+    cnn2_model.load_state_dict(torch.load("cnn2.pth", map_location=device))
+    cnn2_model.to(device).eval()
+
+    cnn1_transform = transform
+    cnn2_transform = transform
+    print("\nWende Regeln an, Cosine den Text, Falte Bilder, Erstelle Scores")
+    for (idx, meta, text, row), llm_out in zip(batch_indices, llm_results):
+
+        # RULES
+        rule_label, _, _, hits = rule_based_classify_with_rules(
+            text, RULES_LONG, LABEL_PRIORITY
         )
 
-        label_long, reason_long, matched_pattern_long, all_hits_long = rule_based_classify_with_rules(
-            text,
-            RULES_LONG,
-            LABEL_PRIORITY
-        )
-        rec = {
+        rule_scores = {c: 0.0 for c in FINAL_CLASSES}
+        if rule_label in FINAL_CLASSES:
+            rule_scores[rule_label] = 1.0
+
+        # BERT
+        if bert_clf:
+            bert_out = bert_clf.predict_batch([text])[0]
+            bert_scores = {c: 0.0 for c in FINAL_CLASSES}
+            bert_scores[bert_out["label"]] = bert_out["score"]
+        else:
+            bert_scores = {c: 0.0 for c in FINAL_CLASSES}
+
+        # CNN1 / CNN2
+        image = get_image_from_row(row)
+        # Top 1
+        # cnn1_raw = run_cnn1(cnn1_model, image, cnn1_transform, device)
+        # cnn2_raw = run_cnn2(cnn2_model, image, cnn2_transform, device)
+        #
+        # cnn1_scores = cnn_to_scores(cnn1_raw, CNN1_MAPPING)
+        # cnn2_scores = cnn_to_scores(cnn2_raw, CNN2_MAPPING)
+
+        # Top 3
+        # CNN1
+        cnn1_top3, cnn1_full = predict_with_cnn(
+            cnn1_model, image, cnn1_transform, device, CNN1_CLASS_NAMES)
+
+        cnn1_scores = map_scores_to_final(cnn1_full, CNN1_MAPPING)
+
+        # CNN2
+        cnn2_top3, cnn2_full = predict_with_cnn(
+            cnn2_model, image, cnn2_transform, device, CNN2_CLASS_NAMES)
+
+        cnn2_scores = map_scores_to_final(cnn2_full, CNN2_MAPPING)
+
+        # Fusion
+        final_label, final_scores, contrib, explanation, uncertain = fuse_scores(
+            rule_scores,
+            bert_scores,
+            cnn1_scores,
+            cnn2_scores,
+            llm_out)
+
+        records.append({
             "row_id": idx,
-            "pmc_id": meta.get("PMC_ID", ""),
-            "image": meta.get("image", ""),
-            "modality_gt": meta.get("modality", ""),
+
+            "Final Label:": final_label,
+
+            "RULE:": rule_label,
+            "BERT:": bert_out["label"] if bert_clf else "none",
+            "CNN1top3": json.dumps(cnn1_top3),
+            "CNN2top3": json.dumps(cnn2_top3),
+            "LaMa:": llm_out[0],
 
             "caption": text,
-            "sub_caption": meta.get("sub_caption", ""),
-            "full_caption": meta.get("full_caption", ""),
-            "intext_refs_summary": meta.get("intext_refs_summary", ""),
-            "intext_refs": meta.get("intext_refs", ""),
 
-            "pred_label_short": label_short if label_short is not None else "unknown",
-            "decision_reason_short": reason_short,
-            "matched_pattern_short": matched_pattern_short,
+            "BERT_score": bert_out["score"] if bert_clf else 0.0,
+            "CNN1_scores": json.dumps(cnn1_scores),
+            "CNN2_scores": json.dumps(cnn2_scores),
+            "LaMa_conf": llm_out[1],
+            "Final Scores": json.dumps(final_scores),
+            "Begründung": json.dumps(explanation),
+            "uncertain": uncertain,
+            "pmc_id": meta.get("PMC_ID", "")
+        })
 
-            "pred_label_long": label_long if label_long is not None else "unknown",
-            "decision_reason_long": reason_long,
-            "matched_pattern_long": matched_pattern_long,
-        }
-        rec["all_rule_hits_short"] = json.dumps(all_hits_short, ensure_ascii=False)
-        rec["all_rule_hits_long"] = json.dumps(all_hits_long, ensure_ascii=False)
-        records.append(rec)
+    records = select_balanced(records, per_class=per_class)
+    print(f"\nBalanced Subset: {len(records)} Samples")
 
-        if label_long or label_short is None:
-            fallback_record_positions.append(len(records) - 1)
-            fallback_texts.append(text)
-
-    print(f"\nRule-Treffer: {len(records) - len(fallback_texts)}")
-    print(f"BERT-Fallback nötig für: {len(fallback_texts)}")
-
-    if fallback_texts:
-        if not biomedbert_path:
-            print("Warnung: Kein --biomedbert_path angegeben. Unklare Fälle werden auf 'unknown' gesetzt.")
-            for pos in fallback_record_positions:
-                records[pos]["pred_label"] = "unknown"
-                records[pos]["decision_source"] = "no_bert_available"
-                records[pos]["decision_reason"] = "rule_failed_and_no_bert_model"
-        else:
-            print("\nLade BERT-Modell ...")
-            bert_clf = BertCaptionClassifier(model_path=biomedbert_path)
-
-            print("BERT-Fallback läuft ...")
-            for start in tqdm(range(0, len(fallback_texts), batch_size), desc="BERT-Batches"):
-                sub_texts = fallback_texts[start:start + batch_size]
-                sub_positions = fallback_record_positions[start:start + batch_size]
-
-                preds = bert_clf.predict_batch(
-                    sub_texts,
-                    threshold=bert_threshold,
-                    batch_size=min(16, batch_size)
-                )
-
-                for pos, pred in zip(sub_positions, preds):
-                    records[pos]["pred_label"] = pred["label"]
-                    records[pos]["decision_source"] = "bert_fallback"
-                    records[pos]["decision_reason"] = "rule_failed"
-                    records[pos]["bert_score"] = pred["score"]
-                    records[pos]["bert_top2"] = json.dumps(pred["top2"], ensure_ascii=False)
-
+# ============================================================
+# Endergebnisse Head ausgeben
+# ============================================================
     df = pd.DataFrame(records)
 
     empty_mask = df["caption"].fillna("").astype(str).str.strip().eq("")
@@ -1104,6 +1450,18 @@ def parse_args():
         help="Lokaler Pfad zu BiomedBERT/PubMedBERT"
     )
     parser.add_argument(
+        "--llamamistral_path",
+        type=str,
+        required=True,
+        help="Lokaler Pfad zum generativen LLM, LLaMA/Mistral Modell"
+    )
+    parser.add_argument(
+        "--per_class",
+        type=int,
+        default=5000,
+        help="Anzahl Samples pro finaler Klasse (hash-balanced)"
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -1113,13 +1471,13 @@ def parse_args():
         "--batch_size",
         type=int,
         default=64,
-        help="Batchgröße für den BERT-Fallback"
+        help="Batchgröße für den BERT-Gang"
     )
     parser.add_argument(
         "--bert_threshold",
         type=float,
         default=0.30,
-        help="Schwelle für BERT-Fallback, sonst unknown"
+        help="Schwelle Fallback für BERT-Gang, sonst unknown"
     )
     parser.add_argument(
         "--inspect_only",
@@ -1140,9 +1498,11 @@ def main():
         dataset_root=dataset_root,
         output_csv=output_csv,
         biomedbert_path=args.biomedbert_path,
+        llamamistral_path=args.llamamistral_path,
         limit=args.limit,
         batch_size=args.batch_size,
         bert_threshold=args.bert_threshold,
+        per_class=args.per_class,
         inspect_only=args.inspect_only,
     )
 

@@ -4,9 +4,11 @@ python make_CLS/pipeline_0.py  \
  --biomedbert_path /home/b/Dokumente/biomedbert   --limit 500
 
 python make_CLS/pipeline_0.py \
-  --dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB \
-  --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/test_5000.csv \
-  --biomedbert_path /home/b/Dokumente/biomedbert \
+  --dataset_root /home/user/PycharmProjects/ba1pmc/PMC-41GB \
+  --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/test_500.csv \
+  --biomedbert_path /home/user/Dokumente/biomedbert \
+  --llamamistral_path /home/user/Dokumente/llamamistral \
+  --per_class 50 \
   --limit 500
 
 
