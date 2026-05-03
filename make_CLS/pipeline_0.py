@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-open-pmc Arrow/WebDataset Klassifikation mit Rules + BERT
+open-pmc Arrow/WebDataset Klassifikation mit Rules + BERT + LLM + CNN
 
 Erwartete Struktur:
 dataset_root/
@@ -16,9 +16,11 @@ python make_CLS/pipeline_0.py \
   --dataset_root /home/user/PycharmProjects/ba1pmc/PMC-41GB \
   --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/test_500.csv \
   --biomedbert_path /home/user/Dokumente/biomedbert \
-  --llamamistral_path /home/user/Dokumente/llamamistral \
+  --llamamistral_path /home/user/Dokumente/LLaMa_Mistral \
+  --cnn1_path /home/user/PycharmProjects/ba2roco/cnn/convu_try_3t.pth \
+  --cnn2_path /home/user/PycharmProjects/ba2roco/cnn/convu_folderlabel_mrt_body_mrt_hirn.pth \
   --per_class 50 \
-  --limit 500
+  --limit 50
 """
 
 from __future__ import annotations
@@ -105,58 +107,67 @@ WEIGHTS = {
     "cnn2": 0.2,
     "llm": 0.2
 }
+
 # gen. LLM (vLLM READY)
 class LocalLLM:
     def __init__(self, model_path: str):
+
         model_path = Path(osp.normpath(model_path))
 
         if not model_path.exists():
             raise FileNotFoundError(f"LLM Pfad existiert nicht: {model_path}")
 
-        print("Initialize LLM von:", model_path)
+        print("Lade Mistral von:", model_path)
 
-        try:
-            self.llm = LLM(model=str(model_path))
-            self.params = SamplingParams(temperature=0.0, max_tokens=64)
-            self.use_vllm = True
-        except Exception as e:
-            print("vLLM nicht verfügbar -> fallback transformers:", e)
-            self.tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True)
-            self.model = AutoModelForCausalLM.from_pretrained(str(model_path),
-                device_map="auto", torch_dtype=torch.float16, local_files_only=True)
-            self.use_vllm = False
+        self.device = "cpu"
 
-    def batch_predict(self, texts):
-        prompts = [
-            f"""Classify into one of {FINAL_CLASSES}.
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+
+        # verhindert Warnung
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.model = AutoModelForCausalLM.from_pretrained(model_path,
+            torch_dtype=torch.float32,
+            local_files_only=True)
+
+        self.model.to(self.device)
+        self.model.eval()
+
+        self.model.config.pad_token_id = self.model.config.eos_token_id
+
+    def batch_predict(self, texts, batch_size=8):
+        results = []
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+
+            prompts = [
+                f"""Classify into one of {FINAL_CLASSES}.
 Return JSON: {{"label": "...", "confidence": 0.0}}
 
 {text}
 """
-            for text in texts
-        ]
+                for text in batch
+            ]
 
-        results = []
+            inputs = self.tokenizer(
+                prompts,
+                padding=True,
+                truncation=True,
+                return_tensors="pt"
+            ).to(self.device)
 
-        if self.use_vllm:
-            outputs = self.llm.generate(prompts, self.params)
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=64
+                )
 
-            for out in outputs:
-                text = out.outputs[0].text
+            decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+            for d in decoded:
                 try:
-                    js = json.loads(text[text.find("{"):])
-                    results.append((js["label"], js["confidence"]))
-                except:
-                    results.append(("unknown", 0.0))
-
-        else:
-            for p in prompts:
-                inputs = self.tokenizer(p, return_tensors="pt").to(self.model.device)
-                out = self.model.generate(**inputs, max_new_tokens=64)
-                decoded = self.tokenizer.decode(out[0], skip_special_tokens=True)
-
-                try:
-                    js = json.loads(decoded[decoded.find("{"):])
+                    js = json.loads(d[d.find("{"):])
                     results.append((js["label"], js["confidence"]))
                 except:
                     results.append(("unknown", 0.0))
@@ -1251,6 +1262,8 @@ def classify_dataset(
     output_csv: Path,
     biomedbert_path: Optional[str],
     llamamistral_path: str,
+    c1path: str,
+    c2path: str,
     limit: Optional[int],
     batch_size: int,
     bert_threshold: float,
@@ -1313,12 +1326,12 @@ def classify_dataset(
 
     # CNN1 laden
     cnn1_model = SimpleCNN(num_classes=11)
-    cnn1_model.load_state_dict(torch.load("cnn1.pth", map_location=device))
+    cnn1_model.load_state_dict(torch.load(c1path, map_location=device))
     cnn1_model.to(device).eval()
 
     # CNN2 laden
     cnn2_model = SimpleCNN(num_classes=4)
-    cnn2_model.load_state_dict(torch.load("cnn2.pth", map_location=device))
+    cnn2_model.load_state_dict(torch.load(c2path, map_location=device))
     cnn2_model.to(device).eval()
 
     cnn1_transform = transform
@@ -1456,6 +1469,18 @@ def parse_args():
         help="Lokaler Pfad zum generativen LLM, LLaMA/Mistral Modell"
     )
     parser.add_argument(
+        "--cnn1_path",
+        type=str,
+        required=True,
+        help="Lokaler Pfad zum custom CNN1"
+    )
+    parser.add_argument(
+        "--cnn2_path",
+        type=str,
+        required=True,
+        help="Lokaler Pfad zum custom CNN2"
+    )
+    parser.add_argument(
         "--per_class",
         type=int,
         default=5000,
@@ -1499,6 +1524,8 @@ def main():
         output_csv=output_csv,
         biomedbert_path=args.biomedbert_path,
         llamamistral_path=args.llamamistral_path,
+        cnn1_path=args.cnn1_path,
+        cnn2_path=args.cnn2_path,
         limit=args.limit,
         batch_size=args.batch_size,
         bert_threshold=args.bert_threshold,

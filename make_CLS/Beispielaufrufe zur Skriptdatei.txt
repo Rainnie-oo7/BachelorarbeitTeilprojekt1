@@ -1,18 +1,34 @@
-python make_CLS/pipeline_0.py  \
---dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB   \
---output_csv /home/b/PycharmProjects/ba1pmc/test_500.csv  \
- --biomedbert_path /home/b/Dokumente/biomedbert   --limit 500
-
+#################################################################
+# Pipeline/Klassifikator
+#################################################################
 python make_CLS/pipeline_0.py \
   --dataset_root /home/user/PycharmProjects/ba1pmc/PMC-41GB \
   --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/test_500.csv \
   --biomedbert_path /home/user/Dokumente/biomedbert \
-  --llamamistral_path /home/user/Dokumente/llamamistral \
+  --llamamistral_path /home/user/Dokumente/LLaMa_Mistral \
+  --cnn1_path /home/user/PycharmProjects/ba2roco/cnn/convu_try_3t.pth \
+  --cnn2_path /home/user/PycharmProjects/ba2roco/cnn/convu_folderlabel_mrt_body_mrt_hirn.pth \
   --per_class 50 \
+  --limit 50
+##########################private################################
+python make_CLS/pipeline_0.py \
+  --dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB \
+  --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/test_500.csv \
+  --biomedbert_path /home/b/Dokumente/biomedbert \
+  --llamamistral_path /home/b/Dokumente/LLaMa_Mistral \
+  --cnn1_path /home/b/PycharmProjects/ba2roco/cnn/convu_try_3t.pth \
+  --cnn2_path /home/b/PycharmProjects/ba2roco/cnn/convu_folderlabel_mrt_body_mrt_hirn.pth \
+  --per_class 50 \
+  --limit 50
+
+#################################################################
+# PMC-VIEWER
+#################################################################
+python make_CLS/open_pmc_viewer.py \
+  --dataset_root /home/user/PycharmProjects/ba1pmc/PMC-41GB \
+  --csv_path /home/user/PycharmProjects/ba1pmc/test1_500.csv \
   --limit 500
-
-
-############################################################################################################
+##########################private################################
 python make_CLS/open_pmc_viewer.py \
   --dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB \
   --csv_path /home/b/PycharmProjects/ba1pmc/test1_500.csv \
