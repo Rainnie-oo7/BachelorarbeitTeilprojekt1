@@ -1,0 +1,112 @@
+(ba1pmc) b@scherv:~/PycharmProjects/ba1pmc$ python make_CLS/pipeline_0.py   --dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB   --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/test_500.csv   --biomedbert_path /home/b/Dokumente/biomedbert   --llamamistral_path /home/b/Dokumente/LLaMa_Mistral   --cnn1_path /home/b/Dokumente/cnn1/convu_try_3t.pth   --cnn2_path /home/b/Dokumente/cnn2/convu_folderlabel_mrt_body_mrt_hirn.pth   --per_class 5   --inspectlimit 200
+/home/b/anaconda3/envs/ba1pmc/lib/python3.10/site-packages/torch/cuda/__init__.py:1061: UserWarning: Can't initialize NVML
+  raw_cnt = _raw_device_count_nvml()
+W0503 15:41:48.731000 21891 site-packages/torch/utils/cpp_extension.py:140] No CUDA runtime is found, using CUDA_HOME='/usr/local/cuda'
+Gefundene Arrow-Dateien: 59
+Lade Arrow-Shards: 100%|████████████████████████████████████████████████████| 1/1 [00:00<00:00, 575.51it/s]
+Gesamtanzahl Zeilen: 29578
+Spalten: ['__key__', '__url__', 'jpg', 'jsonl']
+Text wird aus row['jsonl'] extrahiert.
+
+===== DEBUG: Erstes Sample =====
+Spalten: ['__key__', '__url__', 'jpg', 'jsonl']
+__key__: <class 'str'>
+__url__: <class 'str'>
+jpg: <class 'PIL.JpegImagePlugin.JpegImageFile'>
+jsonl: <class 'bytes'>
+
+jsonl Vorschau:
+b'{"PMC_ID": "PMC9474956", "image": "train-0000-000000.jpg", "sub_caption": "Findings after prednisolone administration. a Colonoscopy findings: disappearance of the redness and edema of the colonic mucosa. b Pathological findings of biopsy from colonoscopy: improvement of inflammatory cell infiltration and numerous eosinophil counts, 1\\u201310 cells/HPF", "full_caption": "Preoperative CT and intraoperative findings. a Preoperative CT: a poor contrast effect on the small intestine. b Intraoperative findings: strangulated bowel obstruction caused by an intestinal mesenteric hiatal hernia. White arrow: intestinal mesenteric hiatal hernia", "intext_refs_summary": "", "intext_refs": "A 5-year-old male was taken to a nearby clinic with complaints of abdominal pain and vomiting. Blood examination '
+
+JSON Keys:
+['PMC_ID', 'image', 'sub_caption', 'full_caption', 'intext_refs_summary', 'intext_refs', 'modality']
+
+PMC_ID: PMC9474956
+image: train-0000-000000.jpg
+modality: N
+full_caption: Preoperative CT and intraoperative findings. a Preoperative CT: a poor contrast effect on the small intestine. b Intraoperative findings: strangulated bowel obstruction caused by an intestinal mesenteric hiatal hernia. White arrow: intestinal mesenteric hiatal hernia
+sub_caption: Findings after prednisolone administration. a Colonoscopy findings: disappearance of the redness and edema of the colonic mucosa. b Pathological findings of biopsy from colonoscopy: improvement of inflammatory cell infiltration and numerous eosinophil counts, 1–10 cells/HPF
+Prüfe modality-Verteilung: 100%|█████████████████████████████████████| 2000/2000 [00:00<00:00, 3936.20it/s]
+
+===== modality-Verteilung (Ausschnitt) =====
+R: 1021
+N: 524
+M: 406
+V: 49
+
+Initialize models (ohne LLM)...
+Early sampling (RULES only):   6%|██▏                                | 1850/29578 [00:05<01:30, 307.11it/s]
+Alle Klassen voll (per_class) bei idx=16739 → STOP
+Early sampling (RULES only):   6%|██▏                                | 1878/29578 [00:05<01:23, 330.59it/s]
+
+Gesammelt: 35 Samples
+
+Initialize models (ohne LLM)...
+
+Initialize BERT Similarity...
+/home/b/anaconda3/envs/ba1pmc/lib/python3.10/site-packages/torch/cuda/__init__.py:1061: UserWarning: Can't initialize NVML
+  raw_cnt = _raw_device_count_nvml()
+Loading weights: 100%|█████████████████████████████████████████████████| 199/199 [00:00<00:00, 7283.18it/s]
+
+Initialize Convolutional Neural Network...
+
+Extrahiere Records + RULES + CNN + BERT ...
+
+Phase 2: CNN + BERT auf Subset
+CNN + BERT: 100%|██████████████████████████████████████████████████████████| 35/35 [00:05<00:00,  6.80it/s]
+
+Initialize LLaMaMistral ...
+Lade Mistral von: /home/b/Dokumente/LLaMa_Mistral
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights: 100%|██████████████████████████████████████████████████| 291/291 [00:00<00:00, 535.39it/s]
+
+LLM läuft NUR auf Subset ...
+[transformers] Setting `pad_token_id` to `eos_token_id`:2 for open-end generation.
+<hier dauert es 2-3 min pro diese ^ [transformers] Meldung> Ist glaube ich jeweils ein bacth 8
+
+Finale Fusion ...
+
+Speichere ausgewählte Bilder ...
+Gespeichert: 7 Bilder in /home/b/PycharmProjects/ba1pmc/make_CLS/exported_images
+
+CSV gespeichert unter:
+/home/b/PycharmProjects/ba1pmc/make_CLS/test_500.csv
+
+===== Verteilung final_label =====
+final_label
+xray                                  1
+xray_fluoroskopie_angiographie        1
+us                                    1
+mrt_hirn                              1
+mrt_body                              1
+ct                                    1
+ct_kombimodalitaet_spect+ct_pet+ct    1
+Name: count, dtype: int64
+
+===== Verteilung decision_source =====
+Begründung
+{"final_label": "xray", "uncertain": true, "rules": {"label": "xray", "score_raw": 1.0, "score_weighted": 0.2, "matched_patterns": ["\\bx[- ]?ray\\b"], "decision_reason": "parallel_rule:xray; hits=1"}, "bert": {"label": "xray", "score_raw": 0.9694334864616394, "score_weighted": 0.19388669729232788, "top2": [["xray", 0.9694334864616394], ["microscopy", 0.9678768515586853]]}, "cnn1": {"top3": [], "scores_raw": {"xray": 0.0, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}, "score_weighted_max": 0.0}, "cnn2": {"top3": [], "scores_raw": {"xray": 0.0, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}, "score_weighted_max": 0.0}, "llm": {"label": "xray", "score_raw": 0.7, "score_weighted": 0.13999999999999999}, "final_scores": {"xray": 0.5338866972923278, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}}                                                                                                                                                                                  1
+{"final_label": "xray_fluoroskopie_angiographie", "uncertain": true, "rules": {"label": "xray_fluoroskopie_angiographie", "score_raw": 1.0, "score_weighted": 0.2, "matched_patterns": ["\\bstent placement\\b"], "decision_reason": "parallel_rule:xray_fluoroskopie_angiographie; hits=1"}, "bert": {"label": "ct_kombimodalitaet_spect+ct_pet+ct", "score_raw": 0.969293475151062, "score_weighted": 0.1938586950302124, "top2": [["ct_kombimodalitaet_spect+ct_pet+ct", 0.969293475151062], ["microscopy", 0.967212438583374]]}, "cnn1": {"top3": [], "scores_raw": {"xray": 0.0, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}, "score_weighted_max": 0.0}, "cnn2": {"top3": [], "scores_raw": {"xray": 0.0, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}, "score_weighted_max": 0.0}, "llm": {"label": "xray", "score_raw": 0.7, "score_weighted": 0.13999999999999999}, "final_scores": {"xray": 0.13999999999999999, "xray_fluoroskopie_angiographie": 0.2, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.1938586950302124}}                      1
+{"final_label": "us", "uncertain": true, "rules": {"label": "us", "score_raw": 1.0, "score_weighted": 0.2, "matched_patterns": ["\\bultrasound\\b"], "decision_reason": "parallel_rule:us; hits=1"}, "bert": {"label": "microscopy", "score_raw": 0.9759740233421326, "score_weighted": 0.19519480466842654, "top2": [["microscopy", 0.9759740233421326], ["ct_kombimodalitaet_spect+ct_pet+ct", 0.9731734991073608]]}, "cnn1": {"top3": [], "scores_raw": {"xray": 0.0, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}, "score_weighted_max": 0.0}, "cnn2": {"top3": [], "scores_raw": {"xray": 0.0, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}, "score_weighted_max": 0.0}, "llm": {"label": "xray", "score_raw": 0.7, "score_weighted": 0.13999999999999999}, "final_scores": {"xray": 0.13999999999999999, "xray_fluoroskopie_angiographie": 0.0, "us": 0.2, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}}                                                                                                                                                  1
+{"final_label": "mrt_hirn", "uncertain": true, "rules": {"label": "mrt_hirn", "score_raw": 1.0, "score_weighted": 0.2, "matched_patterns": ["\\bfluid[- ]attenuated inversion recovery\\b"], "decision_reason": "parallel_rule:mrt_hirn; hits=1"}, "bert": {"label": "mrt_hirn", "score_raw": 0.9783535599708557, "score_weighted": 0.19567071199417116, "top2": [["mrt_hirn", 0.9783535599708557], ["mrt_body", 0.9755120873451233]]}, "cnn1": {"top3": [], "scores_raw": {"xray": 0.0, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}, "score_weighted_max": 0.0}, "cnn2": {"top3": [], "scores_raw": {"xray": 0.0, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}, "score_weighted_max": 0.0}, "llm": {"label": "xray", "score_raw": 0.7, "score_weighted": 0.13999999999999999}, "final_scores": {"xray": 0.13999999999999999, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.39567071199417114, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}}                                                                                                                  1
+{"final_label": "mrt_body", "uncertain": true, "rules": {"label": "mrt_body", "score_raw": 1.0, "score_weighted": 0.2, "matched_patterns": ["\\bknee\\s+mri\\b"], "decision_reason": "parallel_rule:mrt_body; hits=1"}, "bert": {"label": "ct_kombimodalitaet_spect+ct_pet+ct", "score_raw": 0.9675666093826294, "score_weighted": 0.1935133218765259, "top2": [["ct_kombimodalitaet_spect+ct_pet+ct", 0.9675666093826294], ["mrt_body", 0.9635063409805298]]}, "cnn1": {"top3": [], "scores_raw": {"xray": 0.0, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}, "score_weighted_max": 0.0}, "cnn2": {"top3": [], "scores_raw": {"xray": 0.0, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}, "score_weighted_max": 0.0}, "llm": {"label": "xray", "score_raw": 0.7, "score_weighted": 0.13999999999999999}, "final_scores": {"xray": 0.13999999999999999, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.2, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.1935133218765259}}                                                                                           1
+{"final_label": "ct", "uncertain": true, "rules": {"label": "ct", "score_raw": 1.0, "score_weighted": 0.2, "matched_patterns": ["\\bct\\b", "\\bcomputed tomography\\b", "\\bcomputed tomograph\\w*\\b", "\\bhounsfield\\b"], "decision_reason": "parallel_rule:ct; hits=4"}, "bert": {"label": "ct_kombimodalitaet_spect+ct_pet+ct", "score_raw": 0.9735662937164307, "score_weighted": 0.19471325874328616, "top2": [["ct_kombimodalitaet_spect+ct_pet+ct", 0.9735662937164307], ["mrt_body", 0.967707633972168]]}, "cnn1": {"top3": [], "scores_raw": {"xray": 0.0, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}, "score_weighted_max": 0.0}, "cnn2": {"top3": [], "scores_raw": {"xray": 0.0, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}, "score_weighted_max": 0.0}, "llm": {"label": "xray", "score_raw": 0.7, "score_weighted": 0.13999999999999999}, "final_scores": {"xray": 0.13999999999999999, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.2, "ct_kombimodalitaet_spect+ct_pet+ct": 0.19471325874328616}}                                    1
+{"final_label": "ct_kombimodalitaet_spect+ct_pet+ct", "uncertain": true, "rules": {"label": "ct_kombimodalitaet_spect+ct_pet+ct", "score_raw": 1.0, "score_weighted": 0.2, "matched_patterns": ["\\bfused\\s+pet\\s*[-/]?\\s*ct\\b"], "decision_reason": "parallel_rule:ct_kombimodalitaet_spect+ct_pet+ct; hits=1"}, "bert": {"label": "ct_kombimodalitaet_spect+ct_pet+ct", "score_raw": 0.976129412651062, "score_weighted": 0.19522588253021242, "top2": [["ct_kombimodalitaet_spect+ct_pet+ct", 0.976129412651062], ["ct", 0.9663509726524353]]}, "cnn1": {"top3": [], "scores_raw": {"xray": 0.0, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}, "score_weighted_max": 0.0}, "cnn2": {"top3": [], "scores_raw": {"xray": 0.0, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.0}, "score_weighted_max": 0.0}, "llm": {"label": "xray", "score_raw": 0.7, "score_weighted": 0.13999999999999999}, "final_scores": {"xray": 0.13999999999999999, "xray_fluoroskopie_angiographie": 0.0, "us": 0.0, "mrt_hirn": 0.0, "mrt_body": 0.0, "ct": 0.0, "ct_kombimodalitaet_spect+ct_pet+ct": 0.3952258825302124}}    1
+Name: count, dtype: int64
+
+===== Verteilung modality_gt =====
+modality_gt
+R    6
+N    1
+Name: count, dtype: int64
+
+===== Verteilung von mir klassifizierter Modalitaeten. Inspectlimit: 200=====
+
+===== FINAL LABEL VERTEILUNG =====
+xray: 1 (14.29%)
+xray_fluoroskopie_angiographie: 1 (14.29%)
+us: 1 (14.29%)
+mrt_hirn: 1 (14.29%)
+mrt_body: 1 (14.29%)
+ct: 1 (14.29%)
+ct_kombimodalitaet_spect+ct_pet+ct: 1 (14.29%)

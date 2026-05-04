@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-open-pmc Arrow/WebDataset Klassifikation mit Rules + BERT + LLM + CNN
-
+open-pmc Klassifikation mit Rules + BERT + LLM + CNN
 Erwartete Struktur:
 dataset_root/
     data-00000-of-00059.arrow
@@ -10,17 +9,18 @@ dataset_root/
     data-00058-of-00059.arrow
     dataset_info.json
     state.json
-
 Beispiel:
 python make_CLS/pipeline_0.py \
   --dataset_root /home/user/PycharmProjects/ba1pmc/PMC-41GB \
   --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/test_500.csv \
   --biomedbert_path /home/user/Dokumente/biomedbert \
   --llamamistral_path /home/user/Dokumente/LLaMa_Mistral \
-  --cnn1_path /home/user/PycharmProjects/ba2roco/cnn/convu_try_3t.pth \
-  --cnn2_path /home/user/PycharmProjects/ba2roco/cnn/convu_folderlabel_mrt_body_mrt_hirn.pth \
+  --cnn1_path /home/user/Dokumente/cnn1/convu_try_3t.pth \
+  --cnn2_path /home/user/Dokumente/cnn2/convu_folderlabel_mrt_body_mrt_hirn.pth \
+  --cnn3_path /home/b/Dokumente/cnn3/cnn_multiclass.pth \
   --per_class 50 \
-  --limit 50
+  --inspectlimit 2000
+  --limit 2000
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ import json
 import argparse
 
 import hashlib
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
 import io
 from itertools import zip_longest
@@ -59,21 +59,19 @@ FINAL_CLASSES = [
     "mrt_hirn",
     "mrt_body",
     "ct",
-    "ct_kombimodalitaet_spect+ct_pet+ct"
-]
-CNN1_CLASS_NAMES = {
-    "mrt_prostata_t1"
-    "mrt_prostata_t2"
-    "mrt_hirn_flair'"
-    "mrt_hirn_t1"
-    "mrt_hirn_t2"
-    "mrt_hirn_t1_c"
+    "ct_kombimodalitaet_spect+ct_pet+ct"]
+CNN1_CLASS_NAMES = [
+    "mrt_prostata_t1",
+    "mrt_prostata_t2",
+    "mrt_hirn_flair'",
+    "mrt_hirn_t1",
+    "mrt_hirn_t2",
+    "mrt_hirn_t1_c",
     "ct",
     "ct_kombimodalitaet_spect+ct_pet+ct",
     "xray",
     "xray_fluoroskopie_angiographie",
-    "us"
-}
+    "us"]
 CNN1_MAPPING = {
     "mrt_prostata_t1": "mrt_body",
     "mrt_prostata_t2": "mrt_body",
@@ -86,20 +84,24 @@ CNN1_MAPPING = {
     "ct_kombimodalitaet_spect+ct_pet+ct": "ct_kombimodalitaet_spect+ct_pet+ct",
     "xray": "xray",
     "xray_fluoroskopie_angiographie": "xray_fluoroskopie_angiographie",
-    "us": "us",
-}
-CNN2_CLASS_NAMES = {
+    "us": "us"}
+CNN2_CLASS_NAMES = [
     "xray",
     "xray_fluoroskopie_angiographie",
     "mrt_hirn",
-    "mrt_body"
-}
+    "mrt_body"]
 CNN2_MAPPING = {
     "xray": "xray",
     "xray_fluoroskopie_angiographie": "xray_fluoroskopie_angiographie",
     "mrt_hirn": "mrt_hirn",
-    "mrt_body": "mrt_body",
-}
+    "mrt_body": "mrt_body"}
+CNN3_CLASS_NAMES = [
+    "chirurgie",
+    "mikroskopie",
+    "endoskopie",
+    "haut",
+    "chart",
+    "histologie"]
 WEIGHTS = {
     "rules": 0.2,
     "bert": 0.2,
@@ -143,10 +145,13 @@ class LocalLLM:
 
             prompts = [
                 f"""Classify into one of {FINAL_CLASSES}.
-Return JSON: {{"label": "...", "confidence": 0.0}}
+Choose one label from {FINAL_CLASSES}
 
-{text}
+Answer ONLY the label.
+
+Text: {text}
 """
+
                 for text in batch
             ]
 
@@ -166,10 +171,13 @@ Return JSON: {{"label": "...", "confidence": 0.0}}
             decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
             for d in decoded:
-                try:
-                    js = json.loads(d[d.find("{"):])
-                    results.append((js["label"], js["confidence"]))
-                except:
+                label = d.strip().lower()
+
+                for cls in FINAL_CLASSES:
+                    if cls in label:
+                        results.append((cls, 0.7))
+                        break
+                else:
                     results.append(("unknown", 0.0))
 
         return results
@@ -200,6 +208,29 @@ class SimpleCNN(nn.Module):
         x = self.features(x)
         x = self.classifier(x)
         return x
+
+class ThirdCNN(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),
+
+            nn.Flatten(),
+            nn.Linear(128 * 28 * 28, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 transform = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -248,17 +279,50 @@ def fuse_scores(rule, bert, cnn1, cnn2, llm):
     sorted_labels = sorted(final.items(), key=lambda x: x[1], reverse=True)
 
     top1, top2 = sorted_labels[0], sorted_labels[1]
-    uncertain = (top1[1] - top2[1]) < 0.1
+    uncertain = (top1[1] - top2[1] < 0.1) or (top1[1] < 0.129)   # Gewicht 0.2 maximal. 0.128 entspricht 0.64
 
     explanation = sorted(contrib[top1[0]].items(), key=lambda x: x[1], reverse=True)
 
     return top1[0], final, contrib, explanation, uncertain
 
+
+
+
+def quick_fuse(rule_scores, bert_scores, cnn1_scores, cnn2_scores):
+    # Rules macht subset. pre_fuse Fusioniert Rules/CNN/BERT. LLM nur bei unsicheren Faellen als Richter
+    final = {}
+
+    for label in FINAL_CLASSES:
+        final[label] = (
+            WEIGHTS["rules"] * rule_scores.get(label, 0)
+            + WEIGHTS["bert"] * bert_scores.get(label, 0)
+            + WEIGHTS["cnn1"] * cnn1_scores.get(label, 0)
+            + WEIGHTS["cnn2"] * cnn2_scores.get(label, 0)
+        )
+
+    sorted_labels = sorted(final.items(), key=lambda x: x[1], reverse=True)
+
+    top1, top2 = sorted_labels[0], sorted_labels[1]
+
+    margin = top1[1] - top2[1]
+
+    confident = (margin > 0.15) or (top1[1] > 0.5)
+
+    return top1[0], final, confident
+
+
 # ============================================================
 # Hash-Sampling (100k Ziel)
 # ============================================================
-def stable_hash(text):
-    return int(hashlib.md5(text.encode()).hexdigest(), 16)
+def stable_hash_key(key: str) -> int:
+    return int(hashlib.md5(key.encode()).hexdigest(), 16)
+
+def stable_hash_record(record):
+    key = f"{record['pmc_id']}_{record['row_id']}"
+    return stable_hash_key(key)
+
+def stable_hash_index(idx: int) -> int:
+    return stable_hash_key(str(idx))
 
 def select_balanced(records, per_class):
     buckets = {c: [] for c in FINAL_CLASSES}
@@ -272,7 +336,7 @@ def select_balanced(records, per_class):
     for c in buckets:
         sorted_bucket = sorted(
             buckets[c],
-            key=lambda x: stable_hash(x["caption"])
+            key=stable_hash_record
         )
         final.extend(sorted_bucket[:per_class])
 
@@ -355,30 +419,30 @@ def extract_text_from_row(row) -> Tuple[str, dict]:
     return text, meta
 
 # ============================================================
-# Bild-Extractor aus Arrow
+# Bild-Extractor aus Arrow, dient auch im Testrun als Inspizieren/Distr/Debug/Übersicht
 # ============================================================
+def bytes_to_pil_image(x):
+    if isinstance(x, Image.Image):
+        return x.convert("RGB")
+
+    if isinstance(x, bytes):
+        return Image.open(io.BytesIO(x)).convert("RGB")
+
+    if isinstance(x, dict):
+        if "bytes" in x and x["bytes"] is not None:
+            return Image.open(io.BytesIO(x["bytes"])).convert("RGB")
+        if "path" in x and x["path"]:
+            return Image.open(x["path"]).convert("RGB")
+
+    raise ValueError(f"Kann jpg-Feld nicht als Bild lesen. Typ: {type(x)}")
 
 def get_image_from_row(row):
-    img = row.get("image", None)
-
-    if img is None:
-        return None
-
-    try:
-        # Bytes (meistens)
-        if isinstance(img, bytes):
-            return Image.open(io.BytesIO(img)).convert("RGB")
-
-        # HF datasets Image-Objekt
-        if hasattr(img, "convert"):
-            return img.convert("RGB")
-
-        if isinstance(img, np.ndarray):
-            return Image.fromarray(img).convert("RGB")
-
-    except Exception:
-        return None
-
+    for key in ["image", "jpg", "png"]:
+        if key in row:
+            try:
+                return bytes_to_pil_image(row[key])
+            except Exception:
+                continue
     return None
 
 # ============================================================
@@ -940,7 +1004,7 @@ def rule_based_classify_with_rules(text: str, rules, label_priority=None):
     )
 
 # ============================================================
-# CNN1 Wrapper u. CNN2 Wrapper
+# CNN Wrapper
 # ============================================================
 def predict_with_cnn(model, image, transform, device, class_names):
     if image is None:
@@ -973,23 +1037,8 @@ def predict_with_cnn(model, image, transform, device, class_names):
 
     except Exception:
         return [], {}
-# ============================================================
-# CNN1 Wrapper u. CNN2 Wrapper
-# ============================================================
-def run_cnn1(model, image, transform, device):
-    if image is None:
-        return "unknown"
 
-    try:
-        img_tensor = transform(image).unsqueeze(0).to(device)
-        with torch.no_grad():
-            output = model(img_tensor)
-            _, pred = torch.max(output, 1)
-        return str(pred.item())
-    except:
-        return "unknown"
-
-def run_cnn2(model, image, transform, device):
+def run_cnn(model, image, transform, device):
     if image is None:
         return "unknown"
 
@@ -1003,9 +1052,110 @@ def run_cnn2(model, image, transform, device):
         return "unknown"
 
 
+# ============================================================
+# Fast pre-sampling (nur Rules)
+# ============================================================
+# ============================================================
+# Checksum
+# ============================================================
+def debug_sampling(records, per_class, class_key="modality_gt"):
+    print("\n===== Early Sampling Checksum&Debug =====")
+
+    labels = []
+    missing = 0
+
+    for r in records:
+        lbl = r.get(class_key, None)
+
+        if lbl is None or str(lbl).strip() == "":
+            missing += 1
+            continue
+
+        labels.append(str(lbl).lower())
+
+    counts = Counter(labels)
+
+    print("\nIm Subset records0 gefundene Klassen:")
+    for k, v in sorted(counts.items()):
+        print(f"{k}: {v}")
+
+    print(f"\nFehlende Labels: {missing}")
+    print(f"Total gültige Labels: {len(labels)}")
+
+    # Checksum
+    ok = True
+
+    print("\n===== Checksum =====")
+    for cls in FINAL_CLASSES:
+        c = counts.get(cls, 0)
+
+        if c != per_class:
+            print(f"{cls}: {c} (expected {per_class})")
+            ok = False
+        else:
+            print(f"{cls}: {c}")
+
+    if not ok:
+        raise ValueError(
+            "Sampling ist nicht balanced! "
+            "-> Abbruch, bevor CNN/LLM läuft."
+        )
+
+    print("\nSampling korrekt balanced!")
+
+def early_balanced_sampling(ds, per_class, limit=None):
+
+    buckets = defaultdict(list)
+
+    # Hash-basierte Reihenfolge (=reproduktiv zufaellig)
+    indices = list(range(len(ds)))
+    indices.sort(key=stable_hash_index)
+
+    max_n = min(len(indices), limit) if limit is not None else len(indices)
+
+    for idx in tqdm(indices[:max_n], desc="Early sampling (RULES only)"):
+
+        row = ds[idx]
+
+        text, meta = extract_text_from_row(row)
+        text = normalize_text(text)
+
+        rule_label, reason, matched, hits = rule_based_classify_with_rules(
+            text, RULES_LONG, LABEL_PRIORITY)
+
+        if rule_label not in FINAL_CLASSES:
+            continue
+
+        if len(buckets[rule_label]) >= per_class:
+            continue
+
+        buckets[rule_label].append({
+            "row_id": idx,
+            "pmc_id": meta.get("PMC_ID", ""),
+            "caption": text,
+            "row": row,
+            "rule_label": rule_label,
+            "modality_gt": meta.get("modality", "unknown"),
+            "rule_reason": reason,
+            "matched_patterns": matched.split(" | ") if matched else []
+        })
+
+        # Early Stop
+        if all(len(buckets[c]) >= per_class for c in FINAL_CLASSES):
+            print(f"\nAlle Klassen voll (per_class) bei idx={idx} → STOP")
+            break
+
+    # Flatten
+    records = []
+    for c in FINAL_CLASSES:
+        records.extend(buckets[c])
+
+    print(f"\nGesammelt: {len(records)} Samples")
+
+    return records
 
 # ============================================================
-# Zero-Shot-artige BERT-Klassifikation
+# Similarity-BERT-Klassifikation (Cosine-Ahnlichkeit zu gegebener Description)
 # ============================================================
 
 CLASS_TEXTS: Dict[str, str] = {
@@ -1079,7 +1229,7 @@ CLASS_TEXTS: Dict[str, str] = {
     ),
 }
 
-class BertCaptionClassifier:
+class BertSimilarityClassifier:
     def __init__(
         self,
         model_path: str,
@@ -1165,7 +1315,20 @@ class BertCaptionClassifier:
             })
 
         return results
+# ============================================================
+# Dense-linear-Layer-Softmax über Embeddings (klassisches antrainieren) BERT-Klassifikation
+# ============================================================
+class BertClassifier(nn.Module):
+    def __init__(self, bert_model, num_classes):
+        super().__init__()
+        self.bert = bert_model
+        self.classifier = nn.Linear(768, num_classes)
 
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        cls = outputs.last_hidden_state[:, 0]
+        return self.classifier(cls)
+# braucht Trainingsdaten
 
 # ============================================================
 # Arrow-Dateien laden
@@ -1253,6 +1416,33 @@ def inspect_final_distribution(records, limit=None):
         perc = (value / total) * 100 if total > 0 else 0
         print(f"{key}: {value} ({perc:.2f}%)")
 
+def save_selected_images(records, output_dir):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    saved = 0
+
+    for r in records:
+        row = r["row"]
+
+        img = get_image_from_row(row)
+        if img is None:
+            continue
+
+        pmc_id = r.get("pmc_id", "unknown")
+        row_id = r.get("row_id", "unknown")
+
+        fname = f"{pmc_id}_{row_id}.jpg"
+        path = output_dir / fname
+
+        try:
+            img.save(path)
+            saved += 1
+        except Exception:
+            continue
+
+    print(f"Gespeichert: {saved} Bilder in {output_dir}")
+
 # ============================================================
 # Hauptklassifikation
 # ============================================================
@@ -1262,19 +1452,25 @@ def classify_dataset(
     output_csv: Path,
     biomedbert_path: Optional[str],
     llamamistral_path: str,
-    c1path: str,
-    c2path: str,
+    cnn1_path: str,
+    cnn2_path: str,
+    cnn3_path: str,
     limit: Optional[int],
+    inspectlimit: int,
     batch_size: int,
     bert_threshold: float,
     per_class: int,
     inspect_only: bool = False,
 ):
+    device = "cpu"
+
     arrow_files = find_arrow_files(dataset_root)
     if not arrow_files:
         raise FileNotFoundError(f"Keine data-*.arrow Dateien in {dataset_root} gefunden.")
 
     print(f"Gefundene Arrow-Dateien: {len(arrow_files)}")
+    # DEBUG: nur 1 Datei
+    arrow_files = arrow_files[:1]
     ds = load_arrow_shards(arrow_files)
 
     print(f"Gesamtanzahl Zeilen: {len(ds)}")
@@ -1289,154 +1485,367 @@ def classify_dataset(
         return
 
     if limit is not None:
-        ds = ds.select(range(min(limit, len(ds))))
+        print(f"\nLimit aktiv: max {limit} Iterationen im Early Sampling")
         print(f"\nLimit aktiv: {len(ds)} Zeilen")
 
-    records = []
-
-    print("\nInitialize models & preparing batch ...")
-    batch_texts = []
-    batch_indices = []
-
-    print("\nInitialize LLaMaMistral ...")
-    # LLaMaMistral initialisieren
-    llm = LocalLLM(model_path=llamamistral_path)
-
-    print("\nInitialize BERT ...")
-    # BERT initialisieren
+    # ============================================================
+    # Phase 1: Modelle initialisieren (ohne LLM!)
+    # ============================================================
+    print("\nInitialize models (ohne LLM)...")
+    # Phase 2: schnelle Vorauswahl Early Sampler
+    records0 = early_balanced_sampling(ds, per_class, limit)
+    # Gewaehrleist, dass wirklich alle Klassen Eintraganzahl=per_class haben.
+    debug_sampling(records0, per_class)
+    # BERT
     bert_clf = None
     if biomedbert_path:
-        bert_clf = BertCaptionClassifier(model_path=biomedbert_path)
+        print("\nInitialize BERT Similarity...")
+        bert_clf = BertSimilarityClassifier(model_path=biomedbert_path)
 
-    for idx in tqdm(range(len(ds)), desc="Prepare LLM Batch"):
-        row = ds[idx]
-        text, meta = extract_text_from_row(row)
-        text = normalize_text(text)
-
-        batch_texts.append(text)
-        batch_indices.append((idx, meta, text, row))
-
-    # Complete vLLM LLaMa Mistral
-    llm_results = llm.batch_predict(batch_texts)
-
-    records = []
-
-    device = "cpu"
-    # device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # CNN1 laden
+    # CNN
+    print("\nInitialize Convolutional Neural Network...")
     cnn1_model = SimpleCNN(num_classes=11)
-    cnn1_model.load_state_dict(torch.load(c1path, map_location=device))
+    cnn1_model.load_state_dict(torch.load(cnn1_path, map_location=device))
     cnn1_model.to(device).eval()
 
-    # CNN2 laden
     cnn2_model = SimpleCNN(num_classes=4)
-    cnn2_model.load_state_dict(torch.load(c2path, map_location=device))
+    cnn2_model.load_state_dict(torch.load(cnn2_path, map_location=device))
     cnn2_model.to(device).eval()
 
-    cnn1_transform = transform
-    cnn2_transform = transform
-    print("\nWende Regeln an, Cosine den Text, Falte Bilder, Erstelle Scores")
-    for (idx, meta, text, row), llm_out in zip(batch_indices, llm_results):
+    cnn3_model = ThirdCNN(num_classes=6)
+    cnn3_model.load_state_dict(torch.load(cnn3_path, map_location=device))
+    cnn3_model.to(device).eval()
 
+    cnn_transform = transform
+
+
+    # ============================================================
+    # Phase 3: Records sammeln (ohne LLM)
+    # ============================================================
+
+    print("\nExtrahiere Records + RULES + CNN + BERT ...")
+    print("\nPhase 2: CNN + BERT auf Subset")
+
+    processed_records = []
+    filtered_out = []
+
+    for r in tqdm(records0, desc="CNN + BERT"):
+
+        text = r["caption"]
+        row = r["row"]
+
+        # =========================
         # RULES
-        rule_label, _, _, hits = rule_based_classify_with_rules(
-            text, RULES_LONG, LABEL_PRIORITY
-        )
-
+        # =========================
         rule_scores = {c: 0.0 for c in FINAL_CLASSES}
-        if rule_label in FINAL_CLASSES:
-            rule_scores[rule_label] = 1.0
+        if r["rule_label"] in FINAL_CLASSES:
+            rule_scores[r["rule_label"]] = 1.0
 
+        # =========================
         # BERT
+        # =========================
         if bert_clf:
             bert_out = bert_clf.predict_batch([text])[0]
             bert_scores = {c: 0.0 for c in FINAL_CLASSES}
             bert_scores[bert_out["label"]] = bert_out["score"]
         else:
             bert_scores = {c: 0.0 for c in FINAL_CLASSES}
+            bert_out = {"label": "none", "score": 0.0}
 
-        # CNN1 / CNN2
+        # =========================
+        # CNN1 + CNN2
+        # =========================
         image = get_image_from_row(row)
-        # Top 1
-        # cnn1_raw = run_cnn1(cnn1_model, image, cnn1_transform, device)
-        # cnn2_raw = run_cnn2(cnn2_model, image, cnn2_transform, device)
-        #
-        # cnn1_scores = cnn_to_scores(cnn1_raw, CNN1_MAPPING)
-        # cnn2_scores = cnn_to_scores(cnn2_raw, CNN2_MAPPING)
 
-        # Top 3
-        # CNN1
         cnn1_top3, cnn1_full = predict_with_cnn(
-            cnn1_model, image, cnn1_transform, device, CNN1_CLASS_NAMES)
-
+            cnn1_model, image, cnn_transform, device, CNN1_CLASS_NAMES)
         cnn1_scores = map_scores_to_final(cnn1_full, CNN1_MAPPING)
 
-        # CNN2
         cnn2_top3, cnn2_full = predict_with_cnn(
-            cnn2_model, image, cnn2_transform, device, CNN2_CLASS_NAMES)
-
+            cnn2_model, image, cnn_transform, device, CNN2_CLASS_NAMES)
         cnn2_scores = map_scores_to_final(cnn2_full, CNN2_MAPPING)
 
-        # Fusion
-        final_label, final_scores, contrib, explanation, uncertain = fuse_scores(
+        # =========================
+        # Quick Fusion (ohne LLM) laeuft schneller
+        # Rules macht subset. pre_fuse Fusioniert Rules/CNN/BERT. LLM nur bei unsicheren Faellen als Richter
+        # =========================
+        quick_label, quick_scores, confident = quick_fuse(
             rule_scores,
             bert_scores,
             cnn1_scores,
-            cnn2_scores,
-            llm_out)
+            cnn2_scores
+        )
 
-        records.append({
-            "row_id": idx,
+        # =========================
+        # CNN3 Filtering (Konsens!)
+        # =========================
 
-            "Final Label:": final_label,
+        cnn3_top3, cnn3_full = predict_with_cnn(
+            cnn3_model, image, cnn_transform, device, CNN3_CLASS_NAMES
+        )
 
-            "RULE:": rule_label,
-            "BERT:": bert_out["label"] if bert_clf else "none",
-            "CNN1top3": json.dumps(cnn1_top3),
-            "CNN2top3": json.dumps(cnn2_top3),
-            "LaMa:": llm_out[0],
+        if cnn3_full:
+            cnn3_pred = max(cnn3_full, key=cnn3_full.get)
+            cnn3_conf = cnn3_full[cnn3_pred]
+        else:
+            cnn3_pred = "unknown"
+            cnn3_conf = 0.0
 
-            "caption": text,
+        # =========================
+        # Vorscore (CNN1 + CNN2 + RULES + BERT)
+        # =========================
 
-            "BERT_score": bert_out["score"] if bert_clf else 0.0,
-            "CNN1_scores": json.dumps(cnn1_scores),
-            "CNN2_scores": json.dumps(cnn2_scores),
-            "LaMa_conf": llm_out[1],
-            "Final Scores": json.dumps(final_scores),
-            "Begründung": json.dumps(explanation),
-            "uncertain": uncertain,
-            "pmc_id": meta.get("PMC_ID", "")
+        pre_scores = {}
+
+        for label in FINAL_CLASSES:
+            pre_scores[label] = (
+                    WEIGHTS["rules"] * rule_scores.get(label, 0)
+                    + WEIGHTS["bert"] * bert_scores.get(label, 0)
+                    + WEIGHTS["cnn1"] * cnn1_scores.get(label, 0)
+                    + WEIGHTS["cnn2"] * cnn2_scores.get(label, 0)
+            )
+
+        # bestes medizinisches Label
+        pre_pred = max(pre_scores, key=pre_scores.get)
+        pre_conf = pre_scores[pre_pred]
+
+        # =========================
+        # Entscheidung
+        # =========================
+        # Idee:
+        # CNN3 darf nur filtern, wenn:
+        # - gehört zu Filterklassen
+        # - CNN3 ziemlich sicher
+        # - andere Modelle nicht stark sind
+
+        CNN3_CONF_MIN = 0.745 # (0.55) aber hochgetan: Ueber 0.745 sind es Trash-Bilder
+        PRE_CONF_MAX = 0.7  # wenn andere Modelle unsicher sind (0.35) (0.66) aber habe es hochgedrillt: nach 0.7 sind sich die anderen modelle sicher
+        STRONG_PRE = 0.7
+        if (
+                cnn3_pred in CNN3_CLASS_NAMES
+                and cnn3_conf > CNN3_CONF_MIN
+                and pre_conf < PRE_CONF_MAX
+        ):
+            filtered_out.append(r["row_id"])
+            continue
+
+        if pre_conf > STRONG_PRE:
+            pass
+
+        # =========================
+        # LLM Entscheidung
+        # =========================
+
+        LLM_THRESHOLD = 0.739  # streng!
+
+        # selbst wenn confident trotzdem oft LLM
+        if confident and max(quick_scores.values()) > LLM_THRESHOLD:
+            r.update({
+                "final_label": quick_label,
+                "llm_needed": False
+            })
+        else:
+            r.update({
+                "quick_label": quick_label,
+                "llm_needed": True
+            })
+
+        # =========================
+        # Debug + Speicherung
+        # =========================
+        r.update({
+            "rule_scores": rule_scores,
+            "rule_reason": r.get("rule_reason", ""),
+
+            "bert_label": bert_out["label"],
+            "bert_score": bert_out["score"],
+            "bert_scores": bert_scores,
+
+            "cnn1_top3": cnn1_top3,
+            "cnn1_scores": cnn1_scores,
+
+            "cnn2_top3": cnn2_top3,
+            "cnn2_scores": cnn2_scores,
+
+            "modality_gt": r.get("modality_gt", "unknown"),
+
+            "cnn3_pred": cnn3_pred,
+            "cnn3_top3": cnn3_top3,
+            "cnn3_conf": cnn3_conf,
+
+            "matched_patterns": r.get("matched_patterns", []),
         })
 
-    records = select_balanced(records, per_class=per_class)
-    print(f"\nBalanced Subset: {len(records)} Samples")
+        processed_records.append(r)
 
+    records = processed_records
+
+
+    # ============================================================
+    # Phase 4: LLM nur unsichere Fälle!
+    # ============================================================
+
+    print("\nInitialize LLaMaMistral ...")
+    llm = LocalLLM(model_path=llamamistral_path)
+
+    texts = [r["caption"] for r in records if r["llm_needed"]]
+
+    llm_results_partial = llm.batch_predict(texts)
+
+    # Mapping zurück
+    llm_iter = iter(llm_results_partial)
+
+    llm_results = []
+    for r in records:
+        if r["llm_needed"]:
+            llm_results.append(next(llm_iter))
+        else:
+            llm_results.append((r["final_label"], 1.0))  # fake confidence
+
+    # ============================================================
+    # Phase 5: Final fusion
+    # ============================================================
+
+    print("\nFinale Fusion ...")
+
+    final_records = []
+
+    for r, llm_out in zip(records, llm_results):
+        if not r["llm_needed"]:
+            final_label = r["final_label"]
+            final_scores = r["rule_scores"]
+            uncertain = False
+            contrib = {}
+            explanation = []
+        else:
+            final_label, final_scores, contrib, explanation, uncertain = fuse_scores(
+                r["rule_scores"],
+                r["bert_scores"],
+                r["cnn1_scores"],
+                r["cnn2_scores"],
+                llm_out
+            )
+
+        debug_info = {
+            "final_label": final_label,
+            "uncertain": uncertain,
+
+            "rules": {
+                "label": r["rule_label"],
+                "score_raw": 1.0 if r["rule_label"] in FINAL_CLASSES else 0.0,
+                "score_weighted": WEIGHTS["rules"] * (1.0 if r["rule_label"] in FINAL_CLASSES else 0.0),
+                "matched_patterns": r.get("matched_patterns", []),
+                "decision_reason": r.get("rule_reason", "")
+            },
+
+            "bert": {
+                "label": r["bert_label"],
+                "score_raw": r["bert_score"],
+                "score_weighted": WEIGHTS["bert"] * r["bert_score"],
+                "top2": r.get("bert_top2", [])
+            },
+
+            "cnn1": {
+                "top3": r["cnn1_top3"],
+                "scores_raw": r["cnn1_scores"],
+                "score_weighted_max": WEIGHTS["cnn1"] * max(r["cnn1_scores"].values()) if r["cnn1_scores"] else 0.0
+            },
+
+            "cnn2": {
+                "top3": r["cnn2_top3"],
+                "scores_raw": r["cnn2_scores"],
+                "score_weighted_max": WEIGHTS["cnn2"] * max(r["cnn2_scores"].values()) if r["cnn2_scores"] else 0.0
+            },
+
+            "llm": {
+                "label": llm_out[0],
+                "score_raw": llm_out[1],
+                "score_weighted": WEIGHTS["llm"] * llm_out[1]
+            },
+
+            "final_scores": final_scores
+        }
+
+        final_records.append({
+            "pmc_id": r["pmc_id"],
+            "row_id": r["row_id"],
+            "row": r["row"],
+
+            "final_label": final_label,
+
+            "RULE": r["rule_label"],
+            "BERT": r["bert_label"],
+            "CNN1top3": json.dumps(r["cnn1_top3"]),
+            "CNN2top3": json.dumps(r["cnn2_top3"]),
+            "LLM": llm_out[0],
+
+            "BERT_score": r["bert_score"],
+            "CNN1_scores": json.dumps(r["cnn1_scores"]),
+            "CNN2_scores": json.dumps(r["cnn2_scores"]),
+            "LLM_conf": llm_out[1],
+            "Final Scores": json.dumps(final_scores),
+
+            "Begründung": json.dumps(debug_info),
+            "uncertain": uncertain,
+
+            "caption": r["caption"],
+            "modality_gt": r.get("modality_gt", "unknown"),
+        })
+
+    records = final_records
 # ============================================================
-# Endergebnisse Head ausgeben
+# Phase 6: Post-Balancing (=alle Klassen per_class mal haben muessen!)
+# ============================================================
+    print("\nRe-balancing final dataset...")
+
+    records = select_balanced(records, per_class)
+
+    print("Nachbalanciert:", len(records))
+# ============================================================
+# Phase 6: Bilder speichern
+# ============================================================
+    image_output_dir = output_csv.parent / "exported_images"
+
+    print("\nSpeichere ausgewählte Bilder ...")
+    save_selected_images(records, image_output_dir)
+# ============================================================
+# Phase 7: Endergebnisse Head ausgeben
 # ============================================================
     df = pd.DataFrame(records)
 
     empty_mask = df["caption"].fillna("").astype(str).str.strip().eq("")
-    df.loc[empty_mask, "pred_label"] = "unknown"
-    df.loc[empty_mask, "decision_source"] = "empty_text"
-    df.loc[empty_mask, "decision_reason"] = "empty_text"
+    df.loc[empty_mask, "final_label"] = "unknown"
+    df.loc[empty_mask, "Begründung"] = "empty_text"
+    df.loc[empty_mask, "Begründung"] = "empty_text"
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_csv, index=False, encoding="utf-8")
 
     print(f"\nCSV gespeichert unter:\n{output_csv}")
 
-    print("\n===== Verteilung pred_label =====")
-    print(df["pred_label"].value_counts(dropna=False))
+    print("\n===== Verteilung final_label =====")
+    print(df["final_label"].value_counts(dropna=False))
 
     print("\n===== Verteilung decision_source =====")
-    print(df["decision_source"].value_counts(dropna=False))
+    print(df["Begründung"].value_counts(dropna=False))
 
     print("\n===== Verteilung modality_gt =====")
     print(df["modality_gt"].value_counts(dropna=False).head(20))
 
+    print(f"\n===== Verteilung von mir klassifizierter Modalitaeten. Inspectlimit: {inspectlimit}=====")
+    inspect_final_distribution(records, limit=inspectlimit)
 
+    print("\n===== FILTERING =====")
+    print(f"Original: {len(records0)}")
+    print(f"Weggefiltert (einfach): {len(filtered_out)}")
+    print(f"Übrig (für LLM): {len(processed_records)}")
+
+    if len(records0) > 0:
+        print(f"Filter-Rate: {len(filtered_out) / len(records0) * 100:.2f}%")
+
+    print("\n===== DEBUG =====")
+    print("LLM needed:", sum(r["llm_needed"] for r in processed_records))
+    print("No LLM:", sum(not r["llm_needed"] for r in processed_records))
 # ============================================================
 # CLI
 # ============================================================
@@ -1481,6 +1890,12 @@ def parse_args():
         help="Lokaler Pfad zum custom CNN2"
     )
     parser.add_argument(
+        "--cnn3_path",
+        type=str,
+        required=True,
+        help="Lokaler Pfad zum custom filtering CNN3"
+    )
+    parser.add_argument(
         "--per_class",
         type=int,
         default=5000,
@@ -1491,6 +1906,12 @@ def parse_args():
         type=int,
         default=None,
         help="Optionales Limit für erste Tests"
+    )
+    parser.add_argument(
+        "--inspectlimit",
+        type=int,
+        default=10,
+        help="Limit für Inspektionsfunktionen (z.B. Verteilungen)"
     )
     parser.add_argument(
         "--batch_size",
@@ -1526,6 +1947,8 @@ def main():
         llamamistral_path=args.llamamistral_path,
         cnn1_path=args.cnn1_path,
         cnn2_path=args.cnn2_path,
+        cnn3_path=args.cnn3_path,
+        inspectlimit=args.inspectlimit,
         limit=args.limit,
         batch_size=args.batch_size,
         bert_threshold=args.bert_threshold,
