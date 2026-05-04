@@ -63,7 +63,7 @@ FINAL_CLASSES = [
 CNN1_CLASS_NAMES = [
     "mrt_prostata_t1",
     "mrt_prostata_t2",
-    "mrt_hirn_flair'",
+    "mrt_hirn_flair",
     "mrt_hirn_t1",
     "mrt_hirn_t2",
     "mrt_hirn_t1_c",
@@ -102,12 +102,40 @@ CNN3_CLASS_NAMES = [
     "haut",
     "chart",
     "histologie"]
+#Gating fuer CNN1 mit CNN2 Fusion. Disjunkt. CNN1 kann gut (besser als 2) obere. CNN2 kann besser das untere
+# nicht disjunkt. Sie sind asymmetrisch spezialisiert
+CNN1_VALID = [
+    "ct",
+    "ct_kombimodalitaet_spect+ct_pet+ct",
+    "us"]
+CNN2_VALID = [
+    "xray",
+    "xray_fluoroskopie_angiographie",
+    "mrt_hirn",
+    "mrt_body"]
+# fuer Weight Log-Scaling
+CNN1_CLASS_COUNTS_RAW = {
+    "xray": 54419,
+    "xray_fluoroskopie_angiographie": 3000,
+    "us": 23804,
+    "mrt_hirn": 4528,
+    "mrt_body": 1666,
+    "ct": 98158,
+    "ct_kombimodalitaet_spect+ct_pet+ct": 418723
+}
+CNN2_CLASS_COUNTS_RAW = {
+    "xray": 60852,
+    "xray_fluoroskopie_angiographie": 6433,
+    "mrt_hirn": 337909,
+    "mrt_body": 32006
+}
 WEIGHTS = {
     "rules": 0.2,
     "bert": 0.2,
-    "cnn1": 0.2,
-    "cnn2": 0.2,
-    "llm": 0.2
+    "cnn": 0.4,
+    "llm": 0.2,
+
+    "ood": 0.3
 }
 
 # gen. LLM (vLLM READY)
@@ -259,36 +287,51 @@ def map_scores_to_final(full_scores, mapping):
             final_scores[final_cls] += prob
 
     return final_scores
+# CNN1+CNN2 disjunkt Hard Gating Specialist cnn fusion
+def fuse_cnn_specialized(cnn1_scores, cnn2_scores):
+    fused = {c: 0.0 for c in FINAL_CLASSES}
 
-# Final-Classes Fusion
-def fuse_scores(rule, bert, cnn1, cnn2, llm):
+    for c in FINAL_CLASSES:
+        if c in CNN1_VALID:
+            fused[c] = cnn1_scores.get(c, 0.0)
+
+        elif c in CNN2_VALID:
+            fused[c] = cnn2_scores.get(c, 0.0)
+
+    return fused
+
+# Final-Classes Fusion mit Out-Of-Distribution Score~Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
+def fuse_scores(rule, bert, cnn, llm, ood_score):
+
     final = {}
     contrib = {}
 
     for label in FINAL_CLASSES:
-        contrib[label] = {
-            "rules": WEIGHTS["rules"] * rule.get(label, 0),
-            "bert": WEIGHTS["bert"] * bert.get(label, 0),
-            "cnn1": WEIGHTS["cnn1"] * cnn1.get(label, 0),
-            "cnn2": WEIGHTS["cnn2"] * cnn2.get(label, 0),
-            "llm": WEIGHTS["llm"] * (llm[1] if llm[0] == label else 0),
-        }
+        base = (
+            WEIGHTS["rules"] * rule.get(label, 0)
+            + WEIGHTS["bert"] * bert.get(label, 0)
+            + WEIGHTS["cnn"] * cnn.get(label, 0)
+            + WEIGHTS["llm"] * (llm[1] if llm[0] == label else 0)
+        )
 
-        final[label] = sum(contrib[label].values())
+        # OOD reduziert alle medizinischen Klassen
+        final[label] = base * (1 - WEIGHTS["ood"] * ood_score)
 
     sorted_labels = sorted(final.items(), key=lambda x: x[1], reverse=True)
 
     top1, top2 = sorted_labels[0], sorted_labels[1]
-    uncertain = (top1[1] - top2[1] < 0.1) or (top1[1] < 0.129)   # Gewicht 0.2 maximal. 0.128 entspricht 0.64
 
-    explanation = sorted(contrib[top1[0]].items(), key=lambda x: x[1], reverse=True)
+    margin = top1[1] - top2[1]
 
-    return top1[0], final, contrib, explanation, uncertain
+    uncertain = (
+        margin < 0.10 * top1[1] # relativ gesehen
+        or top1[1] < 0.2        # schwach
+    )
+
+    return top1[0], final, contrib, None, uncertain
 
 
-
-
-def quick_fuse(rule_scores, bert_scores, cnn1_scores, cnn2_scores):
+def quick_fuse(rule_scores, bert_scores, cnn_scores):
     # Rules macht subset. pre_fuse Fusioniert Rules/CNN/BERT. LLM nur bei unsicheren Faellen als Richter
     final = {}
 
@@ -296,8 +339,7 @@ def quick_fuse(rule_scores, bert_scores, cnn1_scores, cnn2_scores):
         final[label] = (
             WEIGHTS["rules"] * rule_scores.get(label, 0)
             + WEIGHTS["bert"] * bert_scores.get(label, 0)
-            + WEIGHTS["cnn1"] * cnn1_scores.get(label, 0)
-            + WEIGHTS["cnn2"] * cnn2_scores.get(label, 0)
+            + WEIGHTS["cnn"] * cnn_scores.get(label, 0)    # ersetzt cnn1 u cnn2
         )
 
     sorted_labels = sorted(final.items(), key=lambda x: x[1], reverse=True)
@@ -306,7 +348,10 @@ def quick_fuse(rule_scores, bert_scores, cnn1_scores, cnn2_scores):
 
     margin = top1[1] - top2[1]
 
-    confident = (margin > 0.15) or (top1[1] > 0.5)
+    confident = (
+            margin > 0.10 * top1[1] # relativ gesehen
+            and top1[1] > 0.2       # schwach
+    )
 
     return top1[0], final, confident
 
@@ -1051,41 +1096,66 @@ def run_cnn(model, image, transform, device):
     except:
         return "unknown"
 
+# log scaling weights anstatt hard gating of classes (asymmetric classes)
+def compute_model_weights(class_counts, final_classes):
+    import math
 
+    weights = {}
+
+    # Log scaling
+    for c in final_classes:
+        count = class_counts.get(c, 0)
+        weights[c] = math.log(count + 1)
+
+    # Normalisierung
+    max_w = max(weights.values()) if weights else 1.0
+
+    if max_w == 0:
+        return {c: 0.0 for c in final_classes}
+
+    for c in weights:
+        weights[c] /= max_w  # [0,1]
+
+    return weights
+
+cnn1_weights = compute_model_weights(CNN1_CLASS_COUNTS_RAW, FINAL_CLASSES)
+cnn2_weights = compute_model_weights(CNN2_CLASS_COUNTS_RAW, FINAL_CLASSES)
 # ============================================================
 # Fast pre-sampling (nur Rules)
 # ============================================================
 # ============================================================
 # Checksum
 # ============================================================
-def debug_sampling(records, per_class, class_key="modality_gt"):
+def debug_sampling(records, per_class, class_key="rule_label"):
     print("\n===== Early Sampling Checksum&Debug =====")
 
-    labels = []
+    counts = Counter()
     missing = 0
 
     for r in records:
-        lbl = r.get(class_key, None)
+        lbl = r.get(class_key)
 
-        if lbl is None or str(lbl).strip() == "":
+        if lbl is None:
             missing += 1
             continue
 
-        labels.append(str(lbl).lower())
+        lbl = str(lbl).lower().strip()
 
-    counts = Counter(labels)
+        if lbl not in FINAL_CLASSES:
+            continue
 
-    print("\nIm Subset records0 gefundene Klassen:")
+        counts[lbl] += 1
+
+    print("\nGefundene Klassen:")
     for k, v in sorted(counts.items()):
         print(f"{k}: {v}")
 
     print(f"\nFehlende Labels: {missing}")
-    print(f"Total gültige Labels: {len(labels)}")
-
-    # Checksum
-    ok = True
+    print(f"Total gültige Labels: {sum(counts.values())}")
 
     print("\n===== Checksum =====")
+
+    ok = True
     for cls in FINAL_CLASSES:
         c = counts.get(cls, 0)
 
@@ -1096,10 +1166,7 @@ def debug_sampling(records, per_class, class_key="modality_gt"):
             print(f"{cls}: {c}")
 
     if not ok:
-        raise ValueError(
-            "Sampling ist nicht balanced! "
-            "-> Abbruch, bevor CNN/LLM läuft."
-        )
+        raise ValueError("Sampling ist nicht balanced!")
 
     print("\nSampling korrekt balanced!")
 
@@ -1123,8 +1190,13 @@ def early_balanced_sampling(ds, per_class, limit=None):
         rule_label, reason, matched, hits = rule_based_classify_with_rules(
             text, RULES_LONG, LABEL_PRIORITY)
 
+        # print(f"{rule_label} | {text[:80]}")
+
         if rule_label not in FINAL_CLASSES:
             continue
+
+        if rule_label == "unknown":
+            print("Regellabel ist unknown TEXT:", text[:200])
 
         if len(buckets[rule_label]) >= per_class:
             continue
@@ -1416,6 +1488,9 @@ def inspect_final_distribution(records, limit=None):
         perc = (value / total) * 100 if total > 0 else 0
         print(f"{key}: {value} ({perc:.2f}%)")
 
+def top_label(scores):
+    return max(scores, key=scores.get) if scores else "none"
+
 def save_selected_images(records, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1524,7 +1599,7 @@ def classify_dataset(
     # ============================================================
 
     print("\nExtrahiere Records + RULES + CNN + BERT ...")
-    print("\nPhase 2: CNN + BERT auf Subset")
+    print("\nPhase 3: CNN + BERT auf Subset")
 
     processed_records = []
     filtered_out = []
@@ -1547,7 +1622,8 @@ def classify_dataset(
         if bert_clf:
             bert_out = bert_clf.predict_batch([text])[0]
             bert_scores = {c: 0.0 for c in FINAL_CLASSES}
-            bert_scores[bert_out["label"]] = bert_out["score"]
+            if bert_out["label"] in FINAL_CLASSES:
+                bert_scores[bert_out["label"]] = bert_out["score"]
         else:
             bert_scores = {c: 0.0 for c in FINAL_CLASSES}
             bert_out = {"label": "none", "score": 0.0}
@@ -1565,6 +1641,19 @@ def classify_dataset(
             cnn2_model, image, cnn_transform, device, CNN2_CLASS_NAMES)
         cnn2_scores = map_scores_to_final(cnn2_full, CNN2_MAPPING)
 
+        cnn_scores = fuse_cnn_specialized(cnn1_scores, cnn2_scores)
+
+        #Debug
+        rule_pred = max(rule_scores, key=rule_scores.get)
+        bert_pred = max(bert_scores, key=bert_scores.get)
+        cnn_pred = max(cnn_scores, key=cnn_scores.get)
+        cnn1_pred = max(cnn1_scores, key=cnn1_scores.get)
+        cnn2_pred = max(cnn2_scores, key=cnn2_scores.get)
+        # print(f"R:{rule_pred} B:{bert_pred} C1:{cnn1_pred} C2:{cnn2_pred} | {text[:80]}")
+
+        disagreement = len({rule_pred, bert_pred, cnn1_pred, cnn2_pred})
+        if disagreement >= 3:
+            print("⚠️", rule_pred, bert_pred, cnn1_pred, cnn2_pred)
         # =========================
         # Quick Fusion (ohne LLM) laeuft schneller
         # Rules macht subset. pre_fuse Fusioniert Rules/CNN/BERT. LLM nur bei unsicheren Faellen als Richter
@@ -1572,9 +1661,7 @@ def classify_dataset(
         quick_label, quick_scores, confident = quick_fuse(
             rule_scores,
             bert_scores,
-            cnn1_scores,
-            cnn2_scores
-        )
+            cnn_scores)
 
         # =========================
         # CNN3 Filtering (Konsens!)
@@ -1587,6 +1674,10 @@ def classify_dataset(
         if cnn3_full:
             cnn3_pred = max(cnn3_full, key=cnn3_full.get)
             cnn3_conf = cnn3_full[cnn3_pred]
+            r["ood_score"] = sum(
+                cnn3_full.get(cls, 0.0)
+                for cls in CNN3_CLASS_NAMES
+            )
         else:
             cnn3_pred = "unknown"
             cnn3_conf = 0.0
@@ -1621,8 +1712,7 @@ def classify_dataset(
         )
 
         if (
-                cnn3_pred in CNN3_CLASS_NAMES
-                and cnn3_conf > CNN3_CONF_MIN
+                cnn3_conf > CNN3_CONF_MIN
                 and all_models_uncertain
         ):
             filtered_out.append(r["row_id"])
@@ -1632,7 +1722,7 @@ def classify_dataset(
         # LLM Entscheidung
         # =========================
 
-        LLM_THRESHOLD = 0.739  # streng!
+        LLM_THRESHOLD = 0.35
 
         # selbst wenn confident trotzdem oft LLM
         if confident and max(quick_scores.values()) > LLM_THRESHOLD:
@@ -1656,6 +1746,9 @@ def classify_dataset(
             "bert_label": bert_out["label"],
             "bert_score": bert_out["score"],
             "bert_scores": bert_scores,
+
+            "cnn_scores": cnn_scores,
+            "cnn_label": cnn_pred,
 
             "cnn1_top3": cnn1_top3,
             "cnn1_scores": cnn1_scores,
@@ -1683,7 +1776,16 @@ def classify_dataset(
 
     print("\nInitialize LLaMaMistral ...")
     llm = LocalLLM(model_path=llamamistral_path)
+    #debug
+    llm_needed_count = sum(r["llm_needed"] for r in records)
+    no_llm_count = sum(not r["llm_needed"] for r in records)
+    total_count = len(records)
 
+    print("\n===== LLM USAGE =====")
+    print(f"LLM nötig:      {llm_needed_count}")
+    print(f"Ohne LLM:       {no_llm_count}")
+    print(f"Gesamt:         {total_count}")
+    print(f"LLM Anteil:     {llm_needed_count / total_count * 100:.2f}%")
     texts = [r["caption"] for r in records if r["llm_needed"]]
 
     llm_results_partial = llm.batch_predict(texts)
@@ -1696,7 +1798,7 @@ def classify_dataset(
         if r["llm_needed"]:
             llm_results.append(next(llm_iter))
         else:
-            llm_results.append((r["final_label"], 1.0))  # fake confidence
+            llm_results.append((r["final_label"], 0.5))  # fake confidence
 
     # ============================================================
     # Phase 5: Final fusion
@@ -1707,6 +1809,11 @@ def classify_dataset(
     final_records = []
 
     for r, llm_out in zip(records, llm_results):
+        ood_score = r.get("ood_score", 0.0)
+
+        if ood_score > 0.8:     # ood=Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
+            filtered_out.append(r["row_id"])
+            continue
         if not r["llm_needed"]:
             final_label = r["final_label"]
             final_scores = r["rule_scores"]
@@ -1717,9 +1824,9 @@ def classify_dataset(
             final_label, final_scores, contrib, explanation, uncertain = fuse_scores(
                 r["rule_scores"],
                 r["bert_scores"],
-                r["cnn1_scores"],
-                r["cnn2_scores"],
-                llm_out
+                r["cnn_scores"],
+                llm_out,
+                r.get("ood_score", 0.0)
             )
 
         debug_info = {
@@ -1740,17 +1847,18 @@ def classify_dataset(
                 "score_weighted": WEIGHTS["bert"] * r["bert_score"],
                 "top2": r.get("bert_top2", [])
             },
+            "cnnfusion": {
+                "label": r["cnn_label"],
+                "score_raw": r["cnn_score"]},
 
             "cnn1": {
                 "top3": r["cnn1_top3"],
                 "scores_raw": r["cnn1_scores"],
-                "score_weighted_max": WEIGHTS["cnn1"] * max(r["cnn1_scores"].values()) if r["cnn1_scores"] else 0.0
             },
 
             "cnn2": {
                 "top3": r["cnn2_top3"],
                 "scores_raw": r["cnn2_scores"],
-                "score_weighted_max": WEIGHTS["cnn2"] * max(r["cnn2_scores"].values()) if r["cnn2_scores"] else 0.0
             },
 
             "llm": {
