@@ -1592,22 +1592,13 @@ def classify_dataset(
             cnn3_conf = 0.0
 
         # =========================
-        # Vorscore (CNN1 + CNN2 + RULES + BERT)
+        # Entscheidung ueber CNN1/CNN2/RULES/BERT-einzelweises Scoring
         # =========================
 
-        pre_scores = {}
-
-        for label in FINAL_CLASSES:
-            pre_scores[label] = (
-                    WEIGHTS["rules"] * rule_scores.get(label, 0)
-                    + WEIGHTS["bert"] * bert_scores.get(label, 0)
-                    + WEIGHTS["cnn1"] * cnn1_scores.get(label, 0)
-                    + WEIGHTS["cnn2"] * cnn2_scores.get(label, 0)
-            )
-
-        # bestes medizinisches Label
-        pre_pred = max(pre_scores, key=pre_scores.get)
-        pre_conf = pre_scores[pre_pred]
+        rule_conf = max(rule_scores.values()) if rule_scores else 0.0
+        bert_conf = max(bert_scores.values()) if bert_scores else 0.0
+        cnn1_conf = max(cnn1_scores.values()) if cnn1_scores else 0.0
+        cnn2_conf = max(cnn2_scores.values()) if cnn2_scores else 0.0
 
         # =========================
         # Entscheidung
@@ -1619,18 +1610,23 @@ def classify_dataset(
         # - andere Modelle nicht stark sind
 
         CNN3_CONF_MIN = 0.745 # (0.55) aber hochgetan: Ueber 0.745 sind es Trash-Bilder
-        PRE_CONF_MAX = 0.7  # wenn andere Modelle unsicher sind (0.35) (0.66) aber habe es hochgedrillt: nach 0.7 sind sich die anderen modelle sicher
-        STRONG_PRE = 0.7
+        PRE_CONF_MAX = 0.7  # (0.35) (0.66) aber hochgedrillt: nach 0.7 sind sich die anderen modelle sicher
+        # Klassen der Modelle muessen >0.7 haben. Muellmann moechte nur >=0.75.
+        # Wenn Muellmann selbst unsicher ist, ist >0.7 gut genug, um als Klasse angenommen zu werden
+        all_models_uncertain = (
+                rule_conf < PRE_CONF_MAX and
+                bert_conf < PRE_CONF_MAX and
+                cnn1_conf < PRE_CONF_MAX and
+                cnn2_conf < PRE_CONF_MAX
+        )
+
         if (
                 cnn3_pred in CNN3_CLASS_NAMES
                 and cnn3_conf > CNN3_CONF_MIN
-                and pre_conf < PRE_CONF_MAX
+                and all_models_uncertain
         ):
             filtered_out.append(r["row_id"])
             continue
-
-        if pre_conf > STRONG_PRE:
-            pass
 
         # =========================
         # LLM Entscheidung
