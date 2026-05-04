@@ -287,18 +287,89 @@ def map_scores_to_final(full_scores, mapping):
             final_scores[final_cls] += prob
 
     return final_scores
-# CNN1+CNN2 disjunkt Hard Gating Specialist cnn fusion
-def fuse_cnn_specialized(cnn1_scores, cnn2_scores):
-    fused = {c: 0.0 for c in FINAL_CLASSES}
+# CNN fusion mit log-scaled weights of derer Klassen
+def fuse_cnn_weighted(cnn1_scores, cnn2_scores, w1, w2, alpha=0.5):
+    fused = {}
 
     for c in FINAL_CLASSES:
-        if c in CNN1_VALID:
-            fused[c] = cnn1_scores.get(c, 0.0)
+        s1 = cnn1_scores.get(c, 0.0)
+        s2 = cnn2_scores.get(c, 0.0)
 
-        elif c in CNN2_VALID:
-            fused[c] = cnn2_scores.get(c, 0.0)
+        # Soft weighting
+        s1_weighted = s1 * (1 + alpha * w1.get(c, 0.0))
+        s2_weighted = s2 * (1 + alpha * w2.get(c, 0.0))
+
+        fused[c] = max(s1_weighted, s2_weighted)
 
     return fused
+
+def compute_cnn_confidence_and_margin(cnn_scores):
+    # Berechnet:
+    # - cnn_conf   → höchste Wahrscheinlichkeit
+    # - cnn_margin → Abstand zum zweitbesten Label
+    # Args:
+    #     cnn_scores (dict): {label: score}
+    # Returns:
+    #     cnn_conf (float)
+    #     cnn_margin (float)
+    #     top1_label (str)
+    #     top2_label (str)
+
+    if not cnn_scores:
+        return 0.0, 0.0, "none", "none"
+
+    # Sortiere nach Score (absteigend)
+    sorted_items = sorted(
+        cnn_scores.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    # Top-1
+    top1_label, top1_score = sorted_items[0]
+
+    # Top-2 (falls vorhanden)
+    if len(sorted_items) > 1:
+        top2_label, top2_score = sorted_items[1]
+    else:
+        top2_label, top2_score = "none", 0.0
+
+    # Confidence
+    cnn_conf = top1_score
+
+    # Margin
+    cnn_margin = top1_score - top2_score
+
+    return cnn_conf, cnn_margin, top1_label, top2_label
+
+def is_cnn_uncertain(cnn_conf, cnn_margin, conf_threshold=0.4, margin_threshold=0.15):
+    # Entscheidet, ob CNN unsicher ist.
+    # Returns: bool: True = unsicher → LLM prüfen
+    return (cnn_conf < conf_threshold or cnn_margin < margin_threshold)
+
+# Rules macht subset. pre_fuse. Fusioniert Rules/CNN/BERT. LLM nur bei unsicheren Faellen als Richter
+def quick_fuse(rule_scores, bert_scores, cnn_scores):
+    final = {}
+
+    for label in FINAL_CLASSES:
+        final[label] = (
+            WEIGHTS["rules"] * rule_scores.get(label, 0)
+            + WEIGHTS["bert"] * bert_scores.get(label, 0)
+            + WEIGHTS["cnn"] * cnn_scores.get(label, 0)    # ersetzt cnn1 u cnn2
+        )
+
+    sorted_labels = sorted(final.items(), key=lambda x: x[1], reverse=True)
+
+    top1, top2 = sorted_labels[0], sorted_labels[1]
+
+    margin = top1[1] - top2[1]
+
+    confident = (
+            margin > 0.10 * top1[1] # relativ gesehen
+            and top1[1] > 0.2       # schwach
+    )
+
+    return top1[0], final, confident
 
 # Final-Classes Fusion mit Out-Of-Distribution Score~Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
 def fuse_scores(rule, bert, cnn, llm, ood_score):
@@ -329,32 +400,6 @@ def fuse_scores(rule, bert, cnn, llm, ood_score):
     )
 
     return top1[0], final, contrib, None, uncertain
-
-
-def quick_fuse(rule_scores, bert_scores, cnn_scores):
-    # Rules macht subset. pre_fuse Fusioniert Rules/CNN/BERT. LLM nur bei unsicheren Faellen als Richter
-    final = {}
-
-    for label in FINAL_CLASSES:
-        final[label] = (
-            WEIGHTS["rules"] * rule_scores.get(label, 0)
-            + WEIGHTS["bert"] * bert_scores.get(label, 0)
-            + WEIGHTS["cnn"] * cnn_scores.get(label, 0)    # ersetzt cnn1 u cnn2
-        )
-
-    sorted_labels = sorted(final.items(), key=lambda x: x[1], reverse=True)
-
-    top1, top2 = sorted_labels[0], sorted_labels[1]
-
-    margin = top1[1] - top2[1]
-
-    confident = (
-            margin > 0.10 * top1[1] # relativ gesehen
-            and top1[1] > 0.2       # schwach
-    )
-
-    return top1[0], final, confident
-
 
 # ============================================================
 # Hash-Sampling (100k Ziel)
@@ -1641,8 +1686,11 @@ def classify_dataset(
             cnn2_model, image, cnn_transform, device, CNN2_CLASS_NAMES)
         cnn2_scores = map_scores_to_final(cnn2_full, CNN2_MAPPING)
 
-        cnn_scores = fuse_cnn_specialized(cnn1_scores, cnn2_scores)
+        cnn_scores = fuse_cnn_weighted(cnn1_scores, cnn2_scores, cnn1_weights, cnn2_weights, alpha=0.5)
 
+        cnn_conf, cnn_margin, cnn_top1, cnn_top2 = compute_cnn_confidence_and_margin(cnn_scores)
+
+        cnn_uncertain = is_cnn_uncertain(cnn_conf, cnn_margin)
         #Debug
         rule_pred = max(rule_scores, key=rule_scores.get)
         bert_pred = max(bert_scores, key=bert_scores.get)
@@ -1688,8 +1736,7 @@ def classify_dataset(
 
         rule_conf = max(rule_scores.values()) if rule_scores else 0.0
         bert_conf = max(bert_scores.values()) if bert_scores else 0.0
-        cnn1_conf = max(cnn1_scores.values()) if cnn1_scores else 0.0
-        cnn2_conf = max(cnn2_scores.values()) if cnn2_scores else 0.0
+        cnn_conf = max(cnn_scores.values()) if cnn_scores else 0.0
 
         # =========================
         # Entscheidung
@@ -1707,8 +1754,7 @@ def classify_dataset(
         all_models_uncertain = (
                 rule_conf < PRE_CONF_MAX and
                 bert_conf < PRE_CONF_MAX and
-                cnn1_conf < PRE_CONF_MAX and
-                cnn2_conf < PRE_CONF_MAX
+                cnn_conf < PRE_CONF_MAX
         )
 
         if (
@@ -1722,10 +1768,111 @@ def classify_dataset(
         # LLM Entscheidung
         # =========================
 
-        LLM_THRESHOLD = 0.35
+        # =========================
+        # KONFLIKT + CNN LOGIK (NEU!)
+        # =========================
 
-        # selbst wenn confident trotzdem oft LLM
-        if confident and max(quick_scores.values()) > LLM_THRESHOLD:
+        def top_label(scores):
+            return max(scores, key=scores.get) if scores else "none"
+
+        rule_pred = top_label(rule_scores)
+        bert_pred = top_label(bert_scores)
+        cnn_pred = top_label(cnn_scores)
+
+        unique_preds = {rule_pred, bert_pred, cnn_pred}
+        conflict_level = len(unique_preds)
+
+        # =========================
+        # Confidence Werte
+        # =========================
+
+        rule_conf = max(rule_scores.values()) if rule_scores else 0.0
+        bert_conf = max(bert_scores.values()) if bert_scores else 0.0
+        # cnn_conf hast du schon sauber berechnet (NICHT überschreiben!)
+
+        # =========================
+        # Schwellen
+        # =========================
+
+        RULE_STRONG = 0.8
+        BERT_STRONG = 0.6
+        CNN_STRONG = 0.5
+
+        # 🟢 Fall: CNN unsicher → Rauswurf
+        if cnn_uncertain:
+            filtered_out.append(r["row_id"])
+            continue
+        # =========================
+        # LLM Entscheidung
+        # =========================
+
+        use_llm = False
+
+        # 🟢 Fall 1: alles einig → KEIN LLM
+        if conflict_level == 1:
+            use_llm = False
+            print(
+                f"R:{rule_pred} "
+                f"B:{bert_pred} "
+                f"C:{cnn_pred} "
+                f"| lvl={conflict_level} "
+                f"| conf={cnn_conf:.2f} "
+                f"| margin={cnn_margin:.2f} "
+                f"| LLM={use_llm}"
+            )
+        # 🟢 Fall 2: 2 stimmen überein + CNN sicher
+        elif conflict_level == 2 and cnn_conf > CNN_STRONG:
+            use_llm = False
+            print(
+                f"R:{rule_pred} "
+                f"B:{bert_pred} "
+                f"C:{cnn_pred} "
+                f"| lvl={conflict_level} "
+                f"| conf={cnn_conf:.2f} "
+                f"| margin={cnn_margin:.2f} "
+                f"| LLM={use_llm}"
+            )
+        # 🟢 Fall 3: Rules extrem stark → KEIN LLM
+        elif rule_conf >= RULE_STRONG:
+            use_llm = False
+            print(
+                f"R:{rule_pred} "
+                f"B:{bert_pred} "
+                f"C:{cnn_pred} "
+                f"| lvl={conflict_level} "
+                f"| conf={cnn_conf:.2f} "
+                f"| margin={cnn_margin:.2f} "
+                f"| LLM={use_llm}"
+            )
+        # 🟢 Fall 4: BERT stark + CNN stabil
+        elif bert_conf >= BERT_STRONG:
+            use_llm = False
+            print(
+                f"R:{rule_pred} "
+                f"B:{bert_pred} "
+                f"C:{cnn_pred} "
+                f"| lvl={conflict_level} "
+                f"| conf={cnn_conf:.2f} "
+                f"| margin={cnn_margin:.2f} "
+                f"| LLM={use_llm}"
+            )
+        # 🔴 Fall 5: kompletter Konflikt → LLM
+        elif conflict_level == 3:
+            use_llm = True
+            print(
+                f"R:{rule_pred} "
+                f"B:{bert_pred} "
+                f"C:{cnn_pred} "
+                f"| lvl={conflict_level} "
+                f"| conf={cnn_conf:.2f} "
+                f"| margin={cnn_margin:.2f} "
+                f"| LLM={use_llm}"
+            )
+
+        else:
+            use_llm = False
+
+        if not use_llm:
             r.update({
                 "final_label": quick_label,
                 "llm_needed": False
