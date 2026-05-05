@@ -432,7 +432,72 @@ def fuse_scores(rule, bert, cnn, llm, ood_score):
     )
 
     return top1[0], final, contrib, None, uncertain
+def run_final_fusion(records, llm_results):
 
+    final_records = []
+    filtered_ood = 0
+
+    for r, llm_out in zip(records, llm_results):
+        rule_scores = r.get("rule_scores", {c: 0.0 for c in FINAL_CLASSES})
+        bert_scores = r.get("bert_scores", {c: 0.0 for c in FINAL_CLASSES})
+        cnn_scores  = r.get("cnn_scores",  {c: 0.0 for c in FINAL_CLASSES})
+        ood_score   = r.get("ood_score", 0.0)
+
+        if ood_score > 0.8:     # ood=Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
+            filtered_ood += 1
+            continue
+
+        # ---------- FINAL LABEL ----------
+        if not r.get("llm_needed", False):
+            final_label = r.get("final_label", r.get("quick_label", "unknown"))
+            final_scores = rule_scores
+            uncertain = False
+        else:
+            final_label, final_scores, _, _, uncertain = fuse_scores(
+                rule_scores,
+                bert_scores,
+                cnn_scores,
+                llm_out,
+                ood_score
+            )
+
+        # ---------- DEBUG INFO ----------
+        debug_info = {
+            "final_label": final_label,
+            "uncertain": uncertain,
+            "final_scores": final_scores
+        }
+
+        # ---------- FINAL OUTPUT ----------
+        final_records.append({
+            "pmc_id": r.get("pmc_id"),
+            "row_id": r.get("row_id"),
+            "row": r.get("row"),
+
+            "final_label": final_label,
+
+            "RULE": r.get("rule_label"),
+            "BERT": r.get("bert_label"),
+            "CNN1top3": json.dumps(r.get("cnn1_top3", [])),
+            "CNN2top3": json.dumps(r.get("cnn2_top3", [])),
+            "LLM": llm_out[0],
+
+            "BERT_score": r.get("bert_score", 0.0),
+            "CNN1_scores": json.dumps(r.get("cnn1_scores", {})),
+            "CNN2_scores": json.dumps(r.get("cnn2_scores", {})),
+            "LLM_conf": llm_out[1],
+
+            "Final Scores": json.dumps(final_scores),
+            "Begründung": json.dumps(debug_info),
+
+            "uncertain": uncertain,
+            "caption": r.get("caption"),
+            "modality_gt": r.get("modality_gt", "unknown"),
+        })
+
+    print(f"OOD gefiltert: {filtered_ood}")
+
+    return final_records
 # ============================================================
 # Hash-Sampling (100k Ziel)
 # ============================================================
@@ -1562,7 +1627,7 @@ def process_single_record(r, ctx: ModelContext):
         cnn3_conf = max(cnn3_full.values())
     else:
         cnn3_conf = 0.0
-    if cnn3_conf == 0.0:
+    if cnn3_conf >= 0.8:
         return {"filtered": True, "reason": "cnn3"}
 
     # =========================
@@ -1640,7 +1705,17 @@ def process_single_record(r, ctx: ModelContext):
 
     # 🔴 Fall 5: kompletter Konflikt → LLM
     if conflict_level == 3:
-        use_llm = True
+        if conflict_level == 3:
+            if cnn_conf > 0.6 and cnn_margin > 0.2:
+                use_llm = False  # CNN entscheidet
+            elif rule_conf >= 0.9:
+                use_llm = False  # Rules entscheidet
+            elif bert_conf >= 0.75:
+                use_llm = False  # BERT entscheidet
+            elif rule_pred != cnn_pred and bert_pred != cnn_pred:
+                use_llm = True
+            else:
+                use_llm = True
         print(
             f"R:{rule_pred} "
             f"B:{bert_pred} "
@@ -1770,22 +1845,48 @@ def iterative_fill(ds, existing, per_class, ctx, max_passes=5):
     from collections import defaultdict
     import random
 
-    buckets = defaultdict(list)
+    # ---------- DEDUP ----------
+    seen = set()
+    unique_existing = []
+    for r in existing:
+        key = (r.get("pmc_id"), r.get("row_id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_existing.append(r)
+
+    existing = unique_existing
+
+    # ---------- BUCKETS ----------
+    buckets = {c: [] for c in FINAL_CLASSES}
 
     for r in existing:
-        buckets[r["final_label"]].append(r)
+        label = r.get("final_label") or r.get("quick_label")
+        if label in FINAL_CLASSES:
+            buckets[label].append(r)
 
     used = set((r["pmc_id"], r["row_id"]) for r in existing)
+
+    total_target = per_class * len(FINAL_CLASSES)
 
     for p in range(max_passes):
 
         print(f"\nFILL PASS {p}")
 
-        if all(len(buckets[c]) >= per_class for c in FINAL_CLASSES):
+        # DEBUG
+        for c in FINAL_CLASSES:
+            print(c, len(buckets[c]))
+
+        current_total = sum(len(buckets[c]) for c in FINAL_CLASSES)
+
+        if current_total >= total_target:
+            print("✔ Bereits voll – Stop")
             break
 
         indices = list(range(len(ds)))
         random.shuffle(indices)
+
+        added_this_pass = 0
 
         for idx in indices[:5000]:
 
@@ -1809,7 +1910,7 @@ def iterative_fill(ds, existing, per_class, ctx, max_passes=5):
             if out is None:
                 continue
 
-            label = out["final_label"]
+            label = out.get("final_label") or out.get("quick_label")
 
             if label not in FINAL_CLASSES:
                 continue
@@ -1819,7 +1920,18 @@ def iterative_fill(ds, existing, per_class, ctx, max_passes=5):
 
             buckets[label].append(out)
             used.add(key)
+            added_this_pass += 1
 
+            if sum(len(buckets[c]) for c in FINAL_CLASSES) >= total_target:
+                break
+
+        print(f"+{added_this_pass} Samples")
+
+        if added_this_pass < 5:
+            print("⚠️ Keine neuen Samples → Stop")
+            break
+
+    # flatten
     final = []
     for c in FINAL_CLASSES:
         final.extend(buckets[c][:per_class])
@@ -1946,8 +2058,6 @@ def classify_dataset(
     cnn3_path: str,
     limit: Optional[int],
     inspectlimit: int,
-    batch_size: int,
-    bert_threshold: float,
     per_class: int,
     inspect_only: bool = False,
 ):
@@ -2072,109 +2182,18 @@ def classify_dataset(
 
     print("\nFinale Fusion ...")
 
-    final_records = []
-    filtered_ood = []
-    for r, llm_out in zip(records, llm_results):
-        ood_score = r.get("ood_score", 0.0)
-
-        if ood_score > 0.8:     # ood=Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
-            filtered_ood += 1
-            continue
-        if not r["llm_needed"]:
-            final_label = r["final_label"]
-            final_scores = r["rule_scores"]
-            uncertain = False
-            contrib = {}
-            explanation = []
-        else:
-            final_label, final_scores, contrib, explanation, uncertain = fuse_scores(
-                r["rule_scores"],
-                r["bert_scores"],
-                r["cnn_scores"],
-                llm_out,
-                r.get("ood_score", 0.0)
-            )
-
-        debug_info = {
-            "final_label": final_label,
-            "uncertain": uncertain,
-
-            "rules": {
-                "label": r["rule_label"],
-                "score_raw": 1.0 if r["rule_label"] in FINAL_CLASSES else 0.0,
-                "score_weighted": WEIGHTS["rules"] * (1.0 if r["rule_label"] in FINAL_CLASSES else 0.0),
-                "matched_patterns": r.get("matched_patterns", []),
-                "decision_reason": r.get("rule_reason", "")
-            },
-
-            "bert": {
-                "label": r["bert_label"],
-                "score_raw": r["bert_score"],
-                "score_weighted": WEIGHTS["bert"] * r["bert_score"],
-                "top2": r.get("bert_top2", [])
-            },
-            "cnnfusion": {
-                "label": r["cnn_label"],
-                "score_raw": r["cnn_score"]},
-
-            "cnn1": {
-                "top3": r["cnn1_top3"],
-                "scores_raw": r["cnn1_scores"],
-            },
-
-            "cnn2": {
-                "top3": r["cnn2_top3"],
-                "scores_raw": r["cnn2_scores"],
-            },
-
-            "llm": {
-                "label": llm_out[0],
-                "score_raw": llm_out[1],
-                "score_weighted": WEIGHTS["llm"] * llm_out[1]
-            },
-
-            "final_scores": final_scores
-        }
-
-        final_records.append({
-            "pmc_id": r["pmc_id"],
-            "row_id": r["row_id"],
-            "row": r["row"],
-
-            "final_label": final_label,
-
-            "RULE": r["rule_label"],
-            "BERT": r["bert_label"],
-            "CNN1top3": json.dumps(r["cnn1_top3"]),
-            "CNN2top3": json.dumps(r["cnn2_top3"]),
-            "LLM": llm_out[0],
-
-            "BERT_score": r["bert_score"],
-            "CNN1_scores": json.dumps(r["cnn1_scores"]),
-            "CNN2_scores": json.dumps(r["cnn2_scores"]),
-            "LLM_conf": llm_out[1],
-            "Final Scores": json.dumps(final_scores),
-
-            "Begründung": json.dumps(debug_info),
-            "uncertain": uncertain,
-
-            "caption": r["caption"],
-            "modality_gt": r.get("modality_gt", "unknown"),
-        })
-
-    records = final_records
+    records = run_final_fusion(records, llm_results)
 # ============================================================
 # Phase 6: Post-Balancing (=alle Klassen per_class mal haben muessen!)
 # ============================================================
     print("\nRe-balancing final dataset...")
-
     records = iterative_fill(
         ds=ds,
         existing=records,
         per_class=per_class,
         ctx=ctx
     )
-    print("Nachbalanciert:", len(records))
+    print("Nachbalanciert bzw. Gesamt:", len(records))
 
     seen = set()
     unique_records = []
@@ -2308,12 +2327,6 @@ def parse_args():
         help="Limit für Inspektionsfunktionen (z.B. Verteilungen)"
     )
     parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=64,
-        help="Batchgröße für den BERT-Gang"
-    )
-    parser.add_argument(
         "--bert_threshold",
         type=float,
         default=0.30,
@@ -2344,8 +2357,6 @@ def main():
         cnn3_path=args.cnn3_path,
         inspectlimit=args.inspectlimit,
         limit=args.limit,
-        batch_size=args.batch_size,
-        bert_threshold=args.bert_threshold,
         per_class=args.per_class,
         inspect_only=args.inspect_only,
     )
