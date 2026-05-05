@@ -342,6 +342,38 @@ def compute_cnn_confidence_and_margin(cnn_scores):
 
     return cnn_conf, cnn_margin, top1_label, top2_label
 
+# log scaling weights anstatt hard gating of classes (asymmetric classes)
+def compute_model_weights(class_counts, final_classes):
+    import math
+
+    weights = {}
+
+    # Log scaling
+    for c in final_classes:
+        count = class_counts.get(c, 0)
+        weights[c] = math.log(count + 1)
+
+    # Normalisierung
+    max_w = max(weights.values()) if weights else 1.0
+
+    if max_w == 0:
+        return {c: 0.0 for c in final_classes}
+
+    for c in weights:
+        weights[c] /= max_w  # [0,1]
+
+    return weights
+
+cnn1_weights = compute_model_weights(CNN1_CLASS_COUNTS_RAW, FINAL_CLASSES)
+cnn2_weights = compute_model_weights(CNN2_CLASS_COUNTS_RAW, FINAL_CLASSES)
+
+# normalize all in WEIGHTS, da s1_weighted = s1 * (1 + alpha * w1.get(c, 0.0)) = UEBER 1 !!!
+def normalize_scores(scores):
+    total = sum(scores.values())
+    if total == 0:
+        return scores
+    return {k: v / total for k, v in scores.items()}
+
 def is_cnn_uncertain(cnn_conf, cnn_margin, conf_threshold=0.4, margin_threshold=0.15):
     # Entscheidet, ob CNN unsicher ist.
     # Returns: bool: True = unsicher → LLM prüfen
@@ -1141,30 +1173,7 @@ def run_cnn(model, image, transform, device):
     except:
         return "unknown"
 
-# log scaling weights anstatt hard gating of classes (asymmetric classes)
-def compute_model_weights(class_counts, final_classes):
-    import math
 
-    weights = {}
-
-    # Log scaling
-    for c in final_classes:
-        count = class_counts.get(c, 0)
-        weights[c] = math.log(count + 1)
-
-    # Normalisierung
-    max_w = max(weights.values()) if weights else 1.0
-
-    if max_w == 0:
-        return {c: 0.0 for c in final_classes}
-
-    for c in weights:
-        weights[c] /= max_w  # [0,1]
-
-    return weights
-
-cnn1_weights = compute_model_weights(CNN1_CLASS_COUNTS_RAW, FINAL_CLASSES)
-cnn2_weights = compute_model_weights(CNN2_CLASS_COUNTS_RAW, FINAL_CLASSES)
 # ============================================================
 # Fast pre-sampling (nur Rules)
 # ============================================================
@@ -1470,7 +1479,352 @@ def load_arrow_shards(arrow_files: List[Path]) -> Dataset:
 
     return concatenate_datasets(datasets_list)
 
+# ============================================================
+# Loop Kapsel
+# ============================================================
+class ModelContext:
+    def __init__(
+        self,
+        bert_clf,
+        cnn1_model,
+        cnn2_model,
+        cnn3_model,
+        cnn_transform,
+        device
+    ):
+        self.bert = bert_clf
+        self.cnn1 = cnn1_model
+        self.cnn2 = cnn2_model
+        self.cnn3 = cnn3_model
+        self.transform = cnn_transform
+        self.device = device
 
+# ============================================================
+# Verarbeitung (Ph. 3)
+# ============================================================
+def process_single_record(r, ctx: ModelContext):
+    """
+    Das ist mein Phase-3 Code für ein Sample
+    (Rules + CNN + BERT + LLM Entscheidung)
+    """
+
+    text = r["caption"]
+    row = r["row"]
+
+    # =========================
+    # RULES
+    # =========================
+    rule_scores = {c: 0.0 for c in FINAL_CLASSES}
+    if r["rule_label"] in FINAL_CLASSES:
+        rule_scores[r["rule_label"]] = 1.0
+
+    # =========================
+    # BERT
+    # =========================
+    if ctx.bert:
+        bert_out = ctx.bert.predict_batch([text])[0]
+        bert_scores = {c: 0.0 for c in FINAL_CLASSES}
+        if bert_out["label"] in FINAL_CLASSES:
+            bert_scores[bert_out["label"]] = bert_out["score"]
+    else:
+        bert_scores = {c: 0.0 for c in FINAL_CLASSES}
+        bert_out = {"label": "none", "score": 0.0}
+
+    # =========================
+    # CNN1 + CNN2
+    # =========================
+    image = get_image_from_row(row)
+
+    cnn1_top3, cnn1_full = predict_with_cnn(
+        ctx.cnn1, image, ctx.transform, ctx.device, CNN1_CLASS_NAMES)
+    cnn1_scores = map_scores_to_final(cnn1_full, CNN1_MAPPING)
+
+    cnn2_top3, cnn2_full = predict_with_cnn(
+        ctx.cnn2, image, ctx.transform, ctx.device, CNN2_CLASS_NAMES)
+    cnn2_scores = map_scores_to_final(cnn2_full, CNN2_MAPPING)
+
+    cnn_scores = fuse_cnn_weighted(cnn1_scores, cnn2_scores, cnn1_weights, cnn2_weights, alpha=0.5)
+    cnn_scores = normalize_scores(cnn_scores)
+    # =========================
+    # CNN3 Filtering
+    # =========================
+    cnn_conf, cnn_margin, _, _ = compute_cnn_confidence_and_margin(cnn_scores)
+
+    # 🟢 Fall: CNN unsicher → Rauswurf
+    cnn_uncertain = is_cnn_uncertain(cnn_conf, cnn_margin)
+    if cnn_uncertain:
+        return {"filtered": True, "reason": "cnn_uncertain"}
+
+    _, cnn3_full = predict_with_cnn(
+        ctx.cnn3, image, ctx.transform, ctx.device, CNN3_CLASS_NAMES)
+
+    if cnn3_full:
+        cnn3_conf = max(cnn3_full.values())
+    else:
+        cnn3_conf = 0.0
+    if cnn3_conf == 0.0:
+        return {"filtered": True, "reason": "cnn3"}
+
+    # =========================
+    # Filtering Entscheidung ueber CNN1/CNN2/RULES/BERT-einzelweises Scoring
+    # =========================
+
+    rule_conf = max(rule_scores.values())
+    bert_conf = max(bert_scores.values())
+    cnn_conf = max(cnn_scores.values())
+
+    # =========================
+    # Filtering Entscheidung
+    # =========================
+    # Idee:
+    # CNN3 darf nur filtern, wenn: Konsens
+    # - gehört zu Filterklassen
+    # - CNN3 ziemlich sicher
+    # - andere Modelle nicht stark sind
+
+    CNN3_CONF_MIN = 0.745  # (0.55) aber hochgetan: Ueber 0.745 sind es Trash-Bilder
+    PRE_CONF_MAX = 0.7  # (0.35) (0.66) aber hochgedrillt: nach 0.7 sind sich die anderen modelle sicher
+    # Klassen der Modelle muessen >0.7 haben. Muellmann moechte nur >=0.75.
+    # Wenn Muellmann selbst unsicher ist, ist >0.7 gut genug, um als Klasse angenommen zu werden
+
+    if (
+            cnn3_conf > CNN3_CONF_MIN and
+            rule_conf < PRE_CONF_MAX and
+            bert_conf < PRE_CONF_MAX and
+            cnn_conf < PRE_CONF_MAX
+    ):
+        return {"filtered": True, "reason": "noconsent"}
+    # =========================
+    # Quick Fusion (ohne LLM) laeuft schneller
+    # Rules macht subset. pre_fuse Fusioniert Rules/CNN/BERT. LLM nur bei unsicheren Faellen als Richter
+    # =========================
+    quick_label, quick_scores, confident = quick_fuse(
+        rule_scores,
+        bert_scores,
+        cnn_scores)
+
+    # =========================
+    # LLM Entscheidung KONFLIKT + CNN LOGIK
+    # =========================
+
+    def top_label(scores):
+        return max(scores, key=scores.get)
+
+    rule_pred = top_label(rule_scores)
+    bert_pred = top_label(bert_scores)
+    cnn_pred = top_label(cnn_scores)
+
+    conflict_level = len({rule_pred, bert_pred, cnn_pred})
+
+    # =========================
+    # Confidence Werte
+    # =========================
+
+    rule_conf = max(rule_scores.values()) if rule_scores else 0.0
+    bert_conf = max(bert_scores.values()) if bert_scores else 0.0
+    # cnn_conf hast du schon sauber berechnet (NICHT überschreiben!)
+
+    # =========================
+    # Schwellen
+    # =========================
+
+    RULE_STRONG = 0.8
+    BERT_STRONG = 0.6
+    CNN_STRONG = 0.6
+
+    # =========================
+    # LLM Entscheidung
+    # =========================
+
+    use_llm = False
+
+    # 🔴 Fall 5: kompletter Konflikt → LLM
+    if conflict_level == 3:
+        use_llm = True
+        print(
+            f"R:{rule_pred} "
+            f"B:{bert_pred} "
+            f"C:{cnn_pred} "
+            f"| lvl={conflict_level} "
+            f"| conf={cnn_conf:.2f} "
+            f"| margin={cnn_margin:.2f} "
+            f"| LLM={use_llm}"
+        )
+
+    # 🟢 Fall 1: alles einig → KEIN LLM
+    elif conflict_level == 1:
+        use_llm = False
+        print(
+            f"R:{rule_pred} "
+            f"B:{bert_pred} "
+            f"C:{cnn_pred} "
+            f"| lvl={conflict_level} "
+            f"| conf={cnn_conf:.2f} "
+            f"| margin={cnn_margin:.2f} "
+            f"| LLM={use_llm}"
+        )
+    # 🟢 Fall 2: 2 stimmen überein + CNN sicher
+    elif conflict_level == 2 and cnn_conf > CNN_STRONG:
+        use_llm = False
+        print(
+            f"R:{rule_pred} "
+            f"B:{bert_pred} "
+            f"C:{cnn_pred} "
+            f"| lvl={conflict_level} "
+            f"| conf={cnn_conf:.2f} "
+            f"| margin={cnn_margin:.2f} "
+            f"| LLM={use_llm}"
+        )
+    # 🟢 Fall 3: Rules extrem stark → KEIN LLM
+    elif rule_conf >= RULE_STRONG:
+        use_llm = False
+        print(
+            f"R:{rule_pred} "
+            f"B:{bert_pred} "
+            f"C:{cnn_pred} "
+            f"| lvl={conflict_level} "
+            f"| conf={cnn_conf:.2f} "
+            f"| margin={cnn_margin:.2f} "
+            f"| LLM={use_llm}"
+        )
+    # 🟢 Fall 4: BERT stark + CNN stabil
+    elif bert_conf >= BERT_STRONG:
+        use_llm = False
+        print(
+            f"R:{rule_pred} "
+            f"B:{bert_pred} "
+            f"C:{cnn_pred} "
+            f"| lvl={conflict_level} "
+            f"| conf={cnn_conf:.2f} "
+            f"| margin={cnn_margin:.2f} "
+            f"| LLM={use_llm}"
+        )
+    
+    else:
+        use_llm = False
+
+    if not use_llm:
+        r.update({
+            "final_label": quick_label,
+            "llm_needed": False
+        })
+    else:
+        r.update({
+            "quick_label": quick_label,
+            "llm_needed": True
+        })
+
+    # =========================
+    # Debug + Speicherung
+    # =========================
+    result = {
+        "pmc_id": r["pmc_id"],
+        "row_id": r["row_id"],
+        "caption": text,
+        "row": row,
+
+        "final_label": quick_label if not use_llm else None,
+        "quick_label": quick_label,
+        "llm_needed": use_llm,
+
+        "rule_scores": rule_scores,
+        "bert_scores": bert_scores,
+        "cnn_scores": cnn_scores,
+
+        "cnn_conf": cnn_conf,
+        "cnn_margin": cnn_margin,
+
+        "cnn1_top3": cnn1_top3,
+        "cnn2_top3": cnn2_top3,
+    }
+
+    return result
+
+def process_batch(records0, ctx):
+
+    processed = []
+    filtered_counts = Counter()
+
+    for r in tqdm(records0, desc="Processing"):
+
+        out = process_single_record(r, ctx)
+
+        if r is None:
+            filtered_counts["unknown"] += 1
+            continue
+
+        if r.get("filtered"):       #cnn3certainty UND cnn-uncertainty UND Konsens
+            filtered_counts[r["reason"]] += 1
+            continue
+
+        processed.append(out)
+
+    print(f"Filtered: {filtered_counts}")
+    return processed
+
+# ============================================================
+# Fuellt nach Loop den Loop nochmal neu und die fehlenden Klassen per_class auf
+# ============================================================
+def iterative_fill(ds, existing, per_class, ctx, max_passes=5):
+
+    from collections import defaultdict
+    import random
+
+    buckets = defaultdict(list)
+
+    for r in existing:
+        buckets[r["final_label"]].append(r)
+
+    used = set((r["pmc_id"], r["row_id"]) for r in existing)
+
+    for p in range(max_passes):
+
+        print(f"\nFILL PASS {p}")
+
+        if all(len(buckets[c]) >= per_class for c in FINAL_CLASSES):
+            break
+
+        indices = list(range(len(ds)))
+        random.shuffle(indices)
+
+        for idx in indices[:5000]:
+
+            row = ds[idx]
+            text, meta = extract_text_from_row(row)
+
+            key = (meta.get("PMC_ID", ""), idx)
+            if key in used:
+                continue
+
+            r = {
+                "row": row,
+                "caption": text,
+                "pmc_id": meta.get("PMC_ID", ""),
+                "row_id": idx,
+                "rule_label": "unknown"
+            }
+
+            out = process_single_record(r, ctx)
+
+            if out is None:
+                continue
+
+            label = out["final_label"]
+
+            if label not in FINAL_CLASSES:
+                continue
+
+            if len(buckets[label]) >= per_class:
+                continue
+
+            buckets[label].append(out)
+            used.add(key)
+
+    final = []
+    for c in FINAL_CLASSES:
+        final.extend(buckets[c][:per_class])
+
+    return final
 # ============================================================
 # Inspizieren/Distr/Debug/Übersicht
 # ============================================================
@@ -1536,6 +1890,21 @@ def inspect_final_distribution(records, limit=None):
 def top_label(scores):
     return max(scores, key=scores.get) if scores else "none"
 
+def compute_filter_stats(records):
+    total = len(records)
+
+    filtered = [r for r in records if r.get("is_filtered", False)]
+    kept = [r for r in records if not r.get("is_filtered", False)]
+
+    reasons = Counter(r.get("filter_reason", "unknown") for r in filtered)
+
+    return {
+        "total": total,
+        "filtered_count": len(filtered),
+        "kept_count": len(kept),
+        "reasons": reasons
+    }
+
 def save_selected_images(records, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1583,7 +1952,9 @@ def classify_dataset(
     inspect_only: bool = False,
 ):
     device = "cpu"
-
+    # ============================================================
+    # Phase 1: Datensatz initialisieren
+    # ============================================================
     arrow_files = find_arrow_files(dataset_root)
     if not arrow_files:
         raise FileNotFoundError(f"Keine data-*.arrow Dateien in {dataset_root} gefunden.")
@@ -1608,11 +1979,10 @@ def classify_dataset(
         print(f"\nLimit aktiv: max {limit} Iterationen im Early Sampling")
         print(f"\nLimit aktiv: {len(ds)} Zeilen")
 
+    print("\n\nSchnelle Vorauswahl Early Sampler...")
     # ============================================================
-    # Phase 1: Modelle initialisieren (ohne LLM!)
-    # ============================================================
-    print("\nInitialize models (ohne LLM)...")
     # Phase 2: schnelle Vorauswahl Early Sampler
+    # ============================================================
     records0 = early_balanced_sampling(ds, per_class, limit)
     # Gewaehrleist, dass wirklich alle Klassen Eintraganzahl=per_class haben.
     debug_sampling(records0, per_class)
@@ -1638,294 +2008,41 @@ def classify_dataset(
 
     cnn_transform = transform
 
-
+    ctx = ModelContext(
+        bert_clf,
+        cnn1_model,
+        cnn2_model,
+        cnn3_model,
+        cnn_transform,
+        device
+    )
     # ============================================================
     # Phase 3: Records sammeln (ohne LLM)
     # ============================================================
 
     print("\nExtrahiere Records + RULES + CNN + BERT ...")
     print("\nPhase 3: CNN + BERT auf Subset")
+    records = process_batch(records0, ctx)
+    filtered_cnn = 0    # uncertainty UND cnn3-certain UND Konsens modelle treshhold
 
-    processed_records = []
-    filtered_out = []
+    for r0 in records0:
+        r = process_single_record(r0, ctx)
 
-    for r in tqdm(records0, desc="CNN + BERT"):
-
-        text = r["caption"]
-        row = r["row"]
-
-        # =========================
-        # RULES
-        # =========================
-        rule_scores = {c: 0.0 for c in FINAL_CLASSES}
-        if r["rule_label"] in FINAL_CLASSES:
-            rule_scores[r["rule_label"]] = 1.0
-
-        # =========================
-        # BERT
-        # =========================
-        if bert_clf:
-            bert_out = bert_clf.predict_batch([text])[0]
-            bert_scores = {c: 0.0 for c in FINAL_CLASSES}
-            if bert_out["label"] in FINAL_CLASSES:
-                bert_scores[bert_out["label"]] = bert_out["score"]
-        else:
-            bert_scores = {c: 0.0 for c in FINAL_CLASSES}
-            bert_out = {"label": "none", "score": 0.0}
-
-        # =========================
-        # CNN1 + CNN2
-        # =========================
-        image = get_image_from_row(row)
-
-        cnn1_top3, cnn1_full = predict_with_cnn(
-            cnn1_model, image, cnn_transform, device, CNN1_CLASS_NAMES)
-        cnn1_scores = map_scores_to_final(cnn1_full, CNN1_MAPPING)
-
-        cnn2_top3, cnn2_full = predict_with_cnn(
-            cnn2_model, image, cnn_transform, device, CNN2_CLASS_NAMES)
-        cnn2_scores = map_scores_to_final(cnn2_full, CNN2_MAPPING)
-
-        cnn_scores = fuse_cnn_weighted(cnn1_scores, cnn2_scores, cnn1_weights, cnn2_weights, alpha=0.5)
-
-        cnn_conf, cnn_margin, cnn_top1, cnn_top2 = compute_cnn_confidence_and_margin(cnn_scores)
-
-        cnn_uncertain = is_cnn_uncertain(cnn_conf, cnn_margin)
-        #Debug
-        rule_pred = max(rule_scores, key=rule_scores.get)
-        bert_pred = max(bert_scores, key=bert_scores.get)
-        cnn_pred = max(cnn_scores, key=cnn_scores.get)
-        cnn1_pred = max(cnn1_scores, key=cnn1_scores.get)
-        cnn2_pred = max(cnn2_scores, key=cnn2_scores.get)
-        # print(f"R:{rule_pred} B:{bert_pred} C1:{cnn1_pred} C2:{cnn2_pred} | {text[:80]}")
-
-        disagreement = len({rule_pred, bert_pred, cnn1_pred, cnn2_pred})
-        if disagreement >= 3:
-            print("⚠️", rule_pred, bert_pred, cnn1_pred, cnn2_pred)
-        # =========================
-        # Quick Fusion (ohne LLM) laeuft schneller
-        # Rules macht subset. pre_fuse Fusioniert Rules/CNN/BERT. LLM nur bei unsicheren Faellen als Richter
-        # =========================
-        quick_label, quick_scores, confident = quick_fuse(
-            rule_scores,
-            bert_scores,
-            cnn_scores)
-
-        # =========================
-        # CNN3 Filtering (Konsens!)
-        # =========================
-
-        cnn3_top3, cnn3_full = predict_with_cnn(
-            cnn3_model, image, cnn_transform, device, CNN3_CLASS_NAMES
-        )
-
-        if cnn3_full:
-            cnn3_pred = max(cnn3_full, key=cnn3_full.get)
-            cnn3_conf = cnn3_full[cnn3_pred]
-            r["ood_score"] = sum(
-                cnn3_full.get(cls, 0.0)
-                for cls in CNN3_CLASS_NAMES
-            )
-        else:
-            cnn3_pred = "unknown"
-            cnn3_conf = 0.0
-
-        # =========================
-        # Entscheidung ueber CNN1/CNN2/RULES/BERT-einzelweises Scoring
-        # =========================
-
-        rule_conf = max(rule_scores.values()) if rule_scores else 0.0
-        bert_conf = max(bert_scores.values()) if bert_scores else 0.0
-        cnn_conf = max(cnn_scores.values()) if cnn_scores else 0.0
-
-        # =========================
-        # Entscheidung
-        # =========================
-        # Idee:
-        # CNN3 darf nur filtern, wenn:
-        # - gehört zu Filterklassen
-        # - CNN3 ziemlich sicher
-        # - andere Modelle nicht stark sind
-
-        CNN3_CONF_MIN = 0.745 # (0.55) aber hochgetan: Ueber 0.745 sind es Trash-Bilder
-        PRE_CONF_MAX = 0.7  # (0.35) (0.66) aber hochgedrillt: nach 0.7 sind sich die anderen modelle sicher
-        # Klassen der Modelle muessen >0.7 haben. Muellmann moechte nur >=0.75.
-        # Wenn Muellmann selbst unsicher ist, ist >0.7 gut genug, um als Klasse angenommen zu werden
-        all_models_uncertain = (
-                rule_conf < PRE_CONF_MAX and
-                bert_conf < PRE_CONF_MAX and
-                cnn_conf < PRE_CONF_MAX
-        )
-
-        if (
-                cnn3_conf > CNN3_CONF_MIN
-                and all_models_uncertain
-        ):
-            filtered_out.append(r["row_id"])
+        if r is None:
+            filtered_cnn += 1  # oder differenzieren, siehe unten
             continue
 
-        # =========================
-        # LLM Entscheidung
-        # =========================
-
-        # =========================
-        # KONFLIKT + CNN LOGIK (NEU!)
-        # =========================
-
-        def top_label(scores):
-            return max(scores, key=scores.get) if scores else "none"
-
-        rule_pred = top_label(rule_scores)
-        bert_pred = top_label(bert_scores)
-        cnn_pred = top_label(cnn_scores)
-
-        unique_preds = {rule_pred, bert_pred, cnn_pred}
-        conflict_level = len(unique_preds)
-
-        # =========================
-        # Confidence Werte
-        # =========================
-
-        rule_conf = max(rule_scores.values()) if rule_scores else 0.0
-        bert_conf = max(bert_scores.values()) if bert_scores else 0.0
-        # cnn_conf hast du schon sauber berechnet (NICHT überschreiben!)
-
-        # =========================
-        # Schwellen
-        # =========================
-
-        RULE_STRONG = 0.8
-        BERT_STRONG = 0.6
-        CNN_STRONG = 0.5
-
-        # 🟢 Fall: CNN unsicher → Rauswurf
-        if cnn_uncertain:
-            filtered_out.append(r["row_id"])
-            continue
-        # =========================
-        # LLM Entscheidung
-        # =========================
-
-        use_llm = False
-
-        # 🟢 Fall 1: alles einig → KEIN LLM
-        if conflict_level == 1:
-            use_llm = False
-            print(
-                f"R:{rule_pred} "
-                f"B:{bert_pred} "
-                f"C:{cnn_pred} "
-                f"| lvl={conflict_level} "
-                f"| conf={cnn_conf:.2f} "
-                f"| margin={cnn_margin:.2f} "
-                f"| LLM={use_llm}"
-            )
-        # 🟢 Fall 2: 2 stimmen überein + CNN sicher
-        elif conflict_level == 2 and cnn_conf > CNN_STRONG:
-            use_llm = False
-            print(
-                f"R:{rule_pred} "
-                f"B:{bert_pred} "
-                f"C:{cnn_pred} "
-                f"| lvl={conflict_level} "
-                f"| conf={cnn_conf:.2f} "
-                f"| margin={cnn_margin:.2f} "
-                f"| LLM={use_llm}"
-            )
-        # 🟢 Fall 3: Rules extrem stark → KEIN LLM
-        elif rule_conf >= RULE_STRONG:
-            use_llm = False
-            print(
-                f"R:{rule_pred} "
-                f"B:{bert_pred} "
-                f"C:{cnn_pred} "
-                f"| lvl={conflict_level} "
-                f"| conf={cnn_conf:.2f} "
-                f"| margin={cnn_margin:.2f} "
-                f"| LLM={use_llm}"
-            )
-        # 🟢 Fall 4: BERT stark + CNN stabil
-        elif bert_conf >= BERT_STRONG:
-            use_llm = False
-            print(
-                f"R:{rule_pred} "
-                f"B:{bert_pred} "
-                f"C:{cnn_pred} "
-                f"| lvl={conflict_level} "
-                f"| conf={cnn_conf:.2f} "
-                f"| margin={cnn_margin:.2f} "
-                f"| LLM={use_llm}"
-            )
-        # 🔴 Fall 5: kompletter Konflikt → LLM
-        elif conflict_level == 3:
-            use_llm = True
-            print(
-                f"R:{rule_pred} "
-                f"B:{bert_pred} "
-                f"C:{cnn_pred} "
-                f"| lvl={conflict_level} "
-                f"| conf={cnn_conf:.2f} "
-                f"| margin={cnn_margin:.2f} "
-                f"| LLM={use_llm}"
-            )
-
-        else:
-            use_llm = False
-
-        if not use_llm:
-            r.update({
-                "final_label": quick_label,
-                "llm_needed": False
-            })
-        else:
-            r.update({
-                "quick_label": quick_label,
-                "llm_needed": True
-            })
-
-        # =========================
-        # Debug + Speicherung
-        # =========================
-        r.update({
-            "rule_scores": rule_scores,
-            "rule_reason": r.get("rule_reason", ""),
-
-            "bert_label": bert_out["label"],
-            "bert_score": bert_out["score"],
-            "bert_scores": bert_scores,
-
-            "cnn_scores": cnn_scores,
-            "cnn_label": cnn_pred,
-
-            "cnn1_top3": cnn1_top3,
-            "cnn1_scores": cnn1_scores,
-
-            "cnn2_top3": cnn2_top3,
-            "cnn2_scores": cnn2_scores,
-
-            "modality_gt": r.get("modality_gt", "unknown"),
-
-            "cnn3_pred": cnn3_pred,
-            "cnn3_top3": cnn3_top3,
-            "cnn3_conf": cnn3_conf,
-
-            "matched_patterns": r.get("matched_patterns", []),
-        })
-
-        processed_records.append(r)
-
-    records = processed_records
-
+        records.append(r)
 
     # ============================================================
-    # Phase 4: LLM nur unsichere Fälle!
+    # Phase 4: LLM nur bei unsicheren Fällen
     # ============================================================
 
-    print("\nInitialize LLaMaMistral ...")
+    print("\nInitialize LLaMa Mistral ...")
     llm = LocalLLM(model_path=llamamistral_path)
     #debug
-    llm_needed_count = sum(r["llm_needed"] for r in records)
-    no_llm_count = sum(not r["llm_needed"] for r in records)
+    llm_needed_count = sum(r.get("llm_needed", False) for r in records)
+    no_llm_count = sum(not r.get("llm_needed", False) for r in records)
     total_count = len(records)
 
     print("\n===== LLM USAGE =====")
@@ -1933,8 +2050,10 @@ def classify_dataset(
     print(f"Ohne LLM:       {no_llm_count}")
     print(f"Gesamt:         {total_count}")
     print(f"LLM Anteil:     {llm_needed_count / total_count * 100:.2f}%")
-    texts = [r["caption"] for r in records if r["llm_needed"]]
-
+    texts = [r["caption"] for r in records if r.get("llm_needed", False)]
+    for r in records[:20]:
+        print(r.keys())
+        break
     llm_results_partial = llm.batch_predict(texts)
 
     # Mapping zurück
@@ -1942,10 +2061,10 @@ def classify_dataset(
 
     llm_results = []
     for r in records:
-        if r["llm_needed"]:
+        if r.get("llm_needed", False):
             llm_results.append(next(llm_iter))
         else:
-            llm_results.append((r["final_label"], 0.5))  # fake confidence
+            llm_results.append((r.get("final_label", "unknown"), 0.5))  # fake confidence
 
     # ============================================================
     # Phase 5: Final fusion
@@ -1954,12 +2073,12 @@ def classify_dataset(
     print("\nFinale Fusion ...")
 
     final_records = []
-
+    filtered_ood = []
     for r, llm_out in zip(records, llm_results):
         ood_score = r.get("ood_score", 0.0)
 
         if ood_score > 0.8:     # ood=Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
-            filtered_out.append(r["row_id"])
+            filtered_ood += 1
             continue
         if not r["llm_needed"]:
             final_label = r["final_label"]
@@ -2049,8 +2168,25 @@ def classify_dataset(
 # ============================================================
     print("\nRe-balancing final dataset...")
 
-    records = select_balanced(records, per_class)
+    records = iterative_fill(
+        ds=ds,
+        existing=records,
+        per_class=per_class,
+        ctx=ctx
+    )
+    print("Nachbalanciert:", len(records))
 
+    seen = set()
+    unique_records = []
+
+    for r in records:
+        key = (r["pmc_id"], r["row_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_records.append(r)
+
+    records = unique_records
     print("Nachbalanciert:", len(records))
 # ============================================================
 # Phase 6: Bilder speichern
@@ -2087,16 +2223,23 @@ def classify_dataset(
     inspect_final_distribution(records, limit=inspectlimit)
 
     print("\n===== FILTERING =====")
-    print(f"Original: {len(records0)}")
-    print(f"Weggefiltert (einfach): {len(filtered_out)}")
-    print(f"Übrig (für LLM): {len(processed_records)}")
+    stats = compute_filter_stats(records)
+
+    print(f"Original:        {stats['total']}")
+    print(f"Weggefiltert:   {stats['filtered_count']}")
+    print(f"Übrig:          {stats['kept_count']}")
+
+    print("\n--- Gründe ---")
+    for reason, count in stats["reasons"].items():
+        print(f"{reason}: {count}")
 
     if len(records0) > 0:
-        print(f"Filter-Rate: {len(filtered_out) / len(records0) * 100:.2f}%")
+        print(f"Filter-Rate: {stats['filtered_count'] / len(records0) * 100:.2f}%")
+        print(f"Filter-Rate_kept: {stats['filtered_count'] / stats['kept_count'] * 100:.2f}%")
 
     print("\n===== DEBUG =====")
-    print("LLM needed:", sum(r["llm_needed"] for r in processed_records))
-    print("No LLM:", sum(not r["llm_needed"] for r in processed_records))
+    print("LLM needed:", sum(r.get("llm_needed", False) for r in records))
+    print("No LLM:", sum(not r.get("llm_needed", False) for r in records))
 # ============================================================
 # CLI
 # ============================================================
