@@ -950,7 +950,7 @@ CT_RULES_LONG = [
 ]
 XRAY_ANGIOGRAPHY_RULES_LONG = [
     r"\bangioplast\w*\b",
-    r"\angiography\w*\b",
+    r"\bangiography\w*\b",
     r"\bballoon angioplasty\b",
     r"\bpercutaneous transluminal angioplasty\b",
     r"\bpta\b",
@@ -981,7 +981,7 @@ XRAY_RULES_LONG = [
     r"\bportable chest\b",
     r"\bportable x[- ]ray\b",
     r"\broentgen\b",
-    r"\br\s*[öo]ntgen\b"
+    r"\br\s*[öo]ntgen\b",
     r"\bap view\b",
     r"\bpa view\b",
     r"\blateral view\b",
@@ -1127,12 +1127,11 @@ RULES_LONG = [
     ("chart_or_diagram", CHART_RULES_LONG),
 ]
 
-
 def contains_any(text: str, patterns: List[str]) -> bool:
     return any(re.search(p, text) for p in patterns)
 
-
 def rule_based_classify_with_rules(text: str, rules, label_priority=None):
+
     t = normalize_for_rules(text)
 
     if not t:
@@ -1141,11 +1140,35 @@ def rule_based_classify_with_rules(text: str, rules, label_priority=None):
     if label_priority is None:
         label_priority = {}
 
+    # =========================================================
+    # Score_boni
+    # =========================================================
+
+    SPECIAL_CLASS_BONUS = {
+        "ct": 8,
+        "xray_fluoroskopie_angiographie": 5,
+        "us": 2,
+    }
+
+    # =========================================================
+    # Parallel matching
+    # =========================================================
+
     hits = {}
 
     for label, patterns in rules:
+
         for pattern in patterns:
-            if re.search(pattern, t):
+
+            try:
+                matched = re.search(pattern, t)
+
+            except re.error:
+                print(f"Regex Fehler: {pattern}")
+                continue
+
+            if matched:
+
                 if label not in hits:
                     hits[label] = {
                         "score": 0,
@@ -1158,8 +1181,6 @@ def rule_based_classify_with_rules(text: str, rules, label_priority=None):
     if not hits:
         return "unknown", "no_rule_match", "", {}
 
-    # Zusatzlogik: starke Bildtyp-Klassen gegen zufällige Modalitätswörter schützen
-    # Beispiel: intraoperative findings + CT im Text.
     strong_context_labels = [
         "surgery_real",
         "pathology",
@@ -1169,10 +1190,67 @@ def rule_based_classify_with_rules(text: str, rules, label_priority=None):
     ]
 
     for label in strong_context_labels:
+
         if label in hits:
             hits[label]["score"] += 3
 
-    # Priorität als Tie-Breaker
+    # =========================================================
+    # Bonus fuer spezifische Radiologieklassen
+    # =========================================================
+
+    for label, bonus in SPECIAL_CLASS_BONUS.items():
+
+        if label in hits:
+            hits[label]["score"] += bonus
+
+    # =========================================================
+    # Harte Priorisierung
+    # =========================================================
+
+    # PET/CT und SPECT/CT fast immer sehr spezifisch
+    if "ct_kombimodalitaet_spect+ct_pet+ct" in hits:
+
+        matched_patterns = hits[
+            "ct_kombimodalitaet_spect+ct_pet+ct"
+        ]["patterns"]
+
+        return (
+            "ct_kombimodalitaet_spect+ct_pet+ct",
+            "forced_hybrid_ct",
+            " | ".join(matched_patterns[:5]),
+            hits,
+        )
+
+    # Angiographie oft sonst von xray verdrängt
+    if "xray_fluoroskopie_angiographie" in hits:
+
+        matched_patterns = hits[
+            "xray_fluoroskopie_angiographie"
+        ]["patterns"]
+
+        return (
+            "xray_fluoroskopie_angiographie",
+            "forced_angiography",
+            " | ".join(matched_patterns[:5]),
+            hits,
+        )
+
+    print("\n===== RULE DEBUG =====")
+
+    for cls in sorted(
+        hits.keys(),
+        key=lambda x: hits[x]["score"],
+        reverse=True
+    ):
+
+        print(
+            cls,
+            "score=",
+            hits[cls]["score"],
+            "patterns=",
+            hits[cls]["patterns"][:5]
+        )
+
     best_label = sorted(
         hits.keys(),
         key=lambda label: (
@@ -1987,9 +2065,9 @@ def run_full_inference(records, ctx):
         # Dummy LLM Result
         llm_results.append(("unknown", 0.0))
 
-    fused = run_final_fusion(processed, llm_results)
+    initial_records = run_final_fusion(processed, llm_results)
 
-    return fused
+    return initial_records
 
 # ============================================================
 # HAUPTPIPELINE
@@ -1997,6 +2075,7 @@ def run_full_inference(records, ctx):
 def build_balanced_dataset(
         ds,
         ctx,
+        existing_records,
         per_class=10,
         initial_presample=100,
         refill_presample=100,
@@ -2005,7 +2084,7 @@ def build_balanced_dataset(
     # --------------------------------------------------------
     # Global
     # --------------------------------------------------------
-    accepted_records = []
+    accepted_records = list(existing_records)
     remaining_pool = []
     global_used = set()
 
@@ -2379,8 +2458,8 @@ def classify_dataset(
     records = build_balanced_dataset(
         ds=ds,
         ctx=ctx,
+        existing_records=run_final_fusion(records, llm_results),
         per_class=per_class,
-
         # erstes großes Presample
         initial_presample=initial_presample,
         #100
