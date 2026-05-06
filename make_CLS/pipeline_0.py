@@ -135,7 +135,7 @@ WEIGHTS = {
     "cnn": 0.4,
     "llm": 0.2,
 
-    "ood": 0.3
+    "cnn3": 0.3
 }
 
 # gen. LLM (vLLM READY)
@@ -299,8 +299,7 @@ def fuse_cnn_weighted(cnn1_scores, cnn2_scores, w1, w2, alpha=0.5):
         s1_weighted = s1 * (1 + alpha * w1.get(c, 0.0))
         s2_weighted = s2 * (1 + alpha * w2.get(c, 0.0))
 
-        fused[c] = max(s1_weighted, s2_weighted)
-
+        fused[c] = (s1_weighted + s2_weighted)
     return fused
 
 def compute_cnn_confidence_and_margin(cnn_scores):
@@ -374,10 +373,11 @@ def normalize_scores(scores):
         return scores
     return {k: v / total for k, v in scores.items()}
 
-def is_cnn_uncertain(cnn_conf, cnn_margin, conf_threshold=0.4, margin_threshold=0.15):
+def is_cnn_uncertain(cnn_conf, cnn_margin, conf_threshold=0.4, margin_threshold=0.03):
+    relative_margin = cnn_margin / (cnn_conf + 1e-6)
     # Entscheidet, ob CNN unsicher ist.
     # Returns: bool: True = unsicher → LLM prüfen
-    return (cnn_conf < conf_threshold or cnn_margin < margin_threshold)
+    return (cnn_conf < conf_threshold or relative_margin < margin_threshold)
 
 # Rules macht subset. pre_fuse. Fusioniert Rules/CNN/BERT. LLM nur bei unsicheren Faellen als Richter
 def quick_fuse(rule_scores, bert_scores, cnn_scores):
@@ -403,8 +403,8 @@ def quick_fuse(rule_scores, bert_scores, cnn_scores):
 
     return top1[0], final, confident
 
-# Final-Classes Fusion mit Out-Of-Distribution Score~Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
-def fuse_scores(rule, bert, cnn, llm, ood_score):
+# Final-Classes Fusion
+def fuse_scores(rule, bert, cnn, llm, cnn3_conf):
 
     final = {}
     contrib = {}
@@ -417,8 +417,7 @@ def fuse_scores(rule, bert, cnn, llm, ood_score):
             + WEIGHTS["llm"] * (llm[1] if llm[0] == label else 0)
         )
 
-        # OOD reduziert alle medizinischen Klassen
-        final[label] = base * (1 - WEIGHTS["ood"] * ood_score)
+        final[label] = base * (1 - WEIGHTS["cnn3"] * cnn3_conf)
 
     sorted_labels = sorted(final.items(), key=lambda x: x[1], reverse=True)
 
@@ -435,16 +434,16 @@ def fuse_scores(rule, bert, cnn, llm, ood_score):
 def run_final_fusion(records, llm_results):
 
     final_records = []
-    filtered_ood = 0
+    filtered_cnn3 = 0
 
     for r, llm_out in zip(records, llm_results):
         rule_scores = r.get("rule_scores", {c: 0.0 for c in FINAL_CLASSES})
         bert_scores = r.get("bert_scores", {c: 0.0 for c in FINAL_CLASSES})
         cnn_scores  = r.get("cnn_scores",  {c: 0.0 for c in FINAL_CLASSES})
-        ood_score   = r.get("ood_score", 0.0)
+        cnn3_conf   = r.get("cnn3_conf", 0.0)
 
-        if ood_score > 0.8:     # ood=Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
-            filtered_ood += 1
+        if cnn3_conf > 0.8:     # cnn3_conf=Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
+            filtered_cnn3 += 1
             continue
 
         # ---------- FINAL LABEL ----------
@@ -458,7 +457,7 @@ def run_final_fusion(records, llm_results):
                 bert_scores,
                 cnn_scores,
                 llm_out,
-                ood_score
+                cnn3_conf
             )
 
         # ---------- DEBUG INFO ----------
@@ -495,7 +494,7 @@ def run_final_fusion(records, llm_results):
             "modality_gt": r.get("modality_gt", "unknown"),
         })
 
-    print(f"OOD gefiltert: {filtered_ood}")
+    print(f"CNN3 gefiltert: {filtered_cnn3}")
 
     return final_records
 # ============================================================
@@ -1611,32 +1610,41 @@ def process_single_record(r, ctx: ModelContext):
     cnn_scores = fuse_cnn_weighted(cnn1_scores, cnn2_scores, cnn1_weights, cnn2_weights, alpha=0.5)
     cnn_scores = normalize_scores(cnn_scores)
     # =========================
-    # CNN3 Filtering
+    # CNN3 Filtering + CNN1&CNN2-Uncertainty Filtering
     # =========================
     cnn_conf, cnn_margin, _, _ = compute_cnn_confidence_and_margin(cnn_scores)
 
-    # 🟢 Fall: CNN unsicher → Rauswurf
+    # 🟢 Fall: CNN 1&2 unsicher. Rauswurf
     cnn_uncertain = is_cnn_uncertain(cnn_conf, cnn_margin)
-    if cnn_uncertain:
-        return {"filtered": True, "reason": "cnn_uncertain"}
+    # if cnn_uncertain:
+    #     print("❌ CNN UNCERTAIN", cnn_conf, cnn_margin)
+    #     return {"filtered": True, "reason": "cnn_uncertain", "pmc_id": r["pmc_id"], "row_id": r["row_id"]}
 
     _, cnn3_full = predict_with_cnn(
         ctx.cnn3, image, ctx.transform, ctx.device, CNN3_CLASS_NAMES)
-
+    CNN3_STRONG = 0.93
+    CNN3_MEDIUM = 0.65
+    rule_conf = max(rule_scores.values())
+    bert_conf = max(bert_scores.values())
+    cnn_conf = max(cnn_scores.values())
     if cnn3_full:
         cnn3_conf = max(cnn3_full.values())
     else:
         cnn3_conf = 0.0
-    if cnn3_conf >= 0.8:
-        return {"filtered": True, "reason": "cnn3"}
+    if cnn3_conf >= CNN3_STRONG:
+        # sehr sicher Rauswurf
+        return {"filtered": True, "reason": "cnn3_strong"}
+
+    elif cnn3_conf >= CNN3_MEDIUM:
+        # unsicher. nur filtern wenn andere schwach
+        if bert_conf <= 0.5 and cnn_conf <= 0.5:
+            return {"filtered": True, "reason": "cnn3_medium"}
 
     # =========================
     # Filtering Entscheidung ueber CNN1/CNN2/RULES/BERT-einzelweises Scoring
     # =========================
 
-    rule_conf = max(rule_scores.values())
-    bert_conf = max(bert_scores.values())
-    cnn_conf = max(cnn_scores.values())
+
 
     # =========================
     # Filtering Entscheidung
@@ -1654,7 +1662,6 @@ def process_single_record(r, ctx: ModelContext):
 
     if (
             cnn3_conf > CNN3_CONF_MIN and
-            rule_conf < PRE_CONF_MAX and
             bert_conf < PRE_CONF_MAX and
             cnn_conf < PRE_CONF_MAX
     ):
@@ -1685,37 +1692,36 @@ def process_single_record(r, ctx: ModelContext):
     # Confidence Werte
     # =========================
 
-    rule_conf = max(rule_scores.values()) if rule_scores else 0.0
     bert_conf = max(bert_scores.values()) if bert_scores else 0.0
-    # cnn_conf hast du schon sauber berechnet (NICHT überschreiben!)
 
     # =========================
     # Schwellen
     # =========================
 
-    RULE_STRONG = 0.8
-    BERT_STRONG = 0.6
-    CNN_STRONG = 0.6
+    BERT_STRONG = 0.75
+    CNN_STRONG = 0.675
 
     # =========================
     # LLM Entscheidung
     # =========================
 
     use_llm = False
+    # 🔴 CNN unsicher + kein Konsens
+    if cnn_uncertain and conflict_level >= 2:
+        use_llm = True
 
     # 🔴 Fall 5: kompletter Konflikt → LLM
     if conflict_level == 3:
-        if conflict_level == 3:
-            if cnn_conf > 0.6 and cnn_margin > 0.2:
-                use_llm = False  # CNN entscheidet
-            elif rule_conf >= 0.9:
-                use_llm = False  # Rules entscheidet
-            elif bert_conf >= 0.75:
-                use_llm = False  # BERT entscheidet
-            elif rule_pred != cnn_pred and bert_pred != cnn_pred:
-                use_llm = True
-            else:
-                use_llm = True
+        if cnn_conf > 0.6 and cnn_margin > 0.17:
+            use_llm = False  # CNN sicher.CNN entscheidet
+        elif rule_conf >= 1.0 and conflict_level == 1:
+            use_llm = False  # Rule_conf immer 1 wenn R. findet, aber mindestens conf lvl soll gelten
+        elif bert_conf >= 0.75:
+            use_llm = False  # BERT sicher. entscheidet
+        elif rule_pred != cnn_pred and bert_pred != cnn_pred:
+            use_llm = True
+        else:
+            use_llm = True
         print(
             f"R:{rule_pred} "
             f"B:{bert_pred} "
@@ -1739,7 +1745,7 @@ def process_single_record(r, ctx: ModelContext):
             f"| LLM={use_llm}"
         )
     # 🟢 Fall 2: 2 stimmen überein + CNN sicher
-    elif conflict_level == 2 and cnn_conf > CNN_STRONG:
+    elif conflict_level == 2 and cnn_conf > CNN_STRONG and cnn_margin > 0.1:
         use_llm = False
         print(
             f"R:{rule_pred} "
@@ -1750,18 +1756,9 @@ def process_single_record(r, ctx: ModelContext):
             f"| margin={cnn_margin:.2f} "
             f"| LLM={use_llm}"
         )
-    # 🟢 Fall 3: Rules extrem stark → KEIN LLM
-    elif rule_conf >= RULE_STRONG:
-        use_llm = False
-        print(
-            f"R:{rule_pred} "
-            f"B:{bert_pred} "
-            f"C:{cnn_pred} "
-            f"| lvl={conflict_level} "
-            f"| conf={cnn_conf:.2f} "
-            f"| margin={cnn_margin:.2f} "
-            f"| LLM={use_llm}"
-        )
+    elif conflict_level >= 2 and 0.5 < cnn_conf < 0.6:
+        use_llm = True
+
     # 🟢 Fall 4: BERT stark + CNN stabil
     elif bert_conf >= BERT_STRONG:
         use_llm = False
@@ -1811,6 +1808,8 @@ def process_single_record(r, ctx: ModelContext):
 
         "cnn1_top3": cnn1_top3,
         "cnn2_top3": cnn2_top3,
+
+        "cnn3_conf": cnn3_conf,
     }
 
     return result
@@ -1823,13 +1822,13 @@ def process_batch(records0, ctx):
     for r in tqdm(records0, desc="Processing"):
 
         out = process_single_record(r, ctx)
-
-        if r is None:
+        # Wichtig ist hier nicht "if r is..." u. "if r.get...", da r fuer den iterativen fill beibehalten w.soll und nicht verfaelscht werden soll!
+        if out is None:
             filtered_counts["unknown"] += 1
             continue
 
-        if r.get("filtered"):       #cnn3certainty UND cnn-uncertainty UND Konsens
-            filtered_counts[r["reason"]] += 1
+        if out.get("filtered"):       #cnn3certainty & cnn-uncertainty & Konsens R/B/C-Modelle
+            filtered_counts[out.get("reason", "unknown")] += 1
             continue
 
         processed.append(out)
@@ -2133,16 +2132,7 @@ def classify_dataset(
     print("\nExtrahiere Records + RULES + CNN + BERT ...")
     print("\nPhase 3: CNN + BERT auf Subset")
     records = process_batch(records0, ctx)
-    filtered_cnn = 0    # uncertainty UND cnn3-certain UND Konsens modelle treshhold
-
-    for r0 in records0:
-        r = process_single_record(r0, ctx)
-
-        if r is None:
-            filtered_cnn += 1  # oder differenzieren, siehe unten
-            continue
-
-        records.append(r)
+    print("records nach batch:", len(records))
 
     # ============================================================
     # Phase 4: LLM nur bei unsicheren Fällen
