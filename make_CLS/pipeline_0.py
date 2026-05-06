@@ -12,7 +12,7 @@ dataset_root/
 Beispiel:
 python make_CLS/pipeline_0.py \
   --dataset_root /home/user/PycharmProjects/ba1pmc/PMC-41GB \
-  --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/test_500.csv \
+  --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/abc.csv \
   --biomedbert_path /home/user/Dokumente/biomedbert \
   --llamamistral_path /home/user/Dokumente/LLaMa_Mistral \
   --cnn1_path /home/user/Dokumente/cnn1/convu_try_3t.pth \
@@ -443,7 +443,8 @@ def run_final_fusion(records, llm_results):
         cnn_scores  = r.get("cnn_scores",  {c: 0.0 for c in FINAL_CLASSES})
         cnn3_conf   = r.get("cnn3_conf", 0.0)
 
-        if cnn3_conf > 0.8:     # cnn3_conf=Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
+        if cnn3_conf > 0.91:     # cnn3_conf=Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
+            print("CNN3Filt", r["final_label"], r["cnn3_conf"])
             filtered_cnn3 += 1
             continue
 
@@ -637,13 +638,13 @@ def get_image_from_row(row):
 # ============================================================
 
 RULE_LABELS_ORDER = [
-    "ct_kombimodalitaet_spect+ct_pet+ct",
+    "ct",
+    "us",
     "mrt_hirn",
     "mrt_body",
-    "ct",
     "xray_fluoroskopie_angiographie",
+    "ct_kombimodalitaet_spect+ct_pet+ct",
     "xray",
-    "us",
 
     "microscopy",
     "pathology",
@@ -1083,13 +1084,13 @@ CHART_RULES_LONG = [
     r"\btimeline\b",
 ]
 LABEL_PRIORITY = {
-    "xray_fluoroskopie_angiographie": 100,
+    "ct": 100,
     "us": 90,
-    "ct_kombimodalitaet_spect+ct_pet+ct": 85,
-    "mrt_hirn": 80,
-    "mrt_body": 70,
-    "ct": 60,
-    "xray": 55,
+    "mrt_hirn": 85,
+    "mrt_body": 80,
+    "xray_fluoroskopie_angiographie": 80,
+    "ct_kombimodalitaet_spect+ct_pet+ct": 70,
+    "xray": 65,
     "microscopy": 54,
     "pathology": 50,
     "surgery_real": 45,
@@ -1825,36 +1826,38 @@ def process_batch(records0, ctx):
     return processed
 
 # ============================================================
-# Fuellt nach Loop den Loop nochmal neu und die fehlenden Klassen per_class auf
+# ITERATIVES PRESAMPLING + FAST REFILL
+# Fuhrt nach Loop den Loop nochmal mit besteh. Presamp auf und fuhrt
+# nach Loop den Loop mit neu gesuchten Presamp auf und
+# Fuellt die fehlenden Klassen per_class neu auf
 # ============================================================
-def iterative_fill(ds, existing, per_class, ctx, max_passes=10):
+# Voraussetzung: existieren bereits:
+#
+# FINAL_CLASSES
+# stable_hash_record()
+# process_single_record()
+# run_final_fusion()
+# extract_text_from_row()
 
-    import random
+# ============================================================
+# Iteratives presampling + fast refill Hilfsfunktion
+# ============================================================
+def count_labels(records):
+    c = Counter()
 
-    # =========================================================
-    # DEDUP
-    # =========================================================
+    for r in records:
+        label = r.get("final_label")
+        if label in FINAL_CLASSES:
+            c[label] += 1
+    return c
 
-    seen = set()
-    unique_existing = []
-
-    for r in existing:
-
-        key = (r.get("pmc_id"), r.get("row_id"))
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        unique_existing.append(r)
-
-    existing = unique_existing
-
-    # =========================================================
-    # BUCKETS
-    # =========================================================
-
+# ============================================================
+# Fast Local Balancing
+# ============================================================
+def fast_local_balancing(existing, pool, per_class):
     buckets = {c: [] for c in FINAL_CLASSES}
+
+    # EXISTING
 
     for r in existing:
 
@@ -1863,181 +1866,284 @@ def iterative_fill(ds, existing, per_class, ctx, max_passes=10):
         if label in FINAL_CLASSES:
             buckets[label].append(r)
 
-    used = set((r["pmc_id"], r["row_id"]) for r in existing)
+    used = set(
+        (r["pmc_id"], r["row_id"])
+        for r in existing
+    )
 
-    total_target = per_class * len(FINAL_CLASSES)
+    # Aus presamp. Deterministisch
 
-    # =========================================================
-    # HASH-STABILE REIHENFOLGE
-    # =========================================================
+    pool = sorted(pool, key=stable_hash_record)
 
-    candidates = []
+    # FILL
 
-    print("Baue stabile Kandidatenreihenfolge ...")
+    for r in pool:
+        key = (r["pmc_id"], r["row_id"])
 
-    for idx in range(len(ds)):
-
-        row = ds[idx]
-
-        try:
-            text, meta = extract_text_from_row(row)
-
-        except Exception:
+        if key in used:
             continue
 
-        record = {
-            "pmc_id": meta.get("PMC_ID", ""),
-            "row_id": idx
-        }
+        label = r.get("final_label")
 
-        h = stable_hash_record(record)
+        if label not in FINAL_CLASSES:
+            continue
+        if len(buckets[label]) >= per_class:
+            continue
 
-        candidates.append((h, idx))
+        buckets[label].append(r)
+        used.add(key)
+        print(f"+ refill {label}")
 
-    candidates.sort(key=lambda x: x[0])
+        done = all(len(buckets[c]) >= per_class for c in FINAL_CLASSES)
 
-    indices = [idx for _, idx in candidates]
-
-    print("Kandidaten:", len(indices))
-
-    # =========================================================
-    # PASSES
-    # =========================================================
-
-    for p in range(max_passes):
-
-        print(f"\nFILL PASS {p}")
-
-        for c in FINAL_CLASSES:
-            print(c, len(buckets[c]))
-
-        current_total = sum(len(buckets[c]) for c in FINAL_CLASSES)
-
-        if current_total >= total_target:
-            print("✔ Vollständig")
+        if done:
             break
 
-        # =====================================================
-        # Auf fehlende Klassen abzielen
-        # =====================================================
-
-        missing_classes = [
-            c for c in FINAL_CLASSES
-            if len(buckets[c]) < per_class
-        ]
-
-        print("Fehlend:", missing_classes)
-
-        added_this_pass = 0
-
-        # =====================================================
-        # Iteration
-        # =====================================================
-
-        for idx in indices:
-
-            row = ds[idx]
-
-            try:
-                text, meta = extract_text_from_row(row)
-
-            except Exception:
-                continue
-
-            key = (meta.get("PMC_ID", ""), idx)
-
-            if key in used:
-                continue
-
-            r = {
-                "row": row,
-                "caption": text,
-                "pmc_id": meta.get("PMC_ID", ""),
-                "row_id": idx,
-                "rule_label": "unknown"
-            }
-
-            # =================================================
-            # Process
-            # =================================================
-
-            out = process_single_record(r, ctx)
-
-            if out is None:
-                continue
-
-            # =================================================
-            # Final Fusion
-            # =================================================
-
-            llm_dummy = ("unknown", 0.0)
-
-            fused = run_final_fusion([out], [llm_dummy])
-
-            if not fused:
-                continue
-
-            out = fused[0]
-
-            label = out.get("final_label")
-
-            if label not in FINAL_CLASSES:
-                continue
-
-            # =================================================
-            # Nur fehlende Klassen
-            # =================================================
-
-            if label not in missing_classes:
-                continue
-
-            if len(buckets[label]) >= per_class:
-                continue
-
-            buckets[label].append(out)
-
-            used.add(key)
-
-            added_this_pass += 1
-
-            print(f"+ {label}")
-
-            # =================================================
-            # refresh
-            # =================================================
-
-            missing_classes = [
-                c for c in FINAL_CLASSES
-                if len(buckets[c]) < per_class
-            ]
-
-            if not missing_classes:
-                break
-
-        print(f"Pass hinzugefügt: {added_this_pass}")
-
-        if added_this_pass == 0:
-            print("⚠️ Keine neuen Samples")
-            break
-
-    # =========================================================
-    # FINAL FLATTEN
-    # =========================================================
+    # FINAL
 
     final = []
 
     for c in FINAL_CLASSES:
 
-        # deterministisch statt random.shuffle
-        buckets[c].sort(key=stable_hash_record)
+        bucket = sorted(
+            buckets[c],
+            key=stable_hash_record
+        )
 
-        final.extend(buckets[c][:per_class])
+        final.extend(bucket[:per_class])
 
     return final
+
+# ============================================================
+# PRESAMPLE AUS GROSSEM DATASET
+# ============================================================
+
+def sample_new_chunk(
+        ds,
+        global_used,
+        sample_size=100
+):
+
+    candidates = []
+
+# --------------------------------------------------------
+# Hash-stabile Reihenfolge
+# --------------------------------------------------------
+    for idx in range(len(ds)):
+        row = ds[idx]
+        try:
+            text, meta = extract_text_from_row(row)
+        except Exception:
+            continue
+
+        key = (meta.get("PMC_ID", ""),idx)
+
+        if key in global_used:
+            continue
+
+        record = {
+            "pmc_id": meta.get("PMC_ID", ""),
+            "row_id": idx}
+
+        h = stable_hash_record(record)
+
+        candidates.append((h, idx))
+    candidates.sort(key=lambda x: x[0])
+
+    selected = []
+
+    for _, idx in candidates[:sample_size]:
+        row = ds[idx]
+        try:
+            text, meta = extract_text_from_row(row)
+        except Exception:
+            continue
+
+        r = {
+            "row": row,
+            "caption": text,
+            "pmc_id": meta.get("PMC_ID", ""),
+            "row_id": idx,
+            "rule_label": "unknown"}
+
+        selected.append(r)
+
+    return selected
+
+# ============================================================
+# Volle Inferenz
+# ============================================================
+def run_full_inference(records, ctx):
+    processed = []
+    llm_results = []
+
+    for r in records:
+        out = process_single_record(r, ctx)
+
+        if out is None:
+            continue
+
+        processed.append(out)
+        # Dummy LLM Result
+        llm_results.append(("unknown", 0.0))
+
+    fused = run_final_fusion(processed, llm_results)
+
+    return fused
+
+# ============================================================
+# HAUPTPIPELINE
+# ============================================================
+def build_balanced_dataset(
+        ds,
+        ctx,
+        per_class=10,
+        initial_presample=100,
+        refill_presample=100,
+        max_rounds=20
+):
+    # --------------------------------------------------------
+    # Global
+    # --------------------------------------------------------
+    accepted_records = []
+    remaining_pool = []
+    global_used = set()
+
+    target_total = per_class * len(FINAL_CLASSES)
+    # ========================================================
+    # Rounds
+    # ========================================================
+
+    for round_idx in range(max_rounds):
+
+        print("\n" + "=" * 60)
+        print(f"ROUND {round_idx}")
+        print("=" * 60)
+        # ====================================================
+        # Status
+        # ====================================================
+        counts = count_labels(accepted_records)
+
+        print("\nAktuelle Verteilung:")
+
+        for c in FINAL_CLASSES:
+            print(c, counts[c])
+
+        done = all(counts[c] >= per_class for c in FINAL_CLASSES)
+
+        if done:
+            print("\n✔ Dataset vollständig balanced")
+            break
+
+        # ====================================================
+        # Presample
+        # ====================================================
+        sample_size = (
+            initial_presample
+            if round_idx == 0
+            else refill_presample)
+
+        print(f"\nZiehe neues Presample: {sample_size}")
+        presample = sample_new_chunk(
+            ds=ds,
+            global_used=global_used,
+            sample_size=sample_size)
+
+        print("Presample:", len(presample))
+        # ====================================================
+        # Global USED
+        # ====================================================
+        for r in presample:
+            key = (r["pmc_id"], r["row_id"])
+
+            global_used.add(key)
+
+        # ====================================================
+        # Volle Inferenz
+        # ====================================================
+        print("\nFull inference ...")
+
+        processed = run_full_inference(presample, ctx)
+        print("Processed:", len(processed))
+
+        # ====================================================
+        # ACCEPTED / REMAINING
+        # ====================================================
+        accepted_keys = set((r["pmc_id"], r["row_id"]) for r in accepted_records)
+
+        new_accepts = []
+        new_remaining = []
+
+        for r in processed:
+            key = (r["pmc_id"], r["row_id"])
+
+            if key in accepted_keys:
+                continue
+
+            label = r.get("final_label")
+
+            if label not in FINAL_CLASSES:
+                new_remaining.append(r)
+                continue
+
+            counts = count_labels(accepted_records + new_accepts)
+            # ------------------------------------------------
+            # Prueft, ob Klasse noch nicht voll
+            # ------------------------------------------------
+            if counts[label] < per_class:
+                new_accepts.append(r)
+            else:
+                new_remaining.append(r)
+
+        accepted_records.extend(new_accepts)
+
+        remaining_pool.extend(new_remaining)
+
+        print("\nNeue Accepts:", len(new_accepts))
+        print("Remaining pool:", len(remaining_pool))
+
+        # ====================================================
+        # Fast Local Balancing
+        # ====================================================
+        accepted_records = fast_local_balancing(
+            existing=accepted_records,
+            pool=remaining_pool,
+            per_class=per_class)
+
+        print("\nNach local balancing:")
+        counts = count_labels(accepted_records)
+
+        for c in FINAL_CLASSES:
+            print(c, counts[c])
+    # ========================================================
+    # Final
+    # ========================================================
+    final = []
+    seen = set()
+
+    for r in accepted_records:
+        key = (r["pmc_id"], r["row_id"])
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        final.append(r)
+    print("\n" + "=" * 60)
+    print("FINAL")
+    print("=" * 60)
+
+    counts = count_labels(final)
+
+    for c in FINAL_CLASSES:
+        print(c, counts[c])
+
+    return final
+
 # ============================================================
 # Inspizieren/Distr/Debug/Übersicht
 # ============================================================
-
 def inspect_first_sample(ds: Dataset):
     sample = ds[0]
 
@@ -2156,6 +2262,9 @@ def classify_dataset(
     limit: Optional[int],
     inspectlimit: int,
     per_class: int,
+    initial_presample: int,
+    refill_presample: int,
+    max_rounds: int,
     inspect_only: bool = False,
 ):
     device = "cpu"
@@ -2264,46 +2373,33 @@ def classify_dataset(
         else:
             llm_results.append((r.get("final_label", "unknown"), 0.5))  # fake confidence
 
-# ============================================================
-# Phase 5: Final fusion
-# ============================================================
-
-    print("\nFinale Fusion ...")
-
-    records = run_final_fusion(records, llm_results)
-# ============================================================
-# Phase 6: Post-Balancing (=alle Klassen per_class mal haben muessen!)
-# ============================================================
-    print("\nRe-balancing final dataset...")
-    records = iterative_fill(
+    # ============================================================
+    # Volle iterative Build Pipeline: Phase 5: Final fusion, Phase 6: Post-Balancing
+    # ============================================================
+    records = build_balanced_dataset(
         ds=ds,
-        existing=records,
+        ctx=ctx,
         per_class=per_class,
-        ctx=ctx
+
+        # erstes großes Presample
+        initial_presample=initial_presample,
+        #100
+        # spätere Nachlade-Chunks
+        refill_presample=refill_presample,
+        #100
+        # Sicherheitslimit
+        max_rounds=max_rounds
+        #20
     )
-    print("Nachbalanciert bzw. Gesamt:", len(records))
-
-    seen = set()
-    unique_records = []
-
-    for r in records:
-        key = (r["pmc_id"], r["row_id"])
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_records.append(r)
-
-    records = unique_records
-    print("Nachbalanciert:", len(records))
 # ============================================================
-# Phase 6: Bilder speichern
+# Phase 7: Bilder speichern (f. Viewer)
 # ============================================================
     image_output_dir = output_csv.parent / "exported_images"
 
     print("\nSpeichere ausgewählte Bilder ...")
     save_selected_images(records, image_output_dir)
 # ============================================================
-# Phase 7: Endergebnisse Head ausgeben
+# Phase 8: Endergebnisse Head ausgeben
 # ============================================================
     df = pd.DataFrame(records)
 
@@ -2350,7 +2446,6 @@ def classify_dataset(
 # ============================================================
 # CLI
 # ============================================================
-
 def parse_args():
     parser = argparse.ArgumentParser()
 
@@ -2403,6 +2498,24 @@ def parse_args():
         help="Anzahl Samples pro finaler Klasse (hash-balanced)"
     )
     parser.add_argument(
+        "--initial_presample",
+        type=int,
+        default=100,
+        help="Menge des ersten großes Presample vor Refill"
+    )
+    parser.add_argument(
+        "--refill_presample",
+        type=int,
+        default=100,
+        help="Anzahl spätere Nachlade-Chunks Postsample *im* Refill"
+    )
+    parser.add_argument(
+        "--max_rounds",
+        type=int,
+        default=20,
+        help="Anzahl Sicherheitslimit im Refill (=Runden Runs Durchlaeufe)"
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -2446,9 +2559,11 @@ def main():
         inspectlimit=args.inspectlimit,
         limit=args.limit,
         per_class=args.per_class,
+        initial_presample=args.initial_presample,
+        refill_presample=args.refill_presample,
+        max_rounds=args.max_rounds,
         inspect_only=args.inspect_only,
     )
-
 
 if __name__ == "__main__":
     main()

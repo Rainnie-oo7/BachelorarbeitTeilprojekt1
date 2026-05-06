@@ -17,7 +17,7 @@ from queue import Queue
 # CONFIG
 # ============================================================
 
-CSV_PATH = "test_500.csv"
+CSV_PATH = "abc"
 IMAGE_DIR = "exported_images"
 
 THUMB_SIZE = (900, 900)
