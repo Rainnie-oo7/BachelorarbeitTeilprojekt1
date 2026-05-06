@@ -619,6 +619,8 @@ def bytes_to_pil_image(x):
     raise ValueError(f"Kann jpg-Feld nicht als Bild lesen. Typ: {type(x)}")
 
 def get_image_from_row(row):
+    if row is None:
+        return None
     for key in ["image", "jpg", "png"]:
         if key in row:
             try:
@@ -1653,13 +1655,24 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
     # RULES
     # =========================
     rule_scores = {c: 0.0 for c in FINAL_CLASSES}
-    if r["rule_label"] in FINAL_CLASSES:
+    if r.get("rule_label") in FINAL_CLASSES:
         rule_scores[r["rule_label"]] = 1.0
 
     # =========================
     # BERT
     # =========================
     if ctx.bert:
+        if text is None:
+            text = ""
+
+        if not isinstance(text, str):
+            text = str(text)
+
+        text = text.strip()
+
+        if len(text) == 0:
+            text = "unknown"
+
         bert_out = ctx.bert.predict_batch([text])[0]
         bert_scores = {c: 0.0 for c in FINAL_CLASSES}
         if bert_out["label"] in FINAL_CLASSES:
@@ -1667,7 +1680,10 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
     else:
         bert_scores = {c: 0.0 for c in FINAL_CLASSES}
         bert_out = {"label": "none", "score": 0.0}
-
+    # =========================Umgehung, weil manchmal selbst row None war
+    if row is None:
+        print("\nRow ist None")
+        return None
     # =========================
     # CNN1 + CNN2
     # =========================
@@ -2217,35 +2233,58 @@ def build_balanced_dataset(
         refill_cursor = end_idx
 
         print("Chunkgröße:", len(candidate_chunk))
+        # ====================================================
+        # Raw Arrow -> Standard Records
+        # ====================================================
 
-        # ====================================================
-        # Global USED Filter
-        # ====================================================
         presample = []
 
-        for local_idx, r in enumerate(candidate_chunk):
-
-            key = (
-                r.get("pmc_id"),
-                r.get("row_id")
-            )
-
+        for local_idx, row in enumerate(candidate_chunk):
+            key = row["__key__"]
             # --------------------------------------------
+            # Arrow-Webds hat rohe Felder ['__key__', '__url__', 'jpg', 'jsonl']. Fuer global genutzt ja/nein Filter reicht blosses __key__
             # Bereits benutzt?
             # --------------------------------------------
             if key in global_used:
                 continue
 
             global_used.add(key)
+            # --------------------------------------------
+            # Text extrahieren
+            # --------------------------------------------
+            text, meta = extract_text_from_row(row)
 
-            presample.append(r)
+            text = normalize_text(text)
+            # --------------------------------------------
+            # Leere Texte ignorieren
+            # --------------------------------------------
+            if text is None:
+                continue
+
+            if not isinstance(text, str):
+                text = str(text)
+
+            text = text.strip()
+
+            if len(text) == 0:
+                continue
+            # --------------------------------------------
+            # Standard Record erzeugen
+            # --------------------------------------------
+            record = {
+                "row_id": start_idx + local_idx,
+                "pmc_id": meta.get("PMC_ID", ""),
+                "caption": text,
+                "row": row,
+                "modality_gt": meta.get("modality", "unknown")}
+
+            presample.append(record)
 
         print("Nach global_used:", len(presample))
 
         if len(presample) == 0:
             print("\nLeerer Presample Chunk")
             continue
-
         # ====================================================
         # Full Inference
         # ====================================================
@@ -2253,8 +2292,7 @@ def build_balanced_dataset(
 
         processed = run_full_inference(
             presample,
-            ctx
-        )
+            ctx)
 
         print("Processed:", len(processed))
 
