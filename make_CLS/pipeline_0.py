@@ -1614,11 +1614,7 @@ def process_single_record(r, ctx: ModelContext):
     # =========================
     cnn_conf, cnn_margin, _, _ = compute_cnn_confidence_and_margin(cnn_scores)
 
-    # 🟢 Fall: CNN 1&2 unsicher. Rauswurf
     cnn_uncertain = is_cnn_uncertain(cnn_conf, cnn_margin)
-    # if cnn_uncertain:
-    #     print("❌ CNN UNCERTAIN", cnn_conf, cnn_margin)
-    #     return {"filtered": True, "reason": "cnn_uncertain", "pmc_id": r["pmc_id"], "row_id": r["row_id"]}
 
     _, cnn3_full = predict_with_cnn(
         ctx.cnn3, image, ctx.transform, ctx.device, CNN3_CLASS_NAMES)
@@ -1642,12 +1638,6 @@ def process_single_record(r, ctx: ModelContext):
 
     # =========================
     # Filtering Entscheidung ueber CNN1/CNN2/RULES/BERT-einzelweises Scoring
-    # =========================
-
-
-
-    # =========================
-    # Filtering Entscheidung
     # =========================
     # Idee:
     # CNN3 darf nur filtern, wenn: Konsens
@@ -1687,30 +1677,22 @@ def process_single_record(r, ctx: ModelContext):
     cnn_pred = top_label(cnn_scores)
 
     conflict_level = len({rule_pred, bert_pred, cnn_pred})
-
-    # =========================
-    # Confidence Werte
-    # =========================
-
+    #cnn_conf oben schon definiert
     bert_conf = max(bert_scores.values()) if bert_scores else 0.0
 
-    # =========================
-    # Schwellen
-    # =========================
-
     BERT_STRONG = 0.75
-    CNN_STRONG = 0.675
+    CNN_EIGENTLICH_STRONG = 0.675
 
     # =========================
     # LLM Entscheidung
     # =========================
+    use_llm = False #default
 
-    use_llm = False
-    # 🔴 CNN unsicher + kein Konsens
+    # 🔴 Fall 1: CNN unsicher + kein Konsens
     if cnn_uncertain and conflict_level >= 2:
         use_llm = True
 
-    # 🔴 Fall 5: kompletter Konflikt → LLM
+    # 🟢 Fall 2: kompletter Konflikt LLM
     if conflict_level == 3:
         if cnn_conf > 0.6 and cnn_margin > 0.17:
             use_llm = False  # CNN sicher.CNN entscheidet
@@ -1718,6 +1700,7 @@ def process_single_record(r, ctx: ModelContext):
             use_llm = False  # Rule_conf immer 1 wenn R. findet, aber mindestens conf lvl soll gelten
         elif bert_conf >= 0.75:
             use_llm = False  # BERT sicher. entscheidet
+       # 🔴
         elif rule_pred != cnn_pred and bert_pred != cnn_pred:
             use_llm = True
         else:
@@ -1732,7 +1715,7 @@ def process_single_record(r, ctx: ModelContext):
             f"| LLM={use_llm}"
         )
 
-    # 🟢 Fall 1: alles einig → KEIN LLM
+    # 🟢 Fall 3: alles einig → KEIN LLM
     elif conflict_level == 1:
         use_llm = False
         print(
@@ -1744,8 +1727,8 @@ def process_single_record(r, ctx: ModelContext):
             f"| margin={cnn_margin:.2f} "
             f"| LLM={use_llm}"
         )
-    # 🟢 Fall 2: 2 stimmen überein + CNN sicher
-    elif conflict_level == 2 and cnn_conf > CNN_STRONG and cnn_margin > 0.1:
+    # 🟢 Fall 4: 2 stimmen überein + CNN sicher
+    elif conflict_level == 2 and cnn_conf > CNN_EIGENTLICH_STRONG and cnn_margin > 0.1:
         use_llm = False
         print(
             f"R:{rule_pred} "
@@ -1756,10 +1739,14 @@ def process_single_record(r, ctx: ModelContext):
             f"| margin={cnn_margin:.2f} "
             f"| LLM={use_llm}"
         )
-    elif conflict_level >= 2 and 0.5 < cnn_conf < 0.6:
+    # 🔴 Fall 5: Konflikt gegeben, CNN weiss es mittelmaessig
+    elif conflict_level >= 2 and 0.54 <= cnn_conf < CNN_EIGENTLICH_STRONG:
+        use_llm = True
+    # 🔴 Fall 6: Konflikt gegeben, CNN weiss es mittelmaessig, keine Diskrepanz
+    elif conflict_level >= 2 and cnn_margin <= 0.024:
         use_llm = True
 
-    # 🟢 Fall 4: BERT stark + CNN stabil
+    # 🟢 Fall 7: BERT stark + CNN stabil
     elif bert_conf >= BERT_STRONG:
         use_llm = False
         print(
