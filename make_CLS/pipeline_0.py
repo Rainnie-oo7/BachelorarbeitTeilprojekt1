@@ -18,6 +18,7 @@ python make_CLS/pipeline_0.py \
   --cnn1_path /home/user/Dokumente/cnn1/convu_try_3t.pth \
   --cnn2_path /home/user/Dokumente/cnn2/convu_folderlabel_mrt_body_mrt_hirn.pth \
   --cnn3_path /home/user/Dokumente/cnn3/cnn_multiclass.pth
+  > log.txt 2>&1
 """
 
 from __future__ import annotations
@@ -45,6 +46,9 @@ from tqdm import tqdm
 from datasets import Dataset, concatenate_datasets
 from transformers import AutoTokenizer, AutoModel
 from transformers import AutoModelForCausalLM
+
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import as_completed
 
 # Finale Klassen u. Mapping
 FINAL_CLASSES = [
@@ -438,6 +442,7 @@ def run_final_fusion(records, llm_results):
         cnn3_conf   = r.get("cnn3_conf", 0.0)
 
         if cnn3_conf > 0.91:     # cnn3_conf=Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
+            #CNN3Filt xray 0.9227646589279175
             print("CNN3Filt", r["final_label"], r["cnn3_conf"])
             filtered_cnn3 += 1
             continue
@@ -972,18 +977,10 @@ XRAY_RULES_LONG = [
     r"\bradiograph\b",
     r"\bradiographic\b",
     r"\bprojection radiography\b",
-    r"\bplain film\b",
-    r"\bchest film\b",
-    r"\bportable chest\b",
+    r"\bfilm\b",
     r"\bportable x[- ]ray\b",
     r"\broentgen\b",
     r"\br\s*[öo]ntgen\b",
-    r"\bap view\b",
-    r"\bpa view\b",
-    r"\blateral view\b",
-    r"\bfrontal radiograph\b",
-    r"\blateral radiograph\b",
-    r"\bpanoramic radiograph\b",
     r"\bdorsoplantar projection\b",
 ]
 US_RULES_LONG = [
@@ -1639,6 +1636,23 @@ class ModelContext:
         self.transform = cnn_transform
         self.device = device
 
+def top_label(scores):
+    if not scores:
+        return "none"
+    # Dict
+    if isinstance(scores, dict):
+        return max(scores, key=scores.get)
+    # List[Tuple]
+    if isinstance(scores, list):
+        first = scores[0]
+        # [("xray", 0.9), ...]
+        if isinstance(first, tuple):
+            return max(scores, key=lambda x: x[1])[0]
+        # [{"label":..., "score":...}]
+        if isinstance(first, dict):
+            return max(scores, key=lambda x: x.get("score", 0)).get("label", "none")
+
+    return "none"
 # ============================================================
 # Verarbeitung (Ph. 3)
 # ============================================================
@@ -1706,8 +1720,9 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
 
     cnn_uncertain = is_cnn_uncertain(cnn_conf, cnn_margin)
 
-    _, cnn3_full = predict_with_cnn(
+    cnn3_top3, cnn3_full = predict_with_cnn(
         ctx.cnn3, image, ctx.transform, ctx.device, CNN3_CLASS_NAMES)
+    cnn3_pred = top_label(cnn3_top3)
     CNN3_STRONG = 0.93
     CNN3_MEDIUM = 0.65
     rule_conf = max(rule_scores.values())
@@ -1719,7 +1734,12 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
         cnn3_conf = 0.0
     if cnn3_conf >= CNN3_STRONG:
         # sehr sicher Rauswurf
-        return {"filtered": True, "reason": "cnn3_strong"}
+        r["is_filtered"] = True
+        r["filter_reason"] = "cnn3_strong"
+
+        print(f"CNN3Filt {cnn3_pred} {cnn3_conf}")
+
+        return r
 
     elif cnn3_conf >= CNN3_MEDIUM:
         # unsicher. nur filtern wenn andere schwach
@@ -1758,9 +1778,6 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
     # =========================
     # LLM Entscheidung KONFLIKT + CNN LOGIK
     # =========================
-
-    def top_label(scores):
-        return max(scores, key=scores.get)
 
     rule_pred = top_label(rule_scores)
     bert_pred = top_label(bert_scores)
@@ -1840,7 +1857,7 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
             f"| LLM={use_llm}"
         )
     # 🔴 Fall 5: Konflikt gegeben, CNN weiss es mittelmaessig
-    elif conflict_level >= 2 and 0.54 <= cnn_conf < CNN_EIGENTLICH_STRONG:
+    elif conflict_level >= 2 and 0.49 <= cnn_conf < CNN_EIGENTLICH_STRONG:
         use_llm = True
     # 🔴 Fall 6: Konflikt gegeben, CNN weiss es mittelmaessig, keine Diskrepanz
     elif conflict_level >= 2 and cnn_margin <= 0.024:
@@ -2016,14 +2033,9 @@ def fast_local_balancing(existing, pool, per_class):
 # PRESAMPLE AUS GROSSEM DATASET
 # ============================================================
 
-def sample_new_chunk(
-        ds,
-        global_used,
-        sample_size=100
-):
+def sample_new_chunk(ds, global_used, sample_size=100):
 
     candidates = []
-
 # --------------------------------------------------------
 # Hash-stabile Reihenfolge
 # --------------------------------------------------------
@@ -2081,6 +2093,9 @@ def run_full_inference(records, ctx):
         if out is None:
             continue
 
+        if out.get("is_filtered"):
+            continue
+
         processed.append(out)
         # Dummy LLM Result
         llm_results.append(("unknown", 0.0))
@@ -2090,7 +2105,7 @@ def run_full_inference(records, ctx):
     return initial_records
 
 # ============================================================
-# HAUPTPIPELINE
+# Hauptpipeline
 # ============================================================
 def build_balanced_dataset(
         ds,
@@ -2111,8 +2126,6 @@ def build_balanced_dataset(
     # echte Dublettenkontrolle
     global_used = set()
 
-    target_total = per_class * len(FINAL_CLASSES)
-
     # ========================================================
     # Refill State
     # ========================================================
@@ -2124,6 +2137,8 @@ def build_balanced_dataset(
     # Rounds
     # ========================================================
     for round_idx in range(max_rounds):
+        # Lokale Fehlversuche innerhalb dieser Round
+        failed_counter = 0
 
         print("\n" + "=" * 60)
         print(f"ROUND {round_idx}")
@@ -2162,6 +2177,16 @@ def build_balanced_dataset(
         if not missing_classes:
             print("Alle Klassen gefüllt.")
             break
+        # ====================================================
+        # Micro Decay. Alle 250 erfolglosen Samples Thresholds leicht lockern. Hauptrounds erhalten trotzdem urspruenglichen Decay-Wert!
+        # 2it/sek =/= micro round duration ~2.1 min. DENN Erfolge+Fehlversuche dabei
+        # ====================================================
+        micro_round = failed_counter // 40
+
+        effective_round = round_idx + micro_round
+
+        print(f"\nMicro Round: {micro_round}")
+        print(f"Effective Round: {effective_round}")
 
         # ====================================================
         # Adaptive Thresholds
@@ -2169,21 +2194,21 @@ def build_balanced_dataset(
         cnn_thresh = adaptive_threshold(
             start=0.82,
             min_value=0.55,
-            refill_round=round_idx,
+            refill_round=effective_round,
             decay=0.04
         )
 
         bert_thresh = adaptive_threshold(
             start=0.88,
             min_value=0.60,
-            refill_round=round_idx,
+            refill_round=effective_round,
             decay=0.035
         )
 
         cnn_margin_thresh = adaptive_threshold(
             start=0.18,
             min_value=0.08,
-            refill_round=round_idx,
+            refill_round=effective_round,
             decay=0.015
         )
 
@@ -2195,9 +2220,9 @@ def build_balanced_dataset(
         # Presample Size
         # ====================================================
         sample_size = (
-            initial_presample
-            if round_idx == 0
-            else refill_presample
+            refill_presample
+            # if round_idx == 0
+            # else initial_presample
         )
 
         # ====================================================
@@ -2213,10 +2238,8 @@ def build_balanced_dataset(
         # ====================================================
         start_idx = refill_cursor
 
-        end_idx = min(
-            len(ds),
-            refill_cursor + sample_size
-        )
+        end_idx = min(len(ds),
+            refill_cursor + sample_size)
 
         print(f"\nChunk: {start_idx} -> {end_idx}")
 
@@ -2397,6 +2420,10 @@ def build_balanced_dataset(
                 new_accepts.append(r)
             else:
                 new_remaining.append(r)
+                # ====================================================
+                # Fehlversuch zählen
+                # ====================================================
+                failed_counter += 1
 
         # ====================================================
         # Merge
@@ -2414,8 +2441,7 @@ def build_balanced_dataset(
         accepted_records = fast_local_balancing(
             existing=accepted_records,
             pool=remaining_pool,
-            per_class=per_class
-        )
+            per_class=per_class)
 
         # ====================================================
         # Status nach Balancing
@@ -2423,6 +2449,10 @@ def build_balanced_dataset(
         print("\nNach local balancing:")
 
         counts = count_labels(accepted_records)
+
+        refill_added = sum(counts.values()) - sum(counts.values())
+
+        print(f"\nRefill Added: {refill_added}")
 
         for c in FINAL_CLASSES:
             print(c, counts[c])
@@ -2437,7 +2467,7 @@ def build_balanced_dataset(
 
         print(f"\nStagnation Counter: {stagnation_counter}")
 
-        if stagnation_counter >= 3:
+        if stagnation_counter >= 100:
             print("\nRefill stagniert -> Abbruch")
             break
 
@@ -2536,9 +2566,6 @@ def inspect_final_distribution(records, limit=None):
     for key, value in counter.most_common():
         perc = (value / total) * 100 if total > 0 else 0
         print(f"{key}: {value} ({perc:.2f}%)")
-
-def top_label(scores):
-    return max(scores, key=scores.get) if scores else "none"
 
 def compute_filter_stats(records):
     total = len(records)
@@ -2853,7 +2880,7 @@ def parse_args():
     parser.add_argument(
         "--refill_presample",
         type=int,
-        default=25000,
+        default=300,
         help="Anzahl spätere Nachlade-Chunks Postsample *im* Refill"
     )
     parser.add_argument(
