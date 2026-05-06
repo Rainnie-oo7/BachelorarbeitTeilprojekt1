@@ -2,202 +2,429 @@
 
 import tkinter as tk
 from tkinter import ttk
+from tkinter.scrolledtext import ScrolledText
+
 from PIL import Image, ImageTk
-import pandas as pd
 from pathlib import Path
+
+import pandas as pd
 import json
 import threading
+from queue import Queue
 
-# =========================
+
+# ============================================================
 # CONFIG
-# =========================
+# ============================================================
+
 CSV_PATH = "test_500.csv"
 IMAGE_DIR = "exported_images"
-THUMB_SIZE = (200, 200)
 
-# =========================
+THUMB_SIZE = (900, 900)
+
+BG = "#1e1e1e"
+FG = "#dddddd"
+
+FONT = ("Consolas", 10)
+
+
+# ============================================================
 # Async Image Loader
-# =========================
+# ============================================================
+
 class AsyncImageLoader:
+
     def __init__(self):
         self.cache = {}
+        self.lock = threading.Lock()
 
-    def load(self, path, callback):
-        if path in self.cache:
-            callback(self.cache[path])
-            return
+    def preload(self, paths):
 
-        def worker():
-            try:
-                img = Image.open(path).convert("RGB")
-                img.thumbnail(THUMB_SIZE)
+        for p in paths:
+            if p in self.cache:
+                continue
+
+            threading.Thread(
+                target=self._worker,
+                args=(p,),
+                daemon=True
+            ).start()
+
+    def _worker(self, path):
+
+        try:
+            img = Image.open(path).convert("RGB")
+            img.thumbnail(THUMB_SIZE)
+
+            with self.lock:
                 self.cache[path] = img
-                callback(img)
-            except:
-                callback(None)
 
-        threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            with self.lock:
+                self.cache[path] = None
+
+    def get(self, path):
+
+        if path not in self.cache:
+            self._worker(path)
+
+        return self.cache.get(path)
 
 
-# =========================
-# Main App
-# =========================
-class DebugViewer:
+# ============================================================
+# MAIN VIEWER
+# ============================================================
+
+class PMCViewer:
+
     def __init__(self, root):
-        self.root = root
-        self.root.title("PMC Debug Viewer")
 
-        self.df = pd.read_csv(CSV_PATH)
+        self.root = root
+        self.root.title("PMC DEBUG VIEWER")
+        self.root.geometry("1800x1000")
+        self.root.configure(bg=BG)
+
+        print("Lade CSV ...")
+        self.df = pd.read_csv(CSV_PATH, low_memory=False)
+
+        self.filtered_df = self.df.copy()
+
         self.image_dir = Path(IMAGE_DIR)
 
         self.loader = AsyncImageLoader()
 
-        self.filtered_df = self.df.copy()
-        self.current_index = None
+        self.current_idx = 0
 
         self.build_ui()
+
         self.populate_list()
 
-    # =========================
+        self.root.bind("<Down>", lambda e: self.next_item())
+        self.root.bind("<Up>", lambda e: self.prev_item())
+
+        self.root.bind("<Right>", lambda e: self.next_item())
+        self.root.bind("<Left>", lambda e: self.prev_item())
+
+        self.root.bind("f", lambda e: self.focus_search())
+
+    # ============================================================
     # UI
-    # =========================
+    # ============================================================
+
     def build_ui(self):
 
-        main_frame = tk.Frame(self.root)
-        main_frame.pack(fill="both", expand=True)
+        # =========================
+        # MAIN PANED
+        # =========================
 
-        # LEFT PANEL
-        left = tk.Frame(main_frame)
-        left.pack(side="left", fill="y")
+        main = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
+        main.pack(fill="both", expand=True)
 
-        self.listbox = tk.Listbox(left, width=50)
-        self.listbox.pack(side="left", fill="y")
+        left = tk.Frame(main, bg=BG)
+        center = tk.Frame(main, bg=BG)
+        right = tk.Frame(main, bg=BG)
 
-        scrollbar = tk.Scrollbar(left)
-        scrollbar.pack(side="right", fill="y")
+        main.add(left, weight=1)
+        main.add(center, weight=2)
+        main.add(right, weight=3)
 
-        self.listbox.config(yscrollcommand=scrollbar.set)
-        scrollbar.config(command=self.listbox.yview)
+        # ============================================================
+        # LEFT
+        # ============================================================
+
+        search_frame = tk.Frame(left, bg=BG)
+        search_frame.pack(fill="x")
+
+        tk.Label(
+            search_frame,
+            text="Filter",
+            bg=BG,
+            fg=FG
+        ).pack()
+
+        self.search_entry = tk.Entry(search_frame)
+        self.search_entry.pack(fill="x")
+
+        tk.Button(
+            search_frame,
+            text="Apply",
+            command=self.apply_filter
+        ).pack(fill="x")
+
+        tk.Button(
+            search_frame,
+            text="Only uncertain",
+            command=self.filter_uncertain
+        ).pack(fill="x")
+
+        self.listbox = tk.Listbox(
+            left,
+            bg="#252526",
+            fg=FG,
+            font=FONT
+        )
+
+        self.listbox.pack(fill="both", expand=True)
 
         self.listbox.bind("<<ListboxSelect>>", self.on_select)
 
-        # FILTERS
-        filter_frame = tk.Frame(left)
-        filter_frame.pack(fill="x")
+        # ============================================================
+        # CENTER
+        # ============================================================
 
-        tk.Label(filter_frame, text="Filter label").pack()
-        self.filter_label = tk.Entry(filter_frame)
-        self.filter_label.pack(fill="x")
+        self.image_label = tk.Label(center, bg=BG)
+        self.image_label.pack(fill="both", expand=True)
 
-        tk.Button(filter_frame, text="Apply Filter", command=self.apply_filter).pack(fill="x")
+        # ============================================================
+        # RIGHT
+        # ============================================================
 
-        # RIGHT PANEL
-        right = tk.Frame(main_frame)
-        right.pack(side="right", fill="both", expand=True)
+        self.info = ScrolledText(
+            right,
+            bg="#111111",
+            fg=FG,
+            insertbackground=FG,
+            font=FONT
+        )
 
-        self.image_label = tk.Label(right)
-        self.image_label.pack()
+        self.info.pack(fill="both", expand=True)
 
-        self.text = tk.Text(right, height=20)
-        self.text.pack(fill="both", expand=True)
+        # ============================================================
+        # STATUSBAR
+        # ============================================================
 
-    # =========================
-    # List Population
-    # =========================
-    def populate_list(self):
-        self.listbox.delete(0, tk.END)
+        self.status = tk.Label(
+            self.root,
+            text="READY",
+            anchor="w",
+            bg="#333333",
+            fg="white"
+        )
 
-        for i, row in self.filtered_df.iterrows():
-            label = row["final_label"]
-            text = row["caption"][:50]
-            self.listbox.insert(tk.END, f"{i} | {label} | {text}")
+        self.status.pack(fill="x")
 
-    # =========================
-    # Filter
-    # =========================
+    # ============================================================
+    # FILTER
+    # ============================================================
+
     def apply_filter(self):
-        val = self.filter_label.get().lower()
+
+        val = self.search_entry.get().lower().strip()
 
         if not val:
             self.filtered_df = self.df.copy()
+
         else:
-            self.filtered_df = self.df[
-                self.df["final_label"].astype(str).str.lower().str.contains(val)
-            ]
+
+            mask = (
+                self.df.astype(str)
+                .apply(
+                    lambda col: col.str.lower().str.contains(val, na=False)
+                )
+                .any(axis=1)
+            )
+
+            self.filtered_df = self.df[mask]
 
         self.populate_list()
 
-    # =========================
-    # Selection
-    # =========================
+    def filter_uncertain(self):
+
+        if "uncertain" not in self.df.columns:
+            return
+
+        self.filtered_df = self.df[self.df["uncertain"] == True]
+
+        self.populate_list()
+
+    # ============================================================
+    # LIST
+    # ============================================================
+
+    def populate_list(self):
+
+        self.listbox.delete(0, tk.END)
+
+        for idx, row in self.filtered_df.iterrows():
+
+            txt = (
+                f"{idx} | "
+                f"{row.get('final_label','?')} | "
+                f"{str(row.get('caption',''))[:60]}"
+            )
+
+            self.listbox.insert(tk.END, txt)
+
+        self.status.config(
+            text=f"{len(self.filtered_df)} Samples"
+        )
+
+    # ============================================================
+    # NAVIGATION
+    # ============================================================
+
+    def next_item(self):
+
+        if self.current_idx < len(self.filtered_df) - 1:
+
+            self.current_idx += 1
+
+            self.listbox.selection_clear(0, tk.END)
+            self.listbox.selection_set(self.current_idx)
+
+            self.show_current()
+
+    def prev_item(self):
+
+        if self.current_idx > 0:
+
+            self.current_idx -= 1
+
+            self.listbox.selection_clear(0, tk.END)
+            self.listbox.selection_set(self.current_idx)
+
+            self.show_current()
+
+    # ============================================================
+    # SELECTION
+    # ============================================================
+
     def on_select(self, event):
+
         if not self.listbox.curselection():
             return
 
-        idx = self.listbox.curselection()[0]
-        row = self.filtered_df.iloc[idx]
+        self.current_idx = self.listbox.curselection()[0]
 
-        self.show_detail(row)
+        self.show_current()
 
-    # =========================
-    # Detail View
-    # =========================
-    def show_detail(self, row):
+    # ============================================================
+    # SHOW
+    # ============================================================
 
-        pmc_id = row["pmc_id"]
-        row_id = row["row_id"]
+    def show_current(self):
 
-        img_path = self.image_dir / f"{pmc_id}_{row_id}.jpg"
+        row = self.filtered_df.iloc[self.current_idx]
 
-        def update_image(img):
-            if img is None:
-                return
-            self.tk_img = ImageTk.PhotoImage(img)
-            self.image_label.config(image=self.tk_img)
+        self.show_image(row)
 
-        self.loader.load(img_path, lambda img: self.root.after(0, update_image, img))
+        self.show_text(row)
 
-        # TEXT INFO
-        self.text.delete("1.0", tk.END)
+        self.preload_neighbors()
 
-        info = []
+    # ============================================================
+    # IMAGE
+    # ============================================================
 
-        info.append(f"FINAL: {row['final_label']}")
-        info.append(f"GT: {row.get('modality_gt', 'unknown')}")
-        info.append(f"UNCERTAIN: {row.get('uncertain', False)}")
+    def show_image(self, row):
 
-        info.append("\n--- MODELS ---")
-        info.append(f"RULE: {row['RULE']}")
-        info.append(f"BERT: {row['BERT']}")
-        info.append(f"LLM: {row['LLM']}")
+        pmc_id = row.get("pmc_id", "unknown")
+        row_id = row.get("row_id", "unknown")
 
-        info.append("\nCNN1:")
-        info.append(row["CNN1top3"])
+        path = self.image_dir / f"{pmc_id}_{row_id}.jpg"
 
-        info.append("\nCNN2:")
-        info.append(row["CNN2top3"])
+        img = self.loader.get(path)
 
-        info.append("\n--- SCORES ---")
-        info.append(row["Final Scores"])
+        if img is None:
 
-        info.append("\n--- CAPTION ---")
-        info.append(row["caption"])
+            self.image_label.config(
+                image="",
+                text="NO IMAGE",
+                fg="red"
+            )
 
-        # WHY PANEL
-        info.append("\n--- WHY ---")
-        try:
-            dbg = json.loads(row["Begründung"])
-            info.append(json.dumps(dbg, indent=2))
-        except:
-            info.append("No debug info")
+            return
 
-        self.text.insert(tk.END, "\n".join(info))
+        self.tk_img = ImageTk.PhotoImage(img)
+
+        self.image_label.config(
+            image=self.tk_img
+        )
+
+    # ============================================================
+    # TEXT
+    # ============================================================
+
+    def show_text(self, row):
+
+        self.info.delete("1.0", tk.END)
+
+        lines = []
+
+        lines.append("=" * 80)
+
+        for col in row.index:
+
+            val = row[col]
+
+            try:
+
+                if isinstance(val, str):
+
+                    vv = val.strip()
+
+                    if vv.startswith("{") or vv.startswith("["):
+
+                        try:
+                            parsed = json.loads(vv)
+
+                            val = json.dumps(parsed, indent=2)
+
+                        except:
+                            pass
+
+                lines.append(f"\n[{col}]")
+                lines.append(str(val))
+
+            except Exception as e:
+
+                lines.append(f"{col}: ERROR {e}")
+
+        self.info.insert(tk.END, "\n".join(lines))
+
+    # ============================================================
+    # PRELOAD
+    # ============================================================
+
+    def preload_neighbors(self):
+
+        paths = []
+
+        for delta in [-2, -1, 1, 2]:
+
+            idx = self.current_idx + delta
+
+            if idx < 0 or idx >= len(self.filtered_df):
+                continue
+
+            row = self.filtered_df.iloc[idx]
+
+            pmc_id = row.get("pmc_id", "unknown")
+            row_id = row.get("row_id", "unknown")
+
+            path = self.image_dir / f"{pmc_id}_{row_id}.jpg"
+
+            paths.append(path)
+
+        self.loader.preload(paths)
+
+    # ============================================================
+    # SEARCH FOCUS
+    # ============================================================
+
+    def focus_search(self):
+
+        self.search_entry.focus_set()
 
 
-# =========================
+# ============================================================
 # RUN
-# =========================
+# ============================================================
+
 if __name__ == "__main__":
+
     root = tk.Tk()
-    app = DebugViewer(root)
+
+    app = PMCViewer(root)
+
     root.mainloop()

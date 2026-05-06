@@ -35,6 +35,7 @@ import json
 import argparse
 
 import hashlib
+import random
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
 import io
@@ -1826,28 +1827,39 @@ def process_batch(records0, ctx):
 # ============================================================
 # Fuellt nach Loop den Loop nochmal neu und die fehlenden Klassen per_class auf
 # ============================================================
-def iterative_fill(ds, existing, per_class, ctx, max_passes=5):
+def iterative_fill(ds, existing, per_class, ctx, max_passes=10):
 
-    from collections import defaultdict
     import random
 
-    # ---------- DEDUP ----------
+    # =========================================================
+    # DEDUP
+    # =========================================================
+
     seen = set()
     unique_existing = []
+
     for r in existing:
+
         key = (r.get("pmc_id"), r.get("row_id"))
+
         if key in seen:
             continue
+
         seen.add(key)
         unique_existing.append(r)
 
     existing = unique_existing
 
-    # ---------- BUCKETS ----------
+    # =========================================================
+    # BUCKETS
+    # =========================================================
+
     buckets = {c: [] for c in FINAL_CLASSES}
 
     for r in existing:
-        label = r.get("final_label") or r.get("quick_label")
+
+        label = r.get("final_label")
+
         if label in FINAL_CLASSES:
             buckets[label].append(r)
 
@@ -1855,31 +1867,85 @@ def iterative_fill(ds, existing, per_class, ctx, max_passes=5):
 
     total_target = per_class * len(FINAL_CLASSES)
 
+    # =========================================================
+    # HASH-STABILE REIHENFOLGE
+    # =========================================================
+
+    candidates = []
+
+    print("Baue stabile Kandidatenreihenfolge ...")
+
+    for idx in range(len(ds)):
+
+        row = ds[idx]
+
+        try:
+            text, meta = extract_text_from_row(row)
+
+        except Exception:
+            continue
+
+        record = {
+            "pmc_id": meta.get("PMC_ID", ""),
+            "row_id": idx
+        }
+
+        h = stable_hash_record(record)
+
+        candidates.append((h, idx))
+
+    candidates.sort(key=lambda x: x[0])
+
+    indices = [idx for _, idx in candidates]
+
+    print("Kandidaten:", len(indices))
+
+    # =========================================================
+    # PASSES
+    # =========================================================
+
     for p in range(max_passes):
 
         print(f"\nFILL PASS {p}")
 
-        # DEBUG
         for c in FINAL_CLASSES:
             print(c, len(buckets[c]))
 
         current_total = sum(len(buckets[c]) for c in FINAL_CLASSES)
 
         if current_total >= total_target:
-            print("✔ Bereits voll – Stop")
+            print("✔ Vollständig")
             break
 
-        indices = list(range(len(ds)))
-        random.shuffle(indices)
+        # =====================================================
+        # Auf fehlende Klassen abzielen
+        # =====================================================
+
+        missing_classes = [
+            c for c in FINAL_CLASSES
+            if len(buckets[c]) < per_class
+        ]
+
+        print("Fehlend:", missing_classes)
 
         added_this_pass = 0
 
-        for idx in indices[:5000]:
+        # =====================================================
+        # Iteration
+        # =====================================================
+
+        for idx in indices:
 
             row = ds[idx]
-            text, meta = extract_text_from_row(row)
+
+            try:
+                text, meta = extract_text_from_row(row)
+
+            except Exception:
+                continue
 
             key = (meta.get("PMC_ID", ""), idx)
+
             if key in used:
                 continue
 
@@ -1891,35 +1957,80 @@ def iterative_fill(ds, existing, per_class, ctx, max_passes=5):
                 "rule_label": "unknown"
             }
 
+            # =================================================
+            # Process
+            # =================================================
+
             out = process_single_record(r, ctx)
 
             if out is None:
                 continue
 
-            label = out.get("final_label") or out.get("quick_label")
+            # =================================================
+            # Final Fusion
+            # =================================================
+
+            llm_dummy = ("unknown", 0.0)
+
+            fused = run_final_fusion([out], [llm_dummy])
+
+            if not fused:
+                continue
+
+            out = fused[0]
+
+            label = out.get("final_label")
 
             if label not in FINAL_CLASSES:
+                continue
+
+            # =================================================
+            # Nur fehlende Klassen
+            # =================================================
+
+            if label not in missing_classes:
                 continue
 
             if len(buckets[label]) >= per_class:
                 continue
 
             buckets[label].append(out)
+
             used.add(key)
+
             added_this_pass += 1
 
-            if sum(len(buckets[c]) for c in FINAL_CLASSES) >= total_target:
+            print(f"+ {label}")
+
+            # =================================================
+            # refresh
+            # =================================================
+
+            missing_classes = [
+                c for c in FINAL_CLASSES
+                if len(buckets[c]) < per_class
+            ]
+
+            if not missing_classes:
                 break
 
-        print(f"+{added_this_pass} Samples")
+        print(f"Pass hinzugefügt: {added_this_pass}")
 
-        if added_this_pass < 5:
-            print("⚠️ Keine neuen Samples → Stop")
+        if added_this_pass == 0:
+            print("⚠️ Keine neuen Samples")
             break
 
-    # flatten
+    # =========================================================
+    # FINAL FLATTEN
+    # =========================================================
+
     final = []
+
     for c in FINAL_CLASSES:
+
+        # deterministisch statt random.shuffle
+        buckets[c].sort(key=stable_hash_record)
+
         final.extend(buckets[c][:per_class])
 
     return final
@@ -2153,9 +2264,9 @@ def classify_dataset(
         else:
             llm_results.append((r.get("final_label", "unknown"), 0.5))  # fake confidence
 
-    # ============================================================
-    # Phase 5: Final fusion
-    # ============================================================
+# ============================================================
+# Phase 5: Final fusion
+# ============================================================
 
     print("\nFinale Fusion ...")
 
