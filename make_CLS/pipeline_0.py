@@ -2076,10 +2076,10 @@ def build_balanced_dataset(
         ds,
         ctx,
         existing_records,
-        per_class=10,
-        initial_presample=100,
-        refill_presample=100,
-        max_rounds=20
+        initial_presample,
+        refill_presample,
+        per_class,
+        max_rounds
 ):
     # --------------------------------------------------------
     # Global
@@ -2573,19 +2573,19 @@ def parse_args():
     parser.add_argument(
         "--per_class",
         type=int,
-        default=5000,
+        default=5,
         help="Anzahl Samples pro finaler Klasse (hash-balanced)"
     )
     parser.add_argument(
         "--initial_presample",
         type=int,
-        default=100,
+        default=50000,
         help="Menge des ersten großes Presample vor Refill"
     )
     parser.add_argument(
         "--refill_presample",
         type=int,
-        default=100,
+        default=100000,
         help="Anzahl spätere Nachlade-Chunks Postsample *im* Refill"
     )
     parser.add_argument(
@@ -2603,7 +2603,7 @@ def parse_args():
     parser.add_argument(
         "--inspectlimit",
         type=int,
-        default=10,
+        default=35,
         help="Limit für Inspektionsfunktionen (z.B. Verteilungen)"
     )
     parser.add_argument(

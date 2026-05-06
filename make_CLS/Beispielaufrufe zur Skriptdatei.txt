@@ -14,16 +14,14 @@ python make_CLS/pipeline_0.py \
 ##########################private################################
 python make_CLS/pipeline_0.py \
   --dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB \
-  --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/test_per10.csv \
+  --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/test_per5.csv \
   --biomedbert_path /home/b/Dokumente/biomedbert \
   --llamamistral_path /home/b/Dokumente/LLaMa_Mistral \
   --cnn1_path /home/b/Dokumente/cnn1/convu_try_3t.pth \
   --cnn2_path /home/b/Dokumente/cnn2/convu_folderlabel_mrt_body_mrt_hirn.pth \
   --cnn3_path /home/b/Dokumente/cnn3/cnn_multiclass.pth \
-  --per_class 10 \
-  --inspectlimit 70
 
-
+python make_CLS/pipeline_0.py   --dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB   --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/test_per10.csv   --biomedbert_path /home/b/Dokumente/biomedbert   --llamamistral_path /home/b/Dokumente/LLaMa_Mistral   --cnn1_path /home/b/Dokumente/cnn1/convu_try_3t.pth   --cnn2_path /home/b/Dokumente/cnn2/convu_folderlabel_mrt_body_mrt_hirn.pth   --cnn3_path /home/b/Dokumente/cnn3/cnn_multiclass.pth   --per_class 3   --inspectlimit 70
 
 #################################################################
 # PMC-VIEWER
