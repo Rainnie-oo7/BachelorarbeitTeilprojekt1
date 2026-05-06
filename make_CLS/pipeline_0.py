@@ -12,23 +12,18 @@ dataset_root/
 Beispiel:
 python make_CLS/pipeline_0.py \
   --dataset_root /home/user/PycharmProjects/ba1pmc/PMC-41GB \
-  --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/abc.csv \
+  --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/test_per5.csv \
   --biomedbert_path /home/user/Dokumente/biomedbert \
   --llamamistral_path /home/user/Dokumente/LLaMa_Mistral \
   --cnn1_path /home/user/Dokumente/cnn1/convu_try_3t.pth \
   --cnn2_path /home/user/Dokumente/cnn2/convu_folderlabel_mrt_body_mrt_hirn.pth \
-  --cnn3_path /home/b/Dokumente/cnn3/cnn_multiclass.pth \
-  --per_class 50 \
-  --inspectlimit 2000
-  --limit 2000
+  --cnn3_path /home/user/Dokumente/cnn3/cnn_multiclass.pth
 """
 
 from __future__ import annotations
 
-import os
 import os.path as osp
 from pathlib import Path
-import numpy as np
 from PIL import Image
 import re
 import json
@@ -50,7 +45,6 @@ from tqdm import tqdm
 from datasets import Dataset, concatenate_datasets
 from transformers import AutoTokenizer, AutoModel
 from transformers import AutoModelForCausalLM
-from vllm import LLM, SamplingParams
 
 # Finale Klassen u. Mapping
 FINAL_CLASSES = [
@@ -1235,21 +1229,21 @@ def rule_based_classify_with_rules(text: str, rules, label_priority=None):
             hits,
         )
 
-    print("\n===== RULE DEBUG =====")
-
-    for cls in sorted(
-        hits.keys(),
-        key=lambda x: hits[x]["score"],
-        reverse=True
-    ):
-
-        print(
-            cls,
-            "score=",
-            hits[cls]["score"],
-            "patterns=",
-            hits[cls]["patterns"][:5]
-        )
+    # print("\n===== RULE DEBUG =====")
+    #
+    # for cls in sorted(
+    #     hits.keys(),
+    #     key=lambda x: hits[x]["score"],
+    #     reverse=True
+    # ):
+    #
+    #     print(
+    #         cls,
+    #         "score=",
+    #         hits[cls]["score"],
+    #         "patterns=",
+    #         hits[cls]["patterns"][:5]
+    #     )
 
     best_label = sorted(
         hits.keys(),
@@ -1646,14 +1640,14 @@ class ModelContext:
 # ============================================================
 # Verarbeitung (Ph. 3)
 # ============================================================
-def process_single_record(r, ctx: ModelContext):
+def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh=0.82, bert_thresh=0.88, cnn_margin_thresh=0.18):
     """
     Das ist mein Phase-3 Code für ein Sample
     (Rules + CNN + BERT + LLM Entscheidung)
     """
 
-    text = r["caption"]
-    row = r["row"]
+    text = r.get("caption")
+    row = r.get("row")
 
     # =========================
     # RULES
@@ -1756,6 +1750,16 @@ def process_single_record(r, ctx: ModelContext):
     bert_pred = top_label(bert_scores)
     cnn_pred = top_label(cnn_scores)
 
+    # ============================================================
+    # Nur fehlende Klassen weiter prüfen
+    # ============================================================
+    if missing_classes is not None:
+        if (
+                rule_pred not in missing_classes
+                and cnn_pred not in missing_classes
+                and bert_pred not in missing_classes
+        ):
+            return None
     conflict_level = len({rule_pred, bert_pred, cnn_pred})
     #cnn_conf oben schon definiert
     bert_conf = max(bert_scores.values()) if bert_scores else 0.0
@@ -2085,19 +2089,30 @@ def build_balanced_dataset(
     # Global
     # --------------------------------------------------------
     accepted_records = list(existing_records)
+
     remaining_pool = []
+
+    # echte Dublettenkontrolle
     global_used = set()
 
     target_total = per_class * len(FINAL_CLASSES)
+
+    # ========================================================
+    # Refill State
+    # ========================================================
+    refill_cursor = 0
+
+    stagnation_counter = 0
+
     # ========================================================
     # Rounds
     # ========================================================
-
     for round_idx in range(max_rounds):
 
         print("\n" + "=" * 60)
         print(f"ROUND {round_idx}")
         print("=" * 60)
+
         # ====================================================
         # Status
         # ====================================================
@@ -2108,72 +2123,246 @@ def build_balanced_dataset(
         for c in FINAL_CLASSES:
             print(c, counts[c])
 
-        done = all(counts[c] >= per_class for c in FINAL_CLASSES)
+        done = all(
+            counts[c] >= per_class
+            for c in FINAL_CLASSES
+        )
 
         if done:
             print("\n✔ Dataset vollständig balanced")
             break
 
         # ====================================================
-        # Presample
+        # Fehlende Klassen
+        # ====================================================
+        missing_classes = {
+            cls for cls in FINAL_CLASSES
+            if counts[cls] < per_class
+        }
+
+        print("\nFehlende Klassen:")
+        print(missing_classes)
+
+        if not missing_classes:
+            print("Alle Klassen gefüllt.")
+            break
+
+        # ====================================================
+        # Adaptive Thresholds
+        # ====================================================
+        cnn_thresh = adaptive_threshold(
+            start=0.82,
+            min_value=0.55,
+            refill_round=round_idx,
+            decay=0.04
+        )
+
+        bert_thresh = adaptive_threshold(
+            start=0.88,
+            min_value=0.60,
+            refill_round=round_idx,
+            decay=0.035
+        )
+
+        cnn_margin_thresh = adaptive_threshold(
+            start=0.18,
+            min_value=0.08,
+            refill_round=round_idx,
+            decay=0.015
+        )
+
+        print(f"\nCNN Threshold: {cnn_thresh:.3f}")
+        print(f"BERT Threshold: {bert_thresh:.3f}")
+        print(f"Margin Threshold: {cnn_margin_thresh:.3f}")
+
+        # ====================================================
+        # Presample Size
         # ====================================================
         sample_size = (
             initial_presample
             if round_idx == 0
-            else refill_presample)
+            else refill_presample
+        )
 
-        print(f"\nZiehe neues Presample: {sample_size}")
-        presample = sample_new_chunk(
-            ds=ds,
-            global_used=global_used,
-            sample_size=sample_size)
+        # ====================================================
+        # Dataset Ende?
+        # ====================================================
+        if refill_cursor >= len(ds):
 
-        print("Presample:", len(presample))
+            print("\nDataset vollständig durchsucht.")
+            break
+
         # ====================================================
-        # Global USED
+        # Chunk bestimmen
         # ====================================================
-        for r in presample:
-            key = (r["pmc_id"], r["row_id"])
+        start_idx = refill_cursor
+
+        end_idx = min(
+            len(ds),
+            refill_cursor + sample_size
+        )
+
+        print(f"\nChunk: {start_idx} -> {end_idx}")
+
+        candidate_chunk = ds.select(
+            range(start_idx, end_idx)
+        )
+
+        indices = list(range(len(candidate_chunk)))
+
+        random.shuffle(indices)
+
+        candidate_chunk = candidate_chunk.select(indices)
+
+        refill_cursor = end_idx
+
+        print("Chunkgröße:", len(candidate_chunk))
+
+        # ====================================================
+        # Global USED Filter
+        # ====================================================
+        presample = []
+
+        for local_idx, r in enumerate(candidate_chunk):
+
+            key = (
+                r.get("pmc_id"),
+                r.get("row_id")
+            )
+
+            # --------------------------------------------
+            # Bereits benutzt?
+            # --------------------------------------------
+            if key in global_used:
+                continue
 
             global_used.add(key)
 
+            presample.append(r)
+
+        print("Nach global_used:", len(presample))
+
+        if len(presample) == 0:
+            print("\nLeerer Presample Chunk")
+            continue
+
         # ====================================================
-        # Volle Inferenz
+        # Full Inference
         # ====================================================
         print("\nFull inference ...")
 
-        processed = run_full_inference(presample, ctx)
+        processed = run_full_inference(
+            presample,
+            ctx
+        )
+
         print("Processed:", len(processed))
 
         # ====================================================
-        # ACCEPTED / REMAINING
+        # Existing Keys
         # ====================================================
-        accepted_keys = set((r["pmc_id"], r["row_id"]) for r in accepted_records)
+        accepted_keys = set(
+            (r["pmc_id"], r["row_id"])
+            for r in accepted_records
+        )
 
         new_accepts = []
+
         new_remaining = []
 
+        # ====================================================
+        # Process Results
+        # ====================================================
         for r in processed:
-            key = (r["pmc_id"], r["row_id"])
 
+            key = (
+                r["pmc_id"],
+                r["row_id"]
+            )
+
+            # --------------------------------------------
+            # Bereits akzeptiert?
+            # --------------------------------------------
             if key in accepted_keys:
                 continue
 
             label = r.get("final_label")
 
+            # --------------------------------------------
+            # Ungültiges Label
+            # --------------------------------------------
             if label not in FINAL_CLASSES:
                 new_remaining.append(r)
                 continue
 
-            counts = count_labels(accepted_records + new_accepts)
-            # ------------------------------------------------
-            # Prueft, ob Klasse noch nicht voll
-            # ------------------------------------------------
-            if counts[label] < per_class:
+            # --------------------------------------------
+            # Nur fehlende Klassen priorisieren
+            # --------------------------------------------
+            if label not in missing_classes:
+                new_remaining.append(r)
+                continue
+
+            # --------------------------------------------
+            # Counts aktualisieren
+            # --------------------------------------------
+            counts = count_labels(
+                accepted_records + new_accepts
+            )
+
+            # --------------------------------------------
+            # Klasse bereits voll?
+            # --------------------------------------------
+            if counts[label] >= per_class:
+                new_remaining.append(r)
+                continue
+
+            # ====================================================
+            # Adaptive Qualitätsprüfung
+            # ====================================================
+            cnn_conf = r.get("cnn_conf", 0.0)
+
+            bert_conf = r.get("bert_conf", 0.0)
+
+            cnn_margin = r.get("cnn_margin", 0.0)
+
+            rule_pred = r.get("rule_pred")
+
+            accept = False
+
+            # --------------------------------------------
+            # Rules dominant
+            # --------------------------------------------
+            if rule_pred == label:
+                accept = True
+
+            # --------------------------------------------
+            # CNN akzeptieren
+            # --------------------------------------------
+            elif (
+                cnn_conf >= cnn_thresh
+                and cnn_margin >= cnn_margin_thresh
+            ):
+                accept = True
+
+            # --------------------------------------------
+            # BERT akzeptieren
+            # --------------------------------------------
+            elif (
+                bert_conf >= bert_thresh
+            ):
+                accept = True
+
+            # --------------------------------------------
+            # Accept / Remaining
+            # --------------------------------------------
+            if accept:
                 new_accepts.append(r)
             else:
                 new_remaining.append(r)
 
+        # ====================================================
+        # Merge
+        # ====================================================
         accepted_records.extend(new_accepts)
 
         remaining_pool.extend(new_remaining)
@@ -2187,21 +2376,46 @@ def build_balanced_dataset(
         accepted_records = fast_local_balancing(
             existing=accepted_records,
             pool=remaining_pool,
-            per_class=per_class)
+            per_class=per_class
+        )
 
+        # ====================================================
+        # Status nach Balancing
+        # ====================================================
         print("\nNach local balancing:")
+
         counts = count_labels(accepted_records)
 
         for c in FINAL_CLASSES:
             print(c, counts[c])
+
+        # ====================================================
+        # Stagnation Detection
+        # ====================================================
+        if len(new_accepts) == 0:
+            stagnation_counter += 1
+        else:
+            stagnation_counter = 0
+
+        print(f"\nStagnation Counter: {stagnation_counter}")
+
+        if stagnation_counter >= 3:
+            print("\nRefill stagniert -> Abbruch")
+            break
+
     # ========================================================
-    # Final
+    # Final Dedup
     # ========================================================
     final = []
+
     seen = set()
 
     for r in accepted_records:
-        key = (r["pmc_id"], r["row_id"])
+
+        key = (
+            r["pmc_id"],
+            r["row_id"]
+        )
 
         if key in seen:
             continue
@@ -2209,6 +2423,10 @@ def build_balanced_dataset(
         seen.add(key)
 
         final.append(r)
+
+    # ========================================================
+    # Final Status
+    # ========================================================
     print("\n" + "=" * 60)
     print("FINAL")
     print("=" * 60)
@@ -2325,6 +2543,20 @@ def save_selected_images(records, output_dir):
             continue
 
     print(f"Gespeichert: {saved} Bilder in {output_dir}")
+# ============================================================
+# hilft das Laden von fehlenden Klassen im Refill durch leichtere Tresholds um unnoetiges langes Suchen zu vermeiden
+# ============================================================
+def adaptive_threshold(
+        start: float,
+        min_value: float,
+        refill_round: int,
+        decay: float
+) -> float:
+
+    value = start - refill_round * decay
+
+    return max(min_value, value)
+
 
 # ============================================================
 # Hauptklassifikation
@@ -2355,8 +2587,6 @@ def classify_dataset(
         raise FileNotFoundError(f"Keine data-*.arrow Dateien in {dataset_root} gefunden.")
 
     print(f"Gefundene Arrow-Dateien: {len(arrow_files)}")
-    # DEBUG: nur 1 Datei
-    arrow_files = arrow_files[:1]
     ds = load_arrow_shards(arrow_files)
 
     print(f"Gesamtanzahl Zeilen: {len(ds)}")
@@ -2585,7 +2815,7 @@ def parse_args():
     parser.add_argument(
         "--refill_presample",
         type=int,
-        default=100000,
+        default=25000,
         help="Anzahl spätere Nachlade-Chunks Postsample *im* Refill"
     )
     parser.add_argument(
