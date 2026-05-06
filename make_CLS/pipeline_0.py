@@ -1919,25 +1919,43 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
     return result
 
 def process_batch(records0, ctx):
-
     processed = []
     filtered_counts = Counter()
+    # Parallele Verarbeitung
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = [
+            ex.submit(process_single_record, r, ctx)
+            for r in records0]
 
-    for r in tqdm(records0, desc="Processing"):
+        for fut in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Processing"):
 
-        out = process_single_record(r, ctx)
-        # Wichtig ist hier nicht "if r is..." u. "if r.get...", da r fuer den iterativen fill beibehalten w.soll und nicht verfaelscht werden soll!
-        if out is None:
-            filtered_counts["unknown"] += 1
-            continue
+            try:
+                out = fut.result()
+            except Exception as e:
+                filtered_counts["thread_exception"] += 1
+                print("\nThread Error")
+                print(e)
 
-        if out.get("filtered"):       #cnn3certainty & cnn-uncertainty & Konsens R/B/C-Modelle
-            filtered_counts[out.get("reason", "unknown")] += 1
-            continue
+                continue
+            # Wichtig ist hier nicht "if r is..." u. "if r.get...", da r fuer den iterativen fill beibehalten w.soll und nicht verfaelscht werden soll!
+            if out is None:
+                filtered_counts["unknown"] += 1
+                continue
 
-        processed.append(out)
+            if out.get("filtered"):         #cnn3certainty & cnn-uncertainty & Konsens R/B/C-Modelle
+                filtered_counts[out.get("reason", "unknown")] += 1
+                continue
 
-    print(f"Filtered: {filtered_counts}")
+            # ============
+            # Keep
+            # ============
+            processed.append(out)
+    print(f"\nFiltered: {filtered_counts}")
+    print(f"records nach batch: {len(processed)}")
+
     return processed
 
 # ============================================================
@@ -2313,9 +2331,7 @@ def build_balanced_dataset(
         # ====================================================
         print("\nFull inference ...")
 
-        processed = run_full_inference(
-            presample,
-            ctx)
+        processed = run_full_inference(presample, ctx)
 
         print("Processed:", len(processed))
 
@@ -2336,10 +2352,7 @@ def build_balanced_dataset(
         # ====================================================
         for r in processed:
 
-            key = (
-                r["pmc_id"],
-                r["row_id"]
-            )
+            key = (r["pmc_id"], r["row_id"])
 
             # --------------------------------------------
             # Bereits akzeptiert?
