@@ -101,18 +101,7 @@ CNN3_CLASS_NAMES = [
     "haut",
     "chart",
     "histologie"]
-#Gating fuer CNN1 mit CNN2 Fusion. Disjunkt. CNN1 kann gut (besser als 2) obere. CNN2 kann besser das untere
-# nicht disjunkt. Sie sind asymmetrisch spezialisiert
-CNN1_VALID = [
-    "ct",
-    "ct_kombimodalitaet_spect+ct_pet+ct",
-    "us"]
-CNN2_VALID = [
-    "xray",
-    "xray_fluoroskopie_angiographie",
-    "mrt_hirn",
-    "mrt_body"]
-# fuer Weight Log-Scaling
+# fuer Weight Log-Scaling. Anzahlen Bild in CNN Custom Finetuning
 CNN1_CLASS_COUNTS_RAW = {
     "xray": 54419,
     "xray_fluoroskopie_angiographie": 3000,
@@ -152,8 +141,7 @@ class LocalLLM:
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
 
-        # verhindert Warnung
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.pad_token = self.tokenizer.eos_token      # verhindert Warnung
 
         self.model = AutoModelForCausalLM.from_pretrained(model_path,
             torch_dtype=torch.float32,
@@ -195,7 +183,9 @@ Text: {text}
                     max_new_tokens=64
                 )
 
-            decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            generated = outputs[:, inputs["input_ids"].shape[1]:]
+
+            decoded = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
 
             for d in decoded:
                 label = d.strip().lower()
@@ -403,18 +393,16 @@ def quick_fuse(rule_scores, bert_scores, cnn_scores):
     return top1[0], final, confident
 
 # Final-Classes Fusion
-def fuse_scores(rule, bert, cnn, llm, cnn3_conf):
+def fuse_scores(rule, bert, cnn, llm_label, llm_conf, cnn3_conf):
 
     final = {}
-    contrib = {}
 
     for label in FINAL_CLASSES:
         base = (
             WEIGHTS["rules"] * rule.get(label, 0)
             + WEIGHTS["bert"] * bert.get(label, 0)
             + WEIGHTS["cnn"] * cnn.get(label, 0)
-            + WEIGHTS["llm"] * (llm[1] if llm[0] == label else 0)
-        )
+            + WEIGHTS["llm"] * (llm_conf if llm_label == label else 0))
 
         final[label] = base * (1 - WEIGHTS["cnn3"] * cnn3_conf)
 
@@ -425,48 +413,46 @@ def fuse_scores(rule, bert, cnn, llm, cnn3_conf):
     margin = top1[1] - top2[1]
 
     uncertain = (
-        margin < 0.10 * top1[1] # relativ gesehen
-        or top1[1] < 0.2        # schwach
-    )
+        margin < 0.10 * top1[1]  # relativ gesehen
+        or top1[1] < 0.2)        # schwach
 
-    return top1[0], final, contrib, None, uncertain
-def run_final_fusion(records, llm_results):
+    return top1[0], final, None, uncertain
+
+def run_final_fusion(records):
 
     final_records = []
     filtered_cnn3 = 0
 
-    for r, llm_out in zip(records, llm_results):
+    for r in records:
         rule_scores = r.get("rule_scores", {c: 0.0 for c in FINAL_CLASSES})
         bert_scores = r.get("bert_scores", {c: 0.0 for c in FINAL_CLASSES})
         cnn_scores  = r.get("cnn_scores",  {c: 0.0 for c in FINAL_CLASSES})
         cnn3_conf   = r.get("cnn3_conf", 0.0)
 
-        if cnn3_conf > 0.91:     # cnn3_conf=Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
-            #CNN3Filt xray 0.9227646589279175
-            print("CNN3Filt", r["final_label"], r["cnn3_conf"])
+        if r["is_filtered"]:     # cnn3_conf=Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
+            print("C3-Filth:", r["filter_reason"], r["cnn3_pred"], r["cnn3_conf"], )
             filtered_cnn3 += 1
             continue
 
         # ---------- FINAL LABEL ----------
         if not r.get("llm_needed", False):
             final_label = r.get("final_label", r.get("quick_label", "unknown"))
-            final_scores = rule_scores
+            final_scores = r.get("quick_scores", {})
             uncertain = False
         else:
-            final_label, final_scores, _, _, uncertain = fuse_scores(
+            final_label, final_scores, _, uncertain = fuse_scores(
                 rule_scores,
                 bert_scores,
                 cnn_scores,
-                llm_out,
-                cnn3_conf
-            )
+                r.get("llm_label", "unknown"),
+                r.get("llm_conf", 0.0),
+                cnn3_conf)
 
         # ---------- DEBUG INFO ----------
         debug_info = {
             "final_label": final_label,
             "uncertain": uncertain,
-            "final_scores": final_scores
-        }
+            "final_scores": final_scores}
 
         # ---------- FINAL OUTPUT ----------
         final_records.append({
@@ -480,12 +466,13 @@ def run_final_fusion(records, llm_results):
             "BERT": r.get("bert_label"),
             "CNN1top3": json.dumps(r.get("cnn1_top3", [])),
             "CNN2top3": json.dumps(r.get("cnn2_top3", [])),
-            "LLM": llm_out[0],
+            "LLM": r.get("llm_label", "unknown"),
+
 
             "BERT_score": r.get("bert_score", 0.0),
             "CNN1_scores": json.dumps(r.get("cnn1_scores", {})),
             "CNN2_scores": json.dumps(r.get("cnn2_scores", {})),
-            "LLM_conf": llm_out[1],
+            "LLM_conf": r.get("llm_conf", 0.0),
 
             "Final Scores": json.dumps(final_scores),
             "Begründung": json.dumps(debug_info),
@@ -637,23 +624,6 @@ def get_image_from_row(row):
 # ============================================================
 # Harte Regeln
 # ============================================================
-
-RULE_LABELS_ORDER = [
-    "ct",
-    "us",
-    "mrt_hirn",
-    "mrt_body",
-    "xray_fluoroskopie_angiographie",
-    "ct_kombimodalitaet_spect+ct_pet+ct",
-    "xray",
-
-    "microscopy",
-    "pathology",
-    "surgery_real",
-    "endoscopy",
-    "chart_or_diagram",
-]
-
 MRT_HIRN_T1_SHORT = [
     r"\bbrain\b.*\bt1\b",
     r"\bhead\b.*\bt1\b",
@@ -1120,9 +1090,6 @@ RULES_LONG = [
     ("chart_or_diagram", CHART_RULES_LONG),
 ]
 
-def contains_any(text: str, patterns: List[str]) -> bool:
-    return any(re.search(p, text) for p in patterns)
-
 def rule_based_classify_with_rules(text: str, rules, label_priority=None):
 
     t = normalize_for_rules(text)
@@ -1296,20 +1263,6 @@ def predict_with_cnn(model, image, transform, device, class_names):
 
     except Exception:
         return [], {}
-
-def run_cnn(model, image, transform, device):
-    if image is None:
-        return "unknown"
-
-    try:
-        img_tensor = transform(image).unsqueeze(0).to(device)
-        with torch.no_grad():
-            output = model(img_tensor)
-            _, pred = torch.max(output, 1)
-        return str(pred.item())
-    except:
-        return "unknown"
-
 
 # ============================================================
 # Fast pre-sampling (nur Rules)
@@ -1727,7 +1680,6 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
     CNN3_MEDIUM = 0.65
     rule_conf = max(rule_scores.values())
     bert_conf = max(bert_scores.values())
-    cnn_conf = max(cnn_scores.values())
     if cnn3_full:
         cnn3_conf = max(cnn3_full.values())
     else:
@@ -1736,36 +1688,30 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
         # sehr sicher Rauswurf
         r["is_filtered"] = True
         r["filter_reason"] = "cnn3_strong"
-
-        print(f"CNN3Filt {cnn3_pred} {cnn3_conf}")
-
         return r
 
     elif cnn3_conf >= CNN3_MEDIUM:
         # unsicher. nur filtern wenn andere schwach
         if bert_conf <= 0.5 and cnn_conf <= 0.5:
-            return {"filtered": True, "reason": "cnn3_medium"}
-
-    # =========================
-    # Filtering Entscheidung ueber CNN1/CNN2/RULES/BERT-einzelweises Scoring
-    # =========================
+            r["is_filtered"] = True
+            r["filter_reason"] = "cnn3_medium"
+            return r
     # Idee:
-    # CNN3 darf nur filtern, wenn: Konsens
+    # CNN3 darf nur filtern, wenn:
+    # - Konsens, - andere Modelle nicht stark sind
     # - gehört zu Filterklassen
-    # - CNN3 ziemlich sicher
-    # - andere Modelle nicht stark sind
-
+    # - CNN3 ziemlich sicher ist
     CNN3_CONF_MIN = 0.745  # (0.55) aber hochgetan: Ueber 0.745 sind es Trash-Bilder
     PRE_CONF_MAX = 0.7  # (0.35) (0.66) aber hochgedrillt: nach 0.7 sind sich die anderen modelle sicher
     # Klassen der Modelle muessen >0.7 haben. Muellmann moechte nur >=0.75.
     # Wenn Muellmann selbst unsicher ist, ist >0.7 gut genug, um als Klasse angenommen zu werden
-
     if (
-            cnn3_conf > CNN3_CONF_MIN and
-            bert_conf < PRE_CONF_MAX and
-            cnn_conf < PRE_CONF_MAX
-    ):
-        return {"filtered": True, "reason": "noconsent"}
+        cnn3_conf > CNN3_CONF_MIN and
+        bert_conf < PRE_CONF_MAX and
+        cnn_conf < PRE_CONF_MAX):
+        r["is_filtered"] = True
+        r["filter_reason"] = "noconsent"
+        return r
     # =========================
     # Quick Fusion (ohne LLM) laeuft schneller
     # Rules macht subset. pre_fuse Fusioniert Rules/CNN/BERT. LLM nur bei unsicheren Faellen als Richter
@@ -1813,7 +1759,7 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
     if conflict_level == 3:
         if cnn_conf > 0.6 and cnn_margin > 0.17:
             use_llm = False  # CNN sicher.CNN entscheidet
-        elif rule_conf >= 1.0 and conflict_level == 1:
+        elif rule_conf >= 1.0 and rule_conf == 1:
             use_llm = False  # Rule_conf immer 1 wenn R. findet, aber mindestens conf lvl soll gelten
         elif bert_conf >= 0.75:
             use_llm = False  # BERT sicher. entscheidet
@@ -1880,15 +1826,11 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
         use_llm = False
 
     if not use_llm:
-        r.update({
-            "final_label": quick_label,
-            "llm_needed": False
-        })
+        r["final_label"] = quick_label
+        r["llm_needed"] = False
     else:
-        r.update({
-            "quick_label": quick_label,
-            "llm_needed": True
-        })
+        r["quick_label"] = quick_label
+        r["llm_needed"] = True
 
     # =========================
     # Debug + Speicherung
@@ -1901,6 +1843,14 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
 
         "final_label": quick_label if not use_llm else None,
         "quick_label": quick_label,
+        "quick_scores": quick_scores,
+
+        "rule_pred": rule_pred,
+        "bert_pred": bert_pred,
+        "cnn_pred": cnn_pred,
+        "bert_conf": bert_conf,
+        "cnn3_pred": cnn3_pred,
+
         "llm_needed": use_llm,
 
         "rule_scores": rule_scores,
@@ -1918,14 +1868,20 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
 
     return result
 
-def process_batch(records0, ctx):
+def process_batch(
+    presample,
+    ctx,
+    cnn_thresh=0.82,
+    bert_thresh=0.88,
+    cnn_margin_thresh=0.18):
+
     processed = []
     filtered_counts = Counter()
     # Parallele Verarbeitung
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures = [
-            ex.submit(process_single_record, r, ctx)
-            for r in records0]
+            ex.submit(process_single_record, r, ctx, None, cnn_thresh, bert_thresh, cnn_margin_thresh)
+            for r in presample]
 
         for fut in tqdm(
                 as_completed(futures),
@@ -1945,8 +1901,8 @@ def process_batch(records0, ctx):
                 filtered_counts["unknown"] += 1
                 continue
 
-            if out.get("filtered"):         #cnn3certainty & cnn-uncertainty & Konsens R/B/C-Modelle
-                filtered_counts[out.get("reason", "unknown")] += 1
+            if out.get("is_filtered"):         #cnn3certainty & cnn-uncertainty & Konsens R/B/C-Modelle
+                filtered_counts[out.get("filter_reason", "unknown")] += 1
                 continue
 
             # ============
@@ -1989,27 +1945,20 @@ def count_labels(records):
 # ============================================================
 def fast_local_balancing(existing, pool, per_class):
     buckets = {c: [] for c in FINAL_CLASSES}
-
     # EXISTING
-
     for r in existing:
-
         label = r.get("final_label")
-
         if label in FINAL_CLASSES:
             buckets[label].append(r)
 
     used = set(
         (r["pmc_id"], r["row_id"])
-        for r in existing
-    )
+        for r in existing)
 
     # Aus presamp. Deterministisch
-
     pool = sorted(pool, key=stable_hash_record)
 
     # FILL
-
     for r in pool:
         key = (r["pmc_id"], r["row_id"])
 
@@ -2031,28 +1980,19 @@ def fast_local_balancing(existing, pool, per_class):
 
         if done:
             break
-
     # FINAL
-
     final = []
-
     for c in FINAL_CLASSES:
-
-        bucket = sorted(
-            buckets[c],
-            key=stable_hash_record
-        )
+        bucket = sorted(buckets[c],
+            key=stable_hash_record)
 
         final.extend(bucket[:per_class])
-
     return final
 
 # ============================================================
 # PRESAMPLE AUS GROSSEM DATASET
 # ============================================================
-
 def sample_new_chunk(ds, global_used, sample_size=100):
-
     candidates = []
 # --------------------------------------------------------
 # Hash-stabile Reihenfolge
@@ -2099,48 +2039,22 @@ def sample_new_chunk(ds, global_used, sample_size=100):
     return selected
 
 # ============================================================
-# Volle Inferenz
-# ============================================================
-def run_full_inference(records, ctx):
-    processed = []
-    llm_results = []
-
-    for r in records:
-        out = process_single_record(r, ctx)
-
-        if out is None:
-            continue
-
-        if out.get("is_filtered"):
-            continue
-
-        processed.append(out)
-        # Dummy LLM Result
-        llm_results.append(("unknown", 0.0))
-
-    initial_records = run_final_fusion(processed, llm_results)
-
-    return initial_records
-
-# ============================================================
 # Hauptpipeline
 # ============================================================
 def build_balanced_dataset(
         ds,
         ctx,
+        llm,
         existing_records,
         initial_presample,
         refill_presample,
         per_class,
-        max_rounds
-):
+        max_rounds):
     # --------------------------------------------------------
     # Global
     # --------------------------------------------------------
     accepted_records = list(existing_records)
-
     remaining_pool = []
-
     # echte Dublettenkontrolle
     global_used = set()
 
@@ -2148,7 +2062,6 @@ def build_balanced_dataset(
     # Refill State
     # ========================================================
     refill_cursor = 0
-
     stagnation_counter = 0
 
     # ========================================================
@@ -2174,11 +2087,10 @@ def build_balanced_dataset(
 
         done = all(
             counts[c] >= per_class
-            for c in FINAL_CLASSES
-        )
+            for c in FINAL_CLASSES)
 
         if done:
-            print("\n✔ Dataset vollständig balanced")
+            print("\nDataset vollständig balanced")
             break
 
         # ====================================================
@@ -2186,8 +2098,7 @@ def build_balanced_dataset(
         # ====================================================
         missing_classes = {
             cls for cls in FINAL_CLASSES
-            if counts[cls] < per_class
-        }
+            if counts[cls] < per_class}
 
         print("\nFehlende Klassen:")
         print(missing_classes)
@@ -2247,7 +2158,6 @@ def build_balanced_dataset(
         # Dataset Ende?
         # ====================================================
         if refill_cursor >= len(ds):
-
             print("\nDataset vollständig durchsucht.")
             break
 
@@ -2256,14 +2166,12 @@ def build_balanced_dataset(
         # ====================================================
         start_idx = refill_cursor
 
-        end_idx = min(len(ds),
-            refill_cursor + sample_size)
+        end_idx = min(len(ds), refill_cursor + sample_size)
 
         print(f"\nChunk: {start_idx} -> {end_idx}")
 
         candidate_chunk = ds.select(
-            range(start_idx, end_idx)
-        )
+            range(start_idx, end_idx))
 
         indices = list(range(len(candidate_chunk)))
 
@@ -2277,7 +2185,6 @@ def build_balanced_dataset(
         # ====================================================
         # Raw Arrow -> Standard Records
         # ====================================================
-
         presample = []
 
         for local_idx, row in enumerate(candidate_chunk):
@@ -2322,36 +2229,33 @@ def build_balanced_dataset(
             presample.append(record)
 
         print("Nach global_used:", len(presample))
+        processed = process_batch(
+                        presample,
+                        ctx,
+                        cnn_thresh=cnn_thresh,
+                        bert_thresh=bert_thresh,
+                        cnn_margin_thresh=cnn_margin_thresh)
 
+        processed = run_llm_stage(processed, llm)
+
+        processed = run_final_fusion(processed)
         if len(presample) == 0:
             print("\nLeerer Presample Chunk")
             continue
-        # ====================================================
-        # Full Inference
-        # ====================================================
-        print("\nFull inference ...")
-
-        processed = run_full_inference(presample, ctx)
-
-        print("Processed:", len(processed))
 
         # ====================================================
         # Existing Keys
         # ====================================================
         accepted_keys = set(
             (r["pmc_id"], r["row_id"])
-            for r in accepted_records
-        )
-
+            for r in accepted_records)
         new_accepts = []
-
         new_remaining = []
 
         # ====================================================
         # Process Results
         # ====================================================
         for r in processed:
-
             key = (r["pmc_id"], r["row_id"])
 
             # --------------------------------------------
@@ -2375,13 +2279,10 @@ def build_balanced_dataset(
             if label not in missing_classes:
                 new_remaining.append(r)
                 continue
-
             # --------------------------------------------
             # Counts aktualisieren
             # --------------------------------------------
-            counts = count_labels(
-                accepted_records + new_accepts
-            )
+            counts = count_labels(accepted_records + new_accepts)
 
             # --------------------------------------------
             # Klasse bereits voll?
@@ -2402,7 +2303,6 @@ def build_balanced_dataset(
             rule_pred = r.get("rule_pred")
 
             accept = False
-
             # --------------------------------------------
             # Rules dominant
             # --------------------------------------------
@@ -2412,18 +2312,13 @@ def build_balanced_dataset(
             # --------------------------------------------
             # CNN akzeptieren
             # --------------------------------------------
-            elif (
-                cnn_conf >= cnn_thresh
-                and cnn_margin >= cnn_margin_thresh
-            ):
+            elif (cnn_conf >= cnn_thresh and cnn_margin >= cnn_margin_thresh):
                 accept = True
 
             # --------------------------------------------
             # BERT akzeptieren
             # --------------------------------------------
-            elif (
-                bert_conf >= bert_thresh
-            ):
+            elif (bert_conf >= bert_thresh):
                 accept = True
 
             # --------------------------------------------
@@ -2433,9 +2328,7 @@ def build_balanced_dataset(
                 new_accepts.append(r)
             else:
                 new_remaining.append(r)
-                # ====================================================
                 # Fehlversuch zählen
-                # ====================================================
                 failed_counter += 1
 
         # ====================================================
@@ -2445,9 +2338,10 @@ def build_balanced_dataset(
 
         remaining_pool.extend(new_remaining)
 
+        before_counts = count_labels(accepted_records)
+
         print("\nNeue Accepts:", len(new_accepts))
         print("Remaining pool:", len(remaining_pool))
-
         # ====================================================
         # Fast Local Balancing
         # ====================================================
@@ -2460,10 +2354,9 @@ def build_balanced_dataset(
         # Status nach Balancing
         # ====================================================
         print("\nNach local balancing:")
+        after_counts = count_labels(accepted_records)
 
-        counts = count_labels(accepted_records)
-
-        refill_added = sum(counts.values()) - sum(counts.values())
+        refill_added =  sum(after_counts.values()) - sum(before_counts.values())
 
         print(f"\nRefill Added: {refill_added}")
 
@@ -2488,21 +2381,16 @@ def build_balanced_dataset(
     # Final Dedup
     # ========================================================
     final = []
-
     seen = set()
 
     for r in accepted_records:
-
         key = (
             r["pmc_id"],
-            r["row_id"]
-        )
-
+            r["row_id"])
         if key in seen:
             continue
 
         seen.add(key)
-
         final.append(r)
 
     # ========================================================
@@ -2518,6 +2406,73 @@ def build_balanced_dataset(
         print(c, counts[c])
 
     return final
+
+def run_llm_stage(records, llm):
+    llm_needed_count = sum(
+        r.get("llm_needed", False)
+        for r in records)
+
+    no_llm_count = sum(
+        not r.get("llm_needed", False)
+        for r in records)
+
+    total_count = len(records)
+
+    print("\n===== LLM USAGE =====")
+    print(f"LLM nötig:      {llm_needed_count}")
+    print(f"Ohne LLM:       {no_llm_count}")
+    print(f"Gesamt:         {total_count}")
+
+    if total_count > 0:
+        print(f"LLM Anteil: {llm_needed_count / total_count * 100:.2f}%")
+    # =====================================================
+    # Nur LLM-Fälle sammeln
+    # =====================================================
+    texts = []
+    llm_indices = []
+    for i, r in enumerate(records):
+        if r.get("llm_needed", False):
+            text = r.get("caption", "")
+            if not isinstance(text, str):
+                text = str(text)
+
+            texts.append(text)
+            llm_indices.append(i)
+
+    # =====================================================
+    # Keine LLM Fälle
+    # =====================================================
+    if len(texts) == 0:
+        for r in records:
+            r["llm_label"] = r.get("quick_label", "unknown")
+            r["llm_conf"] = 0.0
+        return records
+
+    # =====================================================
+    # LLM INFERENZ
+    # =====================================================
+    llm_results = llm.batch_predict(texts)
+
+    # =====================================================
+    # Mapping zurück
+    # =====================================================
+    for idx, (label, conf) in zip(llm_indices, llm_results):
+
+        records[idx]["llm_label"] = label
+        records[idx]["llm_conf"] = conf
+
+    # =====================================================
+    # Defaults für Nicht-LLM
+    # =====================================================
+
+    for r in records:
+        if "llm_label" not in r:
+            r["llm_label"] = r.get(
+                "quick_label",
+                "unknown")
+            r["llm_conf"] = 0.0
+
+    return records
 
 # ============================================================
 # Inspizieren/Distr/Debug/Übersicht
@@ -2717,77 +2672,53 @@ def classify_dataset(
         cnn2_model,
         cnn3_model,
         cnn_transform,
-        device
-    )
+        device)
+
     # ============================================================
     # Phase 3: Records sammeln (ohne LLM)
     # ============================================================
-
     print("\nExtrahiere Records + RULES + CNN + BERT ...")
     print("\nPhase 3: CNN + BERT auf Subset")
     records = process_batch(records0, ctx)
     print("records nach batch:", len(records))
-
     # ============================================================
-    # Phase 4: LLM nur bei unsicheren Fällen
+    # Phase 4: LLM initialisieren
     # ============================================================
-
     print("\nInitialize LLaMa Mistral ...")
     llm = LocalLLM(model_path=llamamistral_path)
-    #debug
-    llm_needed_count = sum(r.get("llm_needed", False) for r in records)
-    no_llm_count = sum(not r.get("llm_needed", False) for r in records)
-    total_count = len(records)
-
-    print("\n===== LLM USAGE =====")
-    print(f"LLM nötig:      {llm_needed_count}")
-    print(f"Ohne LLM:       {no_llm_count}")
-    print(f"Gesamt:         {total_count}")
-    print(f"LLM Anteil:     {llm_needed_count / total_count * 100:.2f}%")
-    texts = [r["caption"] for r in records if r.get("llm_needed", False)]
-    for r in records[:20]:
-        print(r.keys())
-        break
-    llm_results_partial = llm.batch_predict(texts)
-
-    # Mapping zurück
-    llm_iter = iter(llm_results_partial)
-
-    llm_results = []
-    for r in records:
-        if r.get("llm_needed", False):
-            llm_results.append(next(llm_iter))
-        else:
-            llm_results.append((r.get("final_label", "unknown"), 0.5))  # fake confidence
+    records = run_llm_stage(records, llm)
 
     # ============================================================
-    # Volle iterative Build Pipeline: Phase 5: Final fusion, Phase 6: Post-Balancing
+    # Phase 5: Final fusion
+    records = run_final_fusion(records)
+
+    existing_records = records
     # ============================================================
-    records = build_balanced_dataset(
-        ds=ds,
-        ctx=ctx,
-        existing_records=run_final_fusion(records, llm_results),
-        per_class=per_class,
-        # erstes großes Presample
-        initial_presample=initial_presample,
-        #100
-        # spätere Nachlade-Chunks
-        refill_presample=refill_presample,
-        #100
-        # Sicherheitslimit
-        max_rounds=max_rounds
-        #20
-    )
-# ============================================================
-# Phase 7: Bilder speichern (f. Viewer)
-# ============================================================
+    # Volle iterative Build Pipeline:
+    # Phase 6: Post-Balancing
+    # ============================================================
+
+    records = build_balanced_dataset(ds,
+        ctx,
+        llm,
+        existing_records,
+        initial_presample,
+        refill_presample,
+        per_class,
+        max_rounds)
+    # ============================================================
+    # Phase 7: Bilder speichern (f. Viewer)
+    # ============================================================
     image_output_dir = output_csv.parent / "exported_images"
 
     print("\nSpeichere ausgewählte Bilder ...")
     save_selected_images(records, image_output_dir)
-# ============================================================
-# Phase 8: Endergebnisse Head ausgeben
-# ============================================================
+    # ============================================================
+    # Phase 8: Endergebnisse Head ausgeben
+    # ============================================================
+    # existing_records haben 'row', entfernen>nicht explodiert
+    for r in records:
+        r.pop("row", None)
     df = pd.DataFrame(records)
 
     empty_mask = df["caption"].fillna("").astype(str).str.strip().eq("")
@@ -2830,6 +2761,7 @@ def classify_dataset(
     print("\n===== DEBUG =====")
     print("LLM needed:", sum(r.get("llm_needed", False) for r in records))
     print("No LLM:", sum(not r.get("llm_needed", False) for r in records))
+
 # ============================================================
 # CLI
 # ============================================================
