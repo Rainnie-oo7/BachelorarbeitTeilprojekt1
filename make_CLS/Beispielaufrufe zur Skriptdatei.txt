@@ -3,23 +3,16 @@
 #################################################################
 python make_CLS/pipeline_0.py \
   --dataset_root /home/user/PycharmProjects/ba1pmc/PMC-41GB \
-  --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/test_500.csv \
-  --biomedbert_path /home/user/Dokumente/biomedbert \
-  --llamamistral_path /home/user/Dokumente/LLaMa_Mistral \
-  --cnn1_path /home/user/Dokumente/cnn1/convu_try_3t.pth \
-  --cnn2_path /home/user/Dokumente/cnn2/convu_folderlabel_mrt_body_mrt_hirn.pth \
-  --cnn3_path /home/user/Dokumente/cnn3/cnn_multiclass.pth \
-  --per_class 50 \
-  --limit 50
-
-python make_CLS/pipeline_0.py \
-  --dataset_root /home/user/PycharmProjects/ba1pmc/PMC-41GB \
   --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/test_per5.csv \
   --biomedbert_path /home/user/Dokumente/biomedbert \
   --llamamistral_path /home/user/Dokumente/LLaMa_Mistral \
   --cnn1_path /home/user/Dokumente/cnn1/convu_try_3t.pth \
   --cnn2_path /home/user/Dokumente/cnn2/convu_folderlabel_mrt_body_mrt_hirn.pth \
   --cnn3_path /home/user/Dokumente/cnn3/cnn_multiclass.pth
+  --cnn_thresh 0.82 \
+  --bert_thresh 0.88 \
+  --cnn_margin_thresh 0.18 \
+  --micro_round_failures 40
   > log300test_per5.txt 2>&1
 ##########################private################################
 python make_CLS/pipeline_0.py \
@@ -29,19 +22,12 @@ python make_CLS/pipeline_0.py \
   --llamamistral_path /home/b/Dokumente/LLaMa_Mistral \
   --cnn1_path /home/b/Dokumente/cnn1/convu_try_3t.pth \
   --cnn2_path /home/b/Dokumente/cnn2/convu_folderlabel_mrt_body_mrt_hirn.pth \
-  --cnn3_path /home/b/Dokumente/cnn3/cnn_multiclass.pth
+  --cnn3_path /home/b/Dokumente/cnn3/cnn_multiclass.pth \
+  --cnn_thresh 0.60 \
+  --bert_thresh 0.68 \
+  --cnn_margin_thresh 0.07 \
+  --micro_round_failures 40
   > log300test_per5.txt 2>&1
-
-python make_CLS/pipeline_0.py \
-  --dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB  \
-  --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/test_per10.csv  \
-  --biomedbert_path /home/b/Dokumente/biomedbert  \
-  --llamamistral_path /home/b/Dokumente/LLaMa_Mistral  \
-  --cnn1_path /home/b/Dokumente/cnn1/convu_try_3t.pth   \
-  --cnn2_path /home/b/Dokumente/cnn2/convu_folderlabel_mrt_body_mrt_hirn.pth   \
-  --cnn3_path /home/b/Dokumente/cnn3/cnn_multiclass.pth   \
-  --per_class 3   \
-  --inspectlimit 70
 
 #################################################################
 # PMC-VIEWER

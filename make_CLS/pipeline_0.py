@@ -18,7 +18,11 @@ python make_CLS/pipeline_0.py \
   --cnn1_path /home/user/Dokumente/cnn1/convu_try_3t.pth \
   --cnn2_path /home/user/Dokumente/cnn2/convu_folderlabel_mrt_body_mrt_hirn.pth \
   --cnn3_path /home/user/Dokumente/cnn3/cnn_multiclass.pth
-  > log.txt 2>&1
+  --cnn_thresh 0.82 \
+  --bert_thresh 0.88 \
+  --cnn_margin_thresh 0.18 \
+  --micro_round_failures 40
+  > log300test_per5.txt 2>&1
 """
 
 from __future__ import annotations
@@ -1587,7 +1591,7 @@ def top_label(scores):
 # ============================================================
 # Verarbeitung (Ph. 3)
 # ============================================================
-def process_single_record(r, ctx: ModelContext):
+def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_margin_thresh):
     """
     Das ist mein Phase-3 Code für ein Sample
     (Rules + CNN + BERT + LLM Entscheidung)
@@ -1702,27 +1706,30 @@ def process_single_record(r, ctx: ModelContext):
     bert_pred = top_label(bert_scores)
     cnn_pred = top_label(cnn_scores)
 
-    # ============================================================
-    # Nur fehlende Klassen weiter prüfen
-    # ============================================================
-    if missing_classes is not None:
-        if (
-                rule_pred not in missing_classes
-                and cnn_pred not in missing_classes
-                and bert_pred not in missing_classes
-        ):
-            return None
-    conflict_level = len({rule_pred, bert_pred, cnn_pred})
-    #cnn_conf oben schon definiert
-    bert_conf = max(bert_scores.values()) if bert_scores else 0.0
+    conflict_level = len({
+        rule_pred,
+        bert_pred,
+        cnn_pred})
 
-    BERT_STRONG = 0.75
+    # ============================================================
+    # Unsicherheit
+    # ============================================================
+    # cnn_uncertain = (
+    #         cnn_conf < cnn_thresh
+    #         or cnn_margin < cnn_margin_thresh
+    # )
+
+    bert_uncertain = (
+            bert_conf < bert_thresh
+    )
+
+    BERT_EIGENTLICH_STRONG = 0.75
     CNN_EIGENTLICH_STRONG = 0.675
+    # ============================================================
+    # LLM nötig?
+    # ============================================================
 
-    # =========================
-    # LLM Entscheidung
-    # =========================
-    use_llm = False #default
+    use_llm = False
 
     # 🔴 Fall 1: CNN unsicher + kein Konsens
     if cnn_uncertain and conflict_level >= 2:
@@ -1736,7 +1743,7 @@ def process_single_record(r, ctx: ModelContext):
             use_llm = False  # Rule_conf immer 1 wenn R. findet, aber mindestens conf lvl soll gelten
         elif bert_conf >= 0.75:
             use_llm = False  # BERT sicher. entscheidet
-       # 🔴
+        # 🔴
         elif rule_pred != cnn_pred and bert_pred != cnn_pred:
             use_llm = True
         else:
@@ -1778,12 +1785,12 @@ def process_single_record(r, ctx: ModelContext):
     # 🔴 Fall 5: Konflikt gegeben, CNN weiss es mittelmaessig
     elif conflict_level >= 2 and 0.49 <= cnn_conf < CNN_EIGENTLICH_STRONG:
         use_llm = True
-    # 🔴 Fall 6: Konflikt gegeben, CNN weiss es mittelmaessig, keine Diskrepanz
-    elif conflict_level >= 2 and cnn_margin <= 0.024:
+    # 🔴 Fall 6: Konflikt gegeben, CNN kann nicht konkretisieren
+    elif conflict_level == 3 and cnn_margin <= 0.024:
         use_llm = True
 
     # 🟢 Fall 7: BERT stark + CNN stabil
-    elif bert_conf >= BERT_STRONG:
+    elif bert_conf >= BERT_EIGENTLICH_STRONG:
         use_llm = False
         print(
             f"R:{rule_pred} "
@@ -1794,7 +1801,6 @@ def process_single_record(r, ctx: ModelContext):
             f"| margin={cnn_margin:.2f} "
             f"| LLM={use_llm}"
         )
-    
     else:
         use_llm = False
 
@@ -1834,28 +1840,41 @@ def process_single_record(r, ctx: ModelContext):
     }
 
     return result
-
 def process_batch(
     presample,
-    ctx):
+    ctx,
+    cnn_thresh,
+    bert_thresh,
+    cnn_margin_thresh):
 
     processed = []
     filtered_counts = Counter()
+
     # Parallele Verarbeitung
     with ThreadPoolExecutor(max_workers=4) as ex:
+
         futures = [
-            ex.submit(process_single_record, r, ctx, None)
-            for r in presample]
+            ex.submit(
+                process_single_record,
+                r,
+                ctx,
+                cnn_thresh,
+                bert_thresh,
+                cnn_margin_thresh
+            )
+            for r in presample
+        ]
 
         for fut in tqdm(
                 as_completed(futures),
                 total=len(futures),
                 desc="Processing"):
-
             try:
                 out = fut.result()
+
             except Exception as e:
                 filtered_counts["thread_exception"] += 1
+
                 print("\nThread Error")
                 print(e)
 
@@ -1865,14 +1884,14 @@ def process_batch(
                 filtered_counts["unknown"] += 1
                 continue
 
-            if out.get("is_filtered"):         #cnn3certainty & cnn-uncertainty & Konsens R/B/C-Modelle
-                filtered_counts[out.get("filter_reason", "unknown")] += 1
+            if out.get("is_filtered"): #cnn3certainty & cnn-uncertainty & Konsens R/B/C-Modelle
+                filtered_counts[
+                    out.get("filter_reason", "unknown")
+                ] += 1
                 continue
 
-            # ============
-            # Keep
-            # ============
             processed.append(out)
+
     print(f"\nFiltered: {filtered_counts}")
     print(f"records nach batch: {len(processed)}")
 
@@ -2013,7 +2032,12 @@ def build_balanced_dataset(
         initial_presample,
         refill_presample,
         per_class,
-        max_rounds):
+        max_rounds,
+
+        cnn_thresh,
+        bert_thresh,
+        cnn_margin_thresh,
+        micro_round_failures):
     # --------------------------------------------------------
     # Global
     # --------------------------------------------------------
@@ -2070,11 +2094,10 @@ def build_balanced_dataset(
             print("Alle Klassen gefüllt.")
             break
         # ====================================================
-        # Micro Decay. Alle x erfolglosen Samples Thresholds leicht lockern. Hauptrounds erhalten trotzdem urspruenglichen Decay-Wert!
+        # Micro Decay. Alle micro_round_failures erfolglosen Samples Thresholds leicht lockern. Hauptrounds erhalten trotzdem urspruenglichen Decay-Wert!
         # 2it/sek =/= micro round duration ~2.1 min. DENN Erfolge+Fehlversuche dabei
         # ====================================================
-        x = 40
-        micro_round = global_failed_counter // x
+        micro_round = global_failed_counter // micro_round_failures
 
         effective_round = round_idx + micro_round
 
@@ -2085,21 +2108,21 @@ def build_balanced_dataset(
         # Adaptive Thresholds
         # ====================================================
         cnn_thresh = adaptive_threshold(
-            start=0.82,
+            start=cnn_thresh,
             min_value=0.55,
             refill_round=effective_round,
             decay=0.04
         )
 
         bert_thresh = adaptive_threshold(
-            start=0.88,
+            start=bert_thresh,
             min_value=0.60,
             refill_round=effective_round,
             decay=0.035
         )
 
         cnn_margin_thresh = adaptive_threshold(
-            start=0.18,
+            start=cnn_margin_thresh,
             min_value=0.08,
             refill_round=effective_round,
             decay=0.015
@@ -2198,7 +2221,7 @@ def build_balanced_dataset(
                         ctx,
                         cnn_thresh=cnn_thresh,
                         bert_thresh=bert_thresh,
-                        cnn_margin_thresh=cnn_margin_thresh)
+                        cnn_margin_thresh=cnn_margin_thresh)    #die tresholds von adaptive trehsolds, die die treshs von parser.add_arg haben
 
         processed = run_llm_stage(processed, llm)
 
@@ -2566,6 +2589,12 @@ def classify_dataset(
     initial_presample: int,
     refill_presample: int,
     max_rounds: int,
+
+    cnn_thresh: float,
+    bert_thresh: float,
+    cnn_margin_thresh: float,
+    micro_round_failures: int,
+
     inspect_only: bool = False,
 ):
     device = "cpu"
@@ -2636,7 +2665,7 @@ def classify_dataset(
     # ============================================================
     print("\nExtrahiere Records + RULES + CNN + BERT ...")
     print("\nPhase 3: CNN + BERT auf Subset")
-    records = process_batch(records0, ctx)
+    records = process_batch(records0, ctx, cnn_thresh, bert_thresh, cnn_margin_thresh)
     print("records nach batch:", len(records))
     # ============================================================
     # Phase 4: LLM initialisieren
@@ -2662,7 +2691,12 @@ def classify_dataset(
         initial_presample,
         refill_presample,
         per_class,
-        max_rounds)
+        max_rounds,
+
+        cnn_thresh,
+        bert_thresh,
+        cnn_margin_thresh,
+        micro_round_failures)
     # ============================================================
     # Phase 7: Bilder speichern (f. Viewer)
     # ============================================================
@@ -2792,6 +2826,30 @@ def parse_args():
         help="Anzahl Sicherheitslimit im Refill (=Runden Runs Durchlaeufe)"
     )
     parser.add_argument(
+        "--cnn_thresh",
+        type=float,
+        default=0.82,
+        help="CNN confidence threshold für sichere Entscheidungen"
+    )
+    parser.add_argument(
+        "--bert_thresh",
+        type=float,
+        default=0.88,
+        help="BERT confidence threshold für sichere Entscheidungen"
+    )
+    parser.add_argument(
+        "--cnn_margin_thresh",
+        type=float,
+        default=0.18,
+        help="CNN Margin Threshold zwischen Top1 und Top2"
+    )
+    parser.add_argument(
+        "--micro_round_failures",
+        type=int,
+        default=40,
+        help="Anzahl erfolgloser Samples bis Micro-Round erhöht wird"
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -2838,6 +2896,12 @@ def main():
         initial_presample=args.initial_presample,
         refill_presample=args.refill_presample,
         max_rounds=args.max_rounds,
+
+        cnn_thresh=args.cnn_thresh,
+        bert_thresh=args.bert_thresh,
+        cnn_margin_thresh=args.cnn_margin_thresh,
+        micro_round_failures=args.micro_round_failures,
+
         inspect_only=args.inspect_only,
     )
 
