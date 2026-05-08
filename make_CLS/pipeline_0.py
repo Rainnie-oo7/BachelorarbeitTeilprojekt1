@@ -122,13 +122,157 @@ CNN2_CLASS_COUNTS_RAW = {
     "mrt_body": 32006
 }
 WEIGHTS = {
-    "rules": 0.2,
-    "bert": 0.2,
-    "cnn": 0.4,
-    "llm": 0.2,
+    "rules": 0.333,
+    "bert": 0.333,
+    "cnn": 0.333,
+    # "llm": 0.2,
 
     "cnn3": 0.3
 }
+# ALLGEMEINE TIERE
+ANIMAL_TERMS = [
+    # Maus / Ratte / Nagetiere
+    r"\bmouse\b",
+    r"\bmice\b",
+    r"\bmurine\b",
+    r"\bmus musculus\b",
+
+    r"\brat\b",
+    r"\brats\b",
+    r"\brattus\b",
+    r"\brattus norvegicus\b",
+
+    r"\bwistar\b",
+    r"\bwistar rat\b",
+    r"\bsprague[- ]dawley\b",
+    r"\bsprague dawley\b",
+    r"\blong[- ]evans\b",
+    r"\bfischer 344\b",
+    r"\bcd[- ]1\b",
+
+    r"\bguinea pig\b",
+    r"\bhamster\b",
+    r"\bgerbil\b",
+    r"\bvole\b",
+    # Kaninchen
+    r"\brabbit\b",
+    r"\brabbits\b",
+    r"\boryctolagus\b",
+    # Hunde / Katzen
+    r"\bdog\b",
+    r"\bdogs\b",
+    r"\bcanine\b",
+    r"\bcanines\b",
+    r"\bbeagle\b",
+
+    r"\bcat\b",
+    r"\bcats\b",
+    r"\bfeline\b",
+
+    # --------------------------------------------------------
+    # Schweine
+    # --------------------------------------------------------
+    r"\bpig\b",
+    r"\bpigs\b",
+    r"\bporcine\b",
+    r"\bswine\b",
+    r"\bmini[- ]pig\b",
+    r"\bgottingen\b",
+    # Affen / Primaten
+    r"\bmonkey\b",
+    r"\bmonkeys\b",
+    r"\bprimate\b",
+    r"\bprimate model\b",
+    r"\bmacaque\b",
+    r"\brhesus\b",
+    r"\bchimpanzee\b",
+    r"\bbaboon\b",
+    r"\bnonhuman primate\b",
+    r"\bnhp\b",
+    # Schafe / Ziegen / Rinder
+    r"\bsheep\b",
+    r"\bovine\b",
+    r"\bcow\b",
+    r"\bcalf\b",
+    r"\bgoat\b",
+    r"\bovine model\b",
+    # Pferde
+    r"\bhorse\b",
+    r"\bequine\b",
+    # Gefluegel / Vögel
+    r"\bchicken\b",
+    r"\bhen\b",
+    r"\bavian\b",
+    r"\bbird\b",
+    r"\bpoultry\b",
+    # Fisch / Amphibien
+    r"\bzebrafish\b",
+    r"\bfish\b",
+    r"\bxenopus\b",
+    r"\bfrog\b",
+    # Insekten
+    r"\bdrosophila\b",
+    r"\bfruit fly\b",
+    r"\binsect\b",
+    r"\bmosquito\b",
+    # Sonstiges
+    r"\banimal model\b",
+    r"\bexperimental animal\b",
+    r"\bpreclinical\b",
+    r"\bin vivo mouse\b",
+    r"\bin vivo rat\b",
+    r"\bmurine model\b",
+]
+
+ANIMAL_REGEX = re.compile(
+    "|".join(ANIMAL_TERMS),
+    flags=re.IGNORECASE)
+
+def contains_animal_terms(text: str):
+    # Gibt: (True, match) oder (False, None)
+    if not isinstance(text, str):
+        return False, None
+    match = ANIMAL_REGEX.search(text)
+    if match:
+        return True, match.group(0)
+    return False, None
+# MULTIPANEL FILTER
+MULTIPANEL_PATTERNS = [
+    # (A) (B) (C)
+    r"\([A-Z]\)",
+    r"\([a-z]\)",
+    # (A)- ...
+    r"\([A-Z]\)\s*[-:]",
+    r"\([a-z]\)\s*[-:]",
+    # panel A
+    r"\bpanel\s+[A-Z]\b",
+    r"\bpanel\s+[a-z]\b",
+    # Figure 2A
+    r"\bfig(?:ure)?\.?\s*\d+[A-Z]\b",
+    # A:
+    r"^[A-Z]\s*:",
+    r"^[a-z]\s*:",
+    # A.
+    r"^[A-Z]\.",
+    r"^[a-z]\.",
+    # multiple panels mention
+    r"\bpanels\b",
+    r"\bsubfigure\b",
+    r"\bsubfigures\b",
+]
+
+MULTIPANEL_REGEX = re.compile(
+    "|".join(MULTIPANEL_PATTERNS),
+    flags=re.IGNORECASE
+)
+
+def is_multipanel_caption(text: str):
+    if not isinstance(text, str):
+        return False, None
+    match = MULTIPANEL_REGEX.search(text)
+    if match:
+        return True, match.group(0)
+    return False, None
 
 # gen. LLM (vLLM READY)
 class LocalLLM:
@@ -442,8 +586,8 @@ def run_final_fusion(records):
             rule_scores=r["rule_scores"],
             bert_scores=r["bert_scores"],
             cnn_scores=r["cnn_scores"],
-            llm_label=r.get("llm_label"),
-            llm_conf=r.get("llm_conf", 0.0),
+            # llm_label=r.get("llm_label"),
+            # llm_conf=r.get("llm_conf", 0.0),
             cnn3_conf=r.get("cnn3_conf", 0.0)
         )
 
@@ -1312,10 +1456,28 @@ def early_balanced_sampling(ds, per_class, limit=None):
         text, meta = extract_text_from_row(row)
         text = normalize_text(text)
 
+        is_animal, animal_match = contains_animal_terms(text)
+
+        if is_animal:
+            # rejected_samples.append({
+            #     "reason": "animal_detected",
+            #     "matched_term": animal_match,
+            #     "caption": text
+            # })
+            continue
+
+        # MULTIPANEL FILTER
+        is_multi, multi_match = is_multipanel_caption(text)
+        if is_multi:
+            # rejected_samples.append({
+            #     "reason": "multipanel_caption",
+            #     "matched_term": multi_match,
+            #     "caption": text
+            # })
+            continue
+
         rule_pred, reason, matched, hits = rule_based_classify_with_rules(
             text, RULES_LONG, LABEL_PRIORITY)
-
-        # print(f"{rule_pred} | {text[:80]}")
 
         if rule_pred not in FINAL_CLASSES:
             continue
@@ -1698,111 +1860,111 @@ def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_ma
         r["filter_reason"] = "noconsent"
         return r
 
-    # =========================
-    # LLM Entscheidung KONFLIKT + CNN LOGIK
-    # =========================
-
     rule_pred = top_label(rule_scores)
     bert_pred = top_label(bert_scores)
     cnn_pred = top_label(cnn_scores)
-
-    conflict_level = len({
-        rule_pred,
-        bert_pred,
-        cnn_pred})
-
-    # ============================================================
-    # Unsicherheit
-    # ============================================================
-    # cnn_uncertain = (
-    #         cnn_conf < cnn_thresh
-    #         or cnn_margin < cnn_margin_thresh
+    # # =========================
+    # # LLM Entscheidung KONFLIKT + CNN LOGIK
+    # # =========================
+    #
+    #
+    # conflict_level = len({
+    #     rule_pred,
+    #     bert_pred,
+    #     cnn_pred})
+    #
+    # # ============================================================
+    # # Unsicherheit
+    # # ============================================================
+    # # cnn_uncertain = (
+    # #         cnn_conf < cnn_thresh
+    # #         or cnn_margin < cnn_margin_thresh
+    # # )
+    #
+    # bert_uncertain = (
+    #         bert_conf < bert_thresh
     # )
-
-    bert_uncertain = (
-            bert_conf < bert_thresh
-    )
-
-    BERT_EIGENTLICH_STRONG = 0.75
-    CNN_EIGENTLICH_STRONG = 0.675
-    # ============================================================
-    # LLM nötig?
-    # ============================================================
-
-    use_llm = False
-
-    # 🔴 Fall 1: CNN unsicher + kein Konsens
-    if cnn_uncertain and conflict_level >= 2:
-        use_llm = True
-
-    # 🟢 Fall 2: kompletter Konflikt LLM
-    if conflict_level == 3:
-        if cnn_conf > 0.6 and cnn_margin > 0.17:
-            use_llm = False  # CNN sicher.CNN entscheidet
-        elif rule_conf >= 1.0 and rule_conf == 1:
-            use_llm = False  # Rule_conf immer 1 wenn R. findet, aber mindestens conf lvl soll gelten
-        elif bert_conf >= 0.75:
-            use_llm = False  # BERT sicher. entscheidet
-        # 🔴
-        elif rule_pred != cnn_pred and bert_pred != cnn_pred:
-            use_llm = True
-        else:
-            use_llm = True
-        print(
-            f"R:{rule_pred} "
-            f"B:{bert_pred} "
-            f"C:{cnn_pred} "
-            f"| lvl={conflict_level} "
-            f"| conf={cnn_conf:.2f} "
-            f"| margin={cnn_margin:.2f} "
-            f"| LLM={use_llm}"
-        )
-
-    # 🟢 Fall 3: alles einig → KEIN LLM
-    elif conflict_level == 1:
-        use_llm = False
-        print(
-            f"R:{rule_pred} "
-            f"B:{bert_pred} "
-            f"C:{cnn_pred} "
-            f"| lvl={conflict_level} "
-            f"| conf={cnn_conf:.2f} "
-            f"| margin={cnn_margin:.2f} "
-            f"| LLM={use_llm}"
-        )
-    # 🟢 Fall 4: 2 stimmen überein + CNN sicher
-    elif conflict_level == 2 and cnn_conf > CNN_EIGENTLICH_STRONG and cnn_margin > 0.1:
-        use_llm = False
-        print(
-            f"R:{rule_pred} "
-            f"B:{bert_pred} "
-            f"C:{cnn_pred} "
-            f"| lvl={conflict_level} "
-            f"| conf={cnn_conf:.2f} "
-            f"| margin={cnn_margin:.2f} "
-            f"| LLM={use_llm}"
-        )
-    # 🔴 Fall 5: Konflikt gegeben, CNN weiss es mittelmaessig
-    elif conflict_level >= 2 and 0.49 <= cnn_conf < CNN_EIGENTLICH_STRONG:
-        use_llm = True
-    # 🔴 Fall 6: Konflikt gegeben, CNN kann nicht konkretisieren
-    elif conflict_level == 3 and cnn_margin <= 0.024:
-        use_llm = True
-
-    # 🟢 Fall 7: BERT stark + CNN stabil
-    elif bert_conf >= BERT_EIGENTLICH_STRONG:
-        use_llm = False
-        print(
-            f"R:{rule_pred} "
-            f"B:{bert_pred} "
-            f"C:{cnn_pred} "
-            f"| lvl={conflict_level} "
-            f"| conf={cnn_conf:.2f} "
-            f"| margin={cnn_margin:.2f} "
-            f"| LLM={use_llm}"
-        )
-    else:
-        use_llm = False
+    #
+    # BERT_EIGENTLICH_STRONG = 0.75
+    # CNN_EIGENTLICH_STRONG = 0.675
+    # # ============================================================
+    # # LLM nötig?
+    # # ============================================================
+    #
+    # use_llm = False
+    #
+    # # 🔴 Fall 1: CNN unsicher + kein Konsens
+    # if cnn_uncertain and conflict_level >= 2:
+    #     use_llm = True
+    #
+    # # 🟢 Fall 2: kompletter Konflikt LLM
+    # if conflict_level == 3:
+    #     if cnn_conf > 0.6 and cnn_margin > 0.17:
+    #         use_llm = False  # CNN sicher.CNN entscheidet
+    #     elif rule_conf >= 1.0 and rule_conf == 1:
+    #         use_llm = False  # Rule_conf immer 1 wenn R. findet, aber mindestens conf lvl soll gelten
+    #     elif bert_conf >= 0.75:
+    #         use_llm = False  # BERT sicher. entscheidet
+    #     # 🔴
+    #     elif rule_pred != cnn_pred and bert_pred != cnn_pred:
+    #         use_llm = True
+    #     else:
+    #         use_llm = True
+    #     print(
+    #         f"R:{rule_pred} "
+    #         f"B:{bert_pred} "
+    #         f"C:{cnn_pred} "
+    #         f"| lvl={conflict_level} "
+    #         f"| conf={cnn_conf:.2f} "
+    #         f"| margin={cnn_margin:.2f} "
+    #         f"| LLM={use_llm}"
+    #     )
+    #
+    # # 🟢 Fall 3: alles einig → KEIN LLM
+    # elif conflict_level == 1:
+    #     use_llm = False
+    #     print(
+    #         f"R:{rule_pred} "
+    #         f"B:{bert_pred} "
+    #         f"C:{cnn_pred} "
+    #         f"| lvl={conflict_level} "
+    #         f"| conf={cnn_conf:.2f} "
+    #         f"| margin={cnn_margin:.2f} "
+    #         f"| LLM={use_llm}"
+    #     )
+    # # 🟢 Fall 4: 2 stimmen überein + CNN sicher
+    # elif conflict_level == 2 and cnn_conf > CNN_EIGENTLICH_STRONG and cnn_margin > 0.1:
+    #     use_llm = False
+    #     print(
+    #         f"R:{rule_pred} "
+    #         f"B:{bert_pred} "
+    #         f"C:{cnn_pred} "
+    #         f"| lvl={conflict_level} "
+    #         f"| conf={cnn_conf:.2f} "
+    #         f"| margin={cnn_margin:.2f} "
+    #         f"| LLM={use_llm}"
+    #     )
+    # # 🔴 Fall 5: Konflikt gegeben, CNN weiss es mittelmaessig
+    # elif conflict_level >= 2 and 0.49 <= cnn_conf < CNN_EIGENTLICH_STRONG:
+    #     use_llm = True
+    # # 🔴 Fall 6: Konflikt gegeben, CNN kann nicht konkretisieren
+    # elif conflict_level == 3 and cnn_margin <= 0.024:
+    #     use_llm = True
+    #
+    # # 🟢 Fall 7: BERT stark + CNN stabil
+    # elif bert_conf >= BERT_EIGENTLICH_STRONG:
+    #     use_llm = False
+    #     print(
+    #         f"R:{rule_pred} "
+    #         f"B:{bert_pred} "
+    #         f"C:{cnn_pred} "
+    #         f"| lvl={conflict_level} "
+    #         f"| conf={cnn_conf:.2f} "
+    #         f"| margin={cnn_margin:.2f} "
+    #         f"| LLM={use_llm}"
+    #     )
+    # else:
+    #     use_llm = False
 
 
     # =========================
@@ -1820,7 +1982,7 @@ def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_ma
         "bert_conf": bert_conf,
         "cnn3_pred": cnn3_pred,
 
-        "llm_needed": use_llm,
+        # "llm_needed": use_llm,
 
         "rule_scores": rule_scores,
         "bert_scores": bert_scores,
@@ -2027,7 +2189,6 @@ def sample_new_chunk(ds, global_used, sample_size=100):
 def build_balanced_dataset(
         ds,
         ctx,
-        llm,
         existing_records,
         initial_presample,
         refill_presample,
@@ -2223,7 +2384,7 @@ def build_balanced_dataset(
                         bert_thresh=bert_thresh,
                         cnn_margin_thresh=cnn_margin_thresh)    #die tresholds von adaptive trehsolds, die die treshs von parser.add_arg haben
 
-        processed = run_llm_stage(processed, llm)
+        # processed = run_llm_stage(processed, llm)
 
         processed = run_final_fusion(processed)
         if len(presample) == 0:
@@ -2387,72 +2548,72 @@ def build_balanced_dataset(
 
     return final
 
-def run_llm_stage(records, llm):
-    llm_needed_count = sum(
-        r.get("llm_needed", False)
-        for r in records)
-
-    no_llm_count = sum(
-        not r.get("llm_needed", False)
-        for r in records)
-
-    total_count = len(records)
-
-    print("\n===== LLM USAGE =====")
-    print(f"LLM nötig:      {llm_needed_count}")
-    print(f"Ohne LLM:       {no_llm_count}")
-    print(f"Gesamt:         {total_count}")
-
-    if total_count > 0:
-        print(f"LLM Anteil: {llm_needed_count / total_count * 100:.2f}%")
-    # =====================================================
-    # Nur LLM-Fälle sammeln
-    # =====================================================
-    texts = []
-    llm_indices = []
-    for i, r in enumerate(records):
-        if r.get("llm_needed", False):
-            text = r.get("caption", "")
-            if not isinstance(text, str):
-                text = str(text)
-
-            texts.append(text)
-            llm_indices.append(i)
-
-    # =====================================================
-    # Keine LLM Fälle
-    # =====================================================
-    if len(texts) == 0:
-        for r in records:
-            r["llm_label"] = None
-            r["llm_conf"] = 0.0
-        return records
-
-    # =====================================================
-    # LLM INFERENZ
-    # =====================================================
-    llm_results = llm.batch_predict(texts)
-
-    # =====================================================
-    # Mapping zurück
-    # =====================================================
-    for idx, (label, conf) in zip(llm_indices, llm_results):
-
-        records[idx]["llm_label"] = label
-        records[idx]["llm_conf"] = conf
-
-    # =====================================================
-    # Defaults für Nicht-LLM
-    # =====================================================
-
-    for r in records:
-        if "llm_label" not in r:
-            r["llm_label"] = r.get(
-                "quick_label",
-                "unknown")
-            r["llm_conf"] = 0.0
-
-    return records
+# def run_llm_stage(records, llm):
+#     llm_needed_count = sum(
+#         r.get("llm_needed", False)
+#         for r in records)
+#
+#     no_llm_count = sum(
+#         not r.get("llm_needed", False)
+#         for r in records)
+#
+#     total_count = len(records)
+#
+#     print("\n===== LLM USAGE =====")
+#     print(f"LLM nötig:      {llm_needed_count}")
+#     print(f"Ohne LLM:       {no_llm_count}")
+#     print(f"Gesamt:         {total_count}")
+#
+#     if total_count > 0:
+#         print(f"LLM Anteil: {llm_needed_count / total_count * 100:.2f}%")
+#     # =====================================================
+#     # Nur LLM-Fälle sammeln
+#     # =====================================================
+#     texts = []
+#     llm_indices = []
+#     for i, r in enumerate(records):
+#         if r.get("llm_needed", False):
+#             text = r.get("caption", "")
+#             if not isinstance(text, str):
+#                 text = str(text)
+#
+#             texts.append(text)
+#             llm_indices.append(i)
+#
+#     # =====================================================
+#     # Keine LLM Fälle
+#     # =====================================================
+#     if len(texts) == 0:
+#         for r in records:
+#             r["llm_label"] = None
+#             r["llm_conf"] = 0.0
+#         return records
+#
+#     # =====================================================
+#     # LLM INFERENZ
+#     # =====================================================
+#     llm_results = llm.batch_predict(texts)
+#
+#     # =====================================================
+#     # Mapping zurück
+#     # =====================================================
+#     for idx, (label, conf) in zip(llm_indices, llm_results):
+#
+#         records[idx]["llm_label"] = label
+#         records[idx]["llm_conf"] = conf
+#
+#     # =====================================================
+#     # Defaults für Nicht-LLM
+#     # =====================================================
+#
+#     for r in records:
+#         if "llm_label" not in r:
+#             r["llm_label"] = r.get(
+#                 "quick_label",
+#                 "unknown")
+#             r["llm_conf"] = 0.0
+#
+#     return records
 
 # ============================================================
 # Inspizieren/Distr/Debug/Übersicht
@@ -2579,7 +2740,6 @@ def classify_dataset(
     dataset_root: Path,
     output_csv: Path,
     biomedbert_path: Optional[str],
-    llamamistral_path: str,
     cnn1_path: str,
     cnn2_path: str,
     cnn3_path: str,
@@ -2670,9 +2830,9 @@ def classify_dataset(
     # ============================================================
     # Phase 4: LLM initialisieren
     # ============================================================
-    print("\nInitialize LLaMa Mistral ...")
-    llm = LocalLLM(model_path=llamamistral_path)
-    records = run_llm_stage(records, llm)
+    # print("\nInitialize LLaMa Mistral ...")
+    # llm = LocalLLM(model_path=llamamistral_path)
+    # records = run_llm_stage(records, llm)
 
     # ============================================================
     # Phase 5: Final fusion
@@ -2686,7 +2846,7 @@ def classify_dataset(
 
     records = build_balanced_dataset(ds,
         ctx,
-        llm,
+        # llm,
         existing_records,
         initial_presample,
         refill_presample,
@@ -2749,9 +2909,9 @@ def classify_dataset(
         print(f"Filter-Rate: {stats['filtered_count'] / len(records0) * 100:.2f}%")
         print(f"Filter-Rate_kept: {stats['filtered_count'] / stats['kept_count'] * 100:.2f}%")
 
-    print("\n===== DEBUG =====")
-    print("LLM needed:", sum(r.get("llm_needed", False) for r in records))
-    print("No LLM:", sum(not r.get("llm_needed", False) for r in records))
+    # print("\n===== DEBUG =====")
+    # print("LLM needed:", sum(r.get("llm_needed", False) for r in records))
+    # print("No LLM:", sum(not r.get("llm_needed", False) for r in records))
 
 # ============================================================
 # CLI
@@ -2777,12 +2937,12 @@ def parse_args():
         default=None,
         help="Lokaler Pfad zu BiomedBERT/PubMedBERT"
     )
-    parser.add_argument(
-        "--llamamistral_path",
-        type=str,
-        required=True,
-        help="Lokaler Pfad zum generativen LLM, LLaMA/Mistral Modell"
-    )
+    # parser.add_argument(
+    #     "--llamamistral_path",
+    #     type=str,
+    #     required=True,
+    #     help="Lokaler Pfad zum generativen LLM, LLaMA/Mistral Modell"
+    # )
     parser.add_argument(
         "--cnn1_path",
         type=str,
@@ -2886,7 +3046,7 @@ def main():
         dataset_root=dataset_root,
         output_csv=output_csv,
         biomedbert_path=args.biomedbert_path,
-        llamamistral_path=args.llamamistral_path,
+        # llamamistral_path=args.llamamistral_path,
         cnn1_path=args.cnn1_path,
         cnn2_path=args.cnn2_path,
         cnn3_path=args.cnn3_path,
