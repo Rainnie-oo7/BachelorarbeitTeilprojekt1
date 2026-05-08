@@ -30,6 +30,7 @@ python make_CLS/pipeline_0.py \
   --cnn1_path /home/b/Dokumente/cnn1/convu_try_3t.pth \
   --cnn2_path /home/b/Dokumente/cnn2/convu_folderlabel_mrt_body_mrt_hirn.pth \
   --cnn3_path /home/b/Dokumente/cnn3/cnn_multiclass.pth
+  > log300test_per5.txt 2>&1
 
 python make_CLS/pipeline_0.py \
   --dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB  \

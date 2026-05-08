@@ -368,121 +368,98 @@ def is_cnn_uncertain(cnn_conf, cnn_margin, conf_threshold=0.4, margin_threshold=
     # Returns: bool: True = unsicher → LLM prüfen
     return (cnn_conf < conf_threshold or relative_margin < margin_threshold)
 
-# Rules macht subset. pre_fuse. Fusioniert Rules/CNN/BERT. LLM nur bei unsicheren Faellen als Richter
-def quick_fuse(rule_scores, bert_scores, cnn_scores):
-    final = {}
+# Final-Classes Fusion # Ein zentrales probabilistisches Fusionssystem.
+def fuse_scores(
+        rule_scores,
+        bert_scores,
+        cnn_scores,
+        llm_label=None,
+        llm_conf=0.0,
+        cnn3_conf=0.0
+):
+    final_scores = {}
 
     for label in FINAL_CLASSES:
-        final[label] = (
-            WEIGHTS["rules"] * rule_scores.get(label, 0)
-            + WEIGHTS["bert"] * bert_scores.get(label, 0)
-            + WEIGHTS["cnn"] * cnn_scores.get(label, 0)    # ersetzt cnn1 u cnn2
-        )
 
-    sorted_labels = sorted(final.items(), key=lambda x: x[1], reverse=True)
+        score = (
+            WEIGHTS["rules"] * rule_scores.get(label, 0.0)
+            + WEIGHTS["bert"] * bert_scores.get(label, 0.0)
+            + WEIGHTS["cnn"] * cnn_scores.get(label, 0.0))
 
-    top1, top2 = sorted_labels[0], sorted_labels[1]
+        # Optionaler LLM-Beitrag
+        if llm_label == label:
+            score += WEIGHTS["llm"] * llm_conf
 
-    margin = top1[1] - top2[1]
+        # CNN3 Trash-Penalty
+        score *= (1.0 - WEIGHTS["cnn3"] * cnn3_conf)
 
-    confident = (
-            margin > 0.10 * top1[1] # relativ gesehen
-            and top1[1] > 0.2       # schwach
-    )
+        final_scores[label] = score
 
-    return top1[0], final, confident
+    # Normalize
+    total = sum(final_scores.values())
 
-# Final-Classes Fusion
-def fuse_scores(rule, bert, cnn, llm_label, llm_conf, cnn3_conf):
+    if total > 0:
+        final_scores = {
+            k: v / total
+            for k, v in final_scores.items()}
 
-    final = {}
+    # Top1 / Top2
+    sorted_scores = sorted(
+        final_scores.items(),
+        key=lambda x: x[1],
+        reverse=True)
 
-    for label in FINAL_CLASSES:
-        base = (
-            WEIGHTS["rules"] * rule.get(label, 0)
-            + WEIGHTS["bert"] * bert.get(label, 0)
-            + WEIGHTS["cnn"] * cnn.get(label, 0)
-            + WEIGHTS["llm"] * (llm_conf if llm_label == label else 0))
+    top1_label, top1_score = sorted_scores[0]
 
-        final[label] = base * (1 - WEIGHTS["cnn3"] * cnn3_conf)
+    if len(sorted_scores) > 1:
+        top2_label, top2_score = sorted_scores[1]
+    else:
+        top2_label, top2_score = "none", 0.0
 
-    sorted_labels = sorted(final.items(), key=lambda x: x[1], reverse=True)
+    margin = top1_score - top2_score
 
-    top1, top2 = sorted_labels[0], sorted_labels[1]
-
-    margin = top1[1] - top2[1]
-
-    uncertain = (
-        margin < 0.10 * top1[1]  # relativ gesehen
-        or top1[1] < 0.2)        # schwach
-
-    return top1[0], final, None, uncertain
+    return {
+        "final_label": top1_label,
+        "final_conf": top1_score,
+        "final_margin": margin,
+        "final_scores": final_scores,
+        "top2_label": top2_label}
 
 def run_final_fusion(records):
 
     final_records = []
-    filtered_cnn3 = 0
 
     for r in records:
-        rule_scores = r.get("rule_scores", {c: 0.0 for c in FINAL_CLASSES})
-        bert_scores = r.get("bert_scores", {c: 0.0 for c in FINAL_CLASSES})
-        cnn_scores  = r.get("cnn_scores",  {c: 0.0 for c in FINAL_CLASSES})
-        cnn3_conf   = r.get("cnn3_conf", 0.0)
 
-        if r["is_filtered"]:     # cnn3_conf=Wie wahrscheinlich ist dieses Bild KEINE Radiologie?
-            print("C3-Filth:", r["filter_reason"], r["cnn3_pred"], r["cnn3_conf"], )
-            filtered_cnn3 += 1
+        if r.get("is_filtered", False):
             continue
 
-        # ---------- FINAL LABEL ----------
-        if not r.get("llm_needed", False):
-            final_label = r.get("final_label", r.get("quick_label", "unknown"))
-            final_scores = r.get("quick_scores", {})
-            uncertain = False
-        else:
-            final_label, final_scores, _, uncertain = fuse_scores(
-                rule_scores,
-                bert_scores,
-                cnn_scores,
-                r.get("llm_label", "unknown"),
-                r.get("llm_conf", 0.0),
-                cnn3_conf)
+        fused = fuse_scores(
+            rule_scores=r["rule_scores"],
+            bert_scores=r["bert_scores"],
+            cnn_scores=r["cnn_scores"],
+            llm_label=r.get("llm_label"),
+            llm_conf=r.get("llm_conf", 0.0),
+            cnn3_conf=r.get("cnn3_conf", 0.0)
+        )
 
-        # ---------- DEBUG INFO ----------
-        debug_info = {
-            "final_label": final_label,
-            "uncertain": uncertain,
-            "final_scores": final_scores}
+        final_label = fused["final_label"]
+        final_scores = fused["final_scores"]
 
-        # ---------- FINAL OUTPUT ----------
-        final_records.append({
-            "pmc_id": r.get("pmc_id"),
-            "row_id": r.get("row_id"),
-            "row": r.get("row"),
+        final_conf = fused["final_conf"]
+        final_margin = fused["final_margin"]
 
-            "final_label": final_label,
+        uncertain = (
+                final_conf < 0.45
+                or final_margin < 0.08
+        )
 
-            "RULE": r.get("rule_label"),
-            "BERT": r.get("bert_label"),
-            "CNN1top3": json.dumps(r.get("cnn1_top3", [])),
-            "CNN2top3": json.dumps(r.get("cnn2_top3", [])),
-            "LLM": r.get("llm_label", "unknown"),
+        r["final_label"] = fused["final_label"]
+        r["final_conf"] = fused["final_conf"]
+        r["final_margin"] = fused["final_margin"]
+        r["final_scores"] = fused["final_scores"]
 
-
-            "BERT_score": r.get("bert_score", 0.0),
-            "CNN1_scores": json.dumps(r.get("cnn1_scores", {})),
-            "CNN2_scores": json.dumps(r.get("cnn2_scores", {})),
-            "LLM_conf": r.get("llm_conf", 0.0),
-
-            "Final Scores": json.dumps(final_scores),
-            "Begründung": json.dumps(debug_info),
-
-            "uncertain": uncertain,
-            "caption": r.get("caption"),
-            "modality_gt": r.get("modality_gt", "unknown"),
-        })
-
-    print(f"CNN3 gefiltert: {filtered_cnn3}")
+        final_records.append(r)
 
     return final_records
 # ============================================================
@@ -1270,7 +1247,7 @@ def predict_with_cnn(model, image, transform, device, class_names):
 # ============================================================
 # Checksum
 # ============================================================
-def debug_sampling(records, per_class, class_key="rule_label"):
+def debug_sampling(records, per_class, class_key="rule_pred"):
     print("\n===== Early Sampling Checksum&Debug =====")
 
     counts = Counter()
@@ -1331,28 +1308,29 @@ def early_balanced_sampling(ds, per_class, limit=None):
         text, meta = extract_text_from_row(row)
         text = normalize_text(text)
 
-        rule_label, reason, matched, hits = rule_based_classify_with_rules(
+        rule_pred, reason, matched, hits = rule_based_classify_with_rules(
             text, RULES_LONG, LABEL_PRIORITY)
 
-        # print(f"{rule_label} | {text[:80]}")
+        # print(f"{rule_pred} | {text[:80]}")
 
-        if rule_label not in FINAL_CLASSES:
+        if rule_pred not in FINAL_CLASSES:
             continue
 
-        if rule_label == "unknown":
+        if rule_pred == "unknown":
             print("Regellabel ist unknown TEXT:", text[:200])
 
-        if len(buckets[rule_label]) >= per_class:
+        if len(buckets[rule_pred]) >= per_class:
             continue
 
-        buckets[rule_label].append({
+        buckets[rule_pred].append({
             "row_id": idx,
             "pmc_id": meta.get("PMC_ID", ""),
             "caption": text,
             "row": row,
-            "rule_label": rule_label,
-            "modality_gt": meta.get("modality", "unknown"),
+            "rule_pred": rule_pred,
             "rule_reason": reason,
+            "rule_hits": hits,
+            "modality_gt": meta.get("modality", "unknown"),
             "matched_patterns": matched.split(" | ") if matched else []
         })
 
@@ -1609,21 +1587,20 @@ def top_label(scores):
 # ============================================================
 # Verarbeitung (Ph. 3)
 # ============================================================
-def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh=0.82, bert_thresh=0.88, cnn_margin_thresh=0.18):
+def process_single_record(r, ctx: ModelContext):
     """
     Das ist mein Phase-3 Code für ein Sample
     (Rules + CNN + BERT + LLM Entscheidung)
     """
-
     text = r.get("caption")
     row = r.get("row")
-
+    rule_hits = r.get("rule_hits")
     # =========================
     # RULES
     # =========================
     rule_scores = {c: 0.0 for c in FINAL_CLASSES}
-    if r.get("rule_label") in FINAL_CLASSES:
-        rule_scores[r["rule_label"]] = 1.0
+    if r.get("rule_pred") in FINAL_CLASSES:
+        rule_scores[r["rule_pred"]] = 1.0
 
     # =========================
     # BERT
@@ -1678,7 +1655,11 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
     cnn3_pred = top_label(cnn3_top3)
     CNN3_STRONG = 0.93
     CNN3_MEDIUM = 0.65
-    rule_conf = max(rule_scores.values())
+    # rule_conf = max(rule_scores.values())
+    rule_conf = max(
+        v["score"]
+        for v in rule_hits.values()
+    ) if rule_hits else 0
     bert_conf = max(bert_scores.values())
     if cnn3_full:
         cnn3_conf = max(cnn3_full.values())
@@ -1712,14 +1693,6 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
         r["is_filtered"] = True
         r["filter_reason"] = "noconsent"
         return r
-    # =========================
-    # Quick Fusion (ohne LLM) laeuft schneller
-    # Rules macht subset. pre_fuse Fusioniert Rules/CNN/BERT. LLM nur bei unsicheren Faellen als Richter
-    # =========================
-    quick_label, quick_scores, confident = quick_fuse(
-        rule_scores,
-        bert_scores,
-        cnn_scores)
 
     # =========================
     # LLM Entscheidung KONFLIKT + CNN LOGIK
@@ -1825,12 +1798,6 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
     else:
         use_llm = False
 
-    if not use_llm:
-        r["final_label"] = quick_label
-        r["llm_needed"] = False
-    else:
-        r["quick_label"] = quick_label
-        r["llm_needed"] = True
 
     # =========================
     # Debug + Speicherung
@@ -1840,10 +1807,6 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
         "row_id": r["row_id"],
         "caption": text,
         "row": row,
-
-        "final_label": quick_label if not use_llm else None,
-        "quick_label": quick_label,
-        "quick_scores": quick_scores,
 
         "rule_pred": rule_pred,
         "bert_pred": bert_pred,
@@ -1864,23 +1827,24 @@ def process_single_record(r, ctx: ModelContext, missing_classes=None, cnn_thresh
         "cnn2_top3": cnn2_top3,
 
         "cnn3_conf": cnn3_conf,
+        "rule_reason": r.get("rule_reason", ""),
+        "rule_hits": r.get("rule_hits", {}),
+        "matched_patterns": r.get("matched_patterns", []),
+        "modality_gt": r.get("modality_gt", "unknown")
     }
 
     return result
 
 def process_batch(
     presample,
-    ctx,
-    cnn_thresh=0.82,
-    bert_thresh=0.88,
-    cnn_margin_thresh=0.18):
+    ctx):
 
     processed = []
     filtered_counts = Counter()
     # Parallele Verarbeitung
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures = [
-            ex.submit(process_single_record, r, ctx, None, cnn_thresh, bert_thresh, cnn_margin_thresh)
+            ex.submit(process_single_record, r, ctx, None)
             for r in presample]
 
         for fut in tqdm(
@@ -2032,7 +1996,7 @@ def sample_new_chunk(ds, global_used, sample_size=100):
             "caption": text,
             "pmc_id": meta.get("PMC_ID", ""),
             "row_id": idx,
-            "rule_label": "unknown"}
+            "rule_pred": "unknown"}
 
         selected.append(r)
 
@@ -2053,6 +2017,7 @@ def build_balanced_dataset(
     # --------------------------------------------------------
     # Global
     # --------------------------------------------------------
+    global_failed_counter = 0
     accepted_records = list(existing_records)
     remaining_pool = []
     # echte Dublettenkontrolle
@@ -2069,8 +2034,6 @@ def build_balanced_dataset(
     # ========================================================
     for round_idx in range(max_rounds):
         # Lokale Fehlversuche innerhalb dieser Round
-        failed_counter = 0
-
         print("\n" + "=" * 60)
         print(f"ROUND {round_idx}")
         print("=" * 60)
@@ -2107,10 +2070,11 @@ def build_balanced_dataset(
             print("Alle Klassen gefüllt.")
             break
         # ====================================================
-        # Micro Decay. Alle 250 erfolglosen Samples Thresholds leicht lockern. Hauptrounds erhalten trotzdem urspruenglichen Decay-Wert!
+        # Micro Decay. Alle x erfolglosen Samples Thresholds leicht lockern. Hauptrounds erhalten trotzdem urspruenglichen Decay-Wert!
         # 2it/sek =/= micro round duration ~2.1 min. DENN Erfolge+Fehlversuche dabei
         # ====================================================
-        micro_round = failed_counter // 40
+        x = 40
+        micro_round = global_failed_counter // x
 
         effective_round = round_idx + micro_round
 
@@ -2294,33 +2258,26 @@ def build_balanced_dataset(
             # ====================================================
             # Adaptive Qualitätsprüfung
             # ====================================================
-            cnn_conf = r.get("cnn_conf", 0.0)
+            final_conf = r.get("final_conf", 0.0)
+            final_margin = r.get("final_margin", 0.0)
 
-            bert_conf = r.get("bert_conf", 0.0)
+            accept_threshold = adaptive_threshold(
+                start=0.72,
+                min_value=0.45,
+                refill_round=effective_round,
+                decay=0.025
+            )
 
-            cnn_margin = r.get("cnn_margin", 0.0)
+            margin_threshold = adaptive_threshold(
+                start=0.18,
+                min_value=0.05,
+                refill_round=effective_round,
+                decay=0.01
+            )
 
-            rule_pred = r.get("rule_pred")
-
-            accept = False
-            # --------------------------------------------
-            # Rules dominant
-            # --------------------------------------------
-            if rule_pred == label:
-                accept = True
-
-            # --------------------------------------------
-            # CNN akzeptieren
-            # --------------------------------------------
-            elif (cnn_conf >= cnn_thresh and cnn_margin >= cnn_margin_thresh):
-                accept = True
-
-            # --------------------------------------------
-            # BERT akzeptieren
-            # --------------------------------------------
-            elif (bert_conf >= bert_thresh):
-                accept = True
-
+            accept = (
+                    final_conf >= accept_threshold
+                    and final_margin >= margin_threshold)
             # --------------------------------------------
             # Accept / Remaining
             # --------------------------------------------
@@ -2329,7 +2286,7 @@ def build_balanced_dataset(
             else:
                 new_remaining.append(r)
                 # Fehlversuch zählen
-                failed_counter += 1
+                global_failed_counter += 1
 
         # ====================================================
         # Merge
@@ -2444,7 +2401,7 @@ def run_llm_stage(records, llm):
     # =====================================================
     if len(texts) == 0:
         for r in records:
-            r["llm_label"] = r.get("quick_label", "unknown")
+            r["llm_label"] = None
             r["llm_conf"] = 0.0
         return records
 
