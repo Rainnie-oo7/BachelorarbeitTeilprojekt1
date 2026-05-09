@@ -34,9 +34,6 @@ import re
 import json
 import argparse
 import numpy as np
-
-import easyocr
-
 import hashlib
 import random
 from collections import Counter, defaultdict
@@ -44,12 +41,13 @@ from typing import Dict, List, Optional, Tuple
 import io
 from itertools import zip_longest
 
+import easyocr
+
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 import torch.nn.functional as F
 import pandas as pd
-from easyocr.utils import make_rotated_img_list
 from tqdm import tqdm
 from datasets import Dataset, concatenate_datasets
 from transformers import AutoTokenizer, AutoModel
@@ -136,7 +134,7 @@ WEIGHTS = {
     "cnn3": 0.3
 }
 # ALLGEMEINE TIERE
-ANIMAL_TERMS = [
+ANIMAL_LIST = [
     # Maus / Ratte / Nagetiere
     r"\bmouse\b",
     r"\bmice\b",
@@ -231,7 +229,7 @@ ANIMAL_TERMS = [
 ]
 
 ANIMAL_REGEX = re.compile(
-    "|".join(ANIMAL_TERMS),
+    "|".join(ANIMAL_LIST),
     flags=re.IGNORECASE)
 
 def contains_animal_terms(text: str):
@@ -281,8 +279,10 @@ def is_multipanel_caption(text: str):
     return False, None
 
 def split_multipanel_caption(text):
+
     if not isinstance(text, str):
-        return {}
+        return {}, ""
+
     pattern = r"""
     (?:\(([A-Z])\))      # (A)
     |
@@ -293,16 +293,35 @@ def split_multipanel_caption(text):
     (?:^([A-Z])[:\.])
     """
 
-    matches = list(re.finditer(pattern, text, flags=re.VERBOSE | re.IGNORECASE))
+    matches = list(
+        re.finditer(
+            pattern,
+            text,
+            flags=re.VERBOSE | re.IGNORECASE
+        )
+    )
 
     if len(matches) == 0:
-        return {}
+        return {}, text
 
     sections = {}
 
+    # =====================================================
+    # PREFIX vor erstem Panel
+    # =====================================================
+
+    prefix_text = text[:matches[0].start()].strip()
+
+    # =====================================================
+    # Panels
+    # =====================================================
+
     for i, match in enumerate(matches):
 
-        panel = next(g for g in match.groups() if g is not None).upper()
+        panel = next(
+            g for g in match.groups()
+            if g is not None
+        ).upper()
 
         start = match.end()
 
@@ -315,7 +334,8 @@ def split_multipanel_caption(text):
 
         sections[panel] = panel_text
 
-    return sections
+    return sections, prefix_text
+
 ocrreader = easyocr.Reader(
     ['en'],
     gpu=False
@@ -619,10 +639,6 @@ def fuse_scores(
             + WEIGHTS["bert"] * bert_scores.get(label, 0.0)
             + WEIGHTS["cnn"] * cnn_scores.get(label, 0.0))
 
-        # Optionaler LLM-Beitrag
-        if llm_label == label:
-            score += WEIGHTS["llm"] * llm_conf
-
         # CNN3 Trash-Penalty
         score *= (1.0 - WEIGHTS["cnn3"] * cnn3_conf)
 
@@ -674,10 +690,23 @@ def run_final_fusion(records):
             cnn_scores=r["cnn_scores"],
             cnn3_conf=r.get("cnn3_conf", 0.0))
 
+        final_scores = fused["final_scores"]
+
         #schonere Ausgabe ohne { usw
         r["final_scores_str"] = json.dumps(
             fused["final_scores"],
             ensure_ascii=False)
+
+        # CNN3 stärker als jede finale Klasse -> wegfiltern
+        #Es war [cnn3_conf] 0.524... aber  [final_scores_str]{maxlabel"xray": 0.4924.. Wurde nicht weggefiltert
+        cnn3_conf = r.get("cnn3_conf", 0.0)
+
+        max_final_score = max(final_scores.values()) if final_scores else 0.0
+
+        if cnn3_conf > (max_final_score + 0.01):    #0.01 etwas Spielraum geben sonst minimale Unter. filtern bereits weg
+            r["is_filtered"] = True
+            r["filter_reason"] = "cnn3stronger_than_any_cnn"
+            continue
 
         r["final_label"] = fused["final_label"]
         r["final_conf"] = fused["final_conf"]
@@ -1730,7 +1759,7 @@ def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_ma
         image = get_image_from_row(row)
         if image is not None:
             ocr_text, ocr_meta = run_ocr_pil(image)
-            panel_sections = split_multipanel_caption(text)
+            panel_sections, prefix_text = split_multipanel_caption(text)
             # OCR erkennt dominante Panels
             VALID_PANELS = {"A", "B", "C", "D", "E", "F"}
             found_panels = []
@@ -1746,8 +1775,9 @@ def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_ma
             selected_panel_texts = []
             for p in found_panels:
                 if p in panel_sections:
-                    selected_panel_texts.append(
-                        panel_sections[p])
+                    combined_text = (prefix_text + " " + panel_sections[p]).strip()
+
+                    selected_panel_texts.append(combined_text)
 
             # Falls OCR erfolgreich:
             # Caption ersetzen
@@ -2780,7 +2810,8 @@ def parse_args():
     parser.add_argument(
         "--per_class",
         type=int,
-        default=5,
+        # default=3,
+        default=1000,
         help="Anzahl Samples pro finaler Klasse (hash-balanced)"
     )
     parser.add_argument(
@@ -2792,13 +2823,14 @@ def parse_args():
     parser.add_argument(
         "--refill_presample",
         type=int,
-        default=400,
+        # default=200,
+        default=25000,
         help="Anzahl spätere Nachlade-Chunks Postsample *im* Refill"
     )
     parser.add_argument(
         "--max_rounds",
         type=int,
-        default=6,
+        # default=3,
         help="Anzahl Sicherheitslimit im Refill (=Runden Runs Durchlaeufe)"
     )
     parser.add_argument(
@@ -2807,8 +2839,7 @@ def parse_args():
         default=0.82,
         help="CNN confidence threshold für sichere Entscheidungen."
     )
-    #höherer Threshold = strenger / konservativer
-    #niedrigerer Threshold = toleranter / mehr akzeptierte Fälle
+    #höherer Threshold = strenger / konservativer niedrigerer Threshold = toleranter / mehr akzeptierte Fälle
     parser.add_argument(
         "--bert_thresh",
         type=float,
@@ -2824,7 +2855,7 @@ def parse_args():
     parser.add_argument(
         "--micro_round_failures",
         type=int,
-        default=40,
+        default=400,
         help="Anzahl erfolgloser Samples bis Micro-Round erhöht wird"
     )
     parser.add_argument(
