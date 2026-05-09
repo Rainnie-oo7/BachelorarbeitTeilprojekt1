@@ -33,6 +33,9 @@ from PIL import Image
 import re
 import json
 import argparse
+import numpy as np
+
+import easyocr
 
 import hashlib
 import random
@@ -46,6 +49,7 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 import torch.nn.functional as F
 import pandas as pd
+from easyocr.utils import make_rotated_img_list
 from tqdm import tqdm
 from datasets import Dataset, concatenate_datasets
 from transformers import AutoTokenizer, AutoModel
@@ -64,30 +68,31 @@ FINAL_CLASSES = [
     "ct",
     "ct_kombimodalitaet_spect+ct_pet+ct"]
 CNN1_CLASS_NAMES = [
-    "mrt_prostata_t1",
-    "mrt_prostata_t2",
-    "mrt_hirn_flair",
-    "mrt_hirn_t1",
-    "mrt_hirn_t2",
-    "mrt_hirn_t1_c",
-    "ct",
-    "ct_kombimodalitaet_spect+ct_pet+ct",
-    "xray",
-    "xray_fluoroskopie_angiographie",
-    "us"]
+    'xray',
+    'xray_fluoroskopie_angiographie',
+    'us',
+    'mrt_hirn_flair',
+    'mrt_hirn_t1',
+    'mrt_hirn_t2',
+    'mrt_hirn_t1_c',
+    'mrt_prostata_t1',
+    'mrt_prostata_t2',
+    'ct',
+    'ct_kombimodalitaet_spect+ct_pet+ct'
+    ]
 CNN1_MAPPING = {
-    "mrt_prostata_t1": "mrt_body",
-    "mrt_prostata_t2": "mrt_body",
+    "xray": "xray",
+    "xray_fluoroskopie_angiographie": "xray_fluoroskopie_angiographie",
+    "us": "us",
     "mrt_hirn_flair": "mrt_hirn",
     "mrt_hirn_t1": "mrt_hirn",
     "mrt_hirn_t2": "mrt_hirn",
     "mrt_hirn_t1_c": "mrt_hirn",
-
+    "mrt_prostata_t1": "mrt_body",
+    "mrt_prostata_t2": "mrt_body",
     "ct": "ct",
     "ct_kombimodalitaet_spect+ct_pet+ct": "ct_kombimodalitaet_spect+ct_pet+ct",
-    "xray": "xray",
-    "xray_fluoroskopie_angiographie": "xray_fluoroskopie_angiographie",
-    "us": "us"}
+    }
 CNN2_CLASS_NAMES = [
     "xray",
     "xray_fluoroskopie_angiographie",
@@ -99,12 +104,13 @@ CNN2_MAPPING = {
     "mrt_hirn": "mrt_hirn",
     "mrt_body": "mrt_body"}
 CNN3_CLASS_NAMES = [
-    "chirurgie",
-    "mikroskopie",
-    "endoskopie",
+    "histologie",
     "haut",
     "chart",
-    "histologie"]
+    "endoskopie",
+    "mikroskopie",
+    "chirurgie",
+]
 # fuer Weight Log-Scaling. Anzahlen Bild in CNN Custom Finetuning
 CNN1_CLASS_COUNTS_RAW = {
     "xray": 54419,
@@ -273,6 +279,85 @@ def is_multipanel_caption(text: str):
     if match:
         return True, match.group(0)
     return False, None
+
+def split_multipanel_caption(text):
+    if not isinstance(text, str):
+        return {}
+    pattern = r"""
+    (?:\(([A-Z])\))      # (A)
+    |
+    (?:\(([a-z])\))      # (a)
+    |
+    (?:\bPanel\s+([A-Z])\b)
+    |
+    (?:^([A-Z])[:\.])
+    """
+
+    matches = list(re.finditer(pattern, text, flags=re.VERBOSE | re.IGNORECASE))
+
+    if len(matches) == 0:
+        return {}
+
+    sections = {}
+
+    for i, match in enumerate(matches):
+
+        panel = next(g for g in match.groups() if g is not None).upper()
+
+        start = match.end()
+
+        if i + 1 < len(matches):
+            end = matches[i + 1].start()
+        else:
+            end = len(text)
+
+        panel_text = text[start:end].strip()
+
+        sections[panel] = panel_text
+
+    return sections
+ocrreader = easyocr.Reader(
+    ['en'],
+    gpu=False
+)
+
+def run_ocr_pil(image):
+
+    if image is None:
+        return "", []
+
+    try:
+
+        results = ocrreader.readtext(
+            np.array(image),
+            detail=1,
+            paragraph=False
+        )
+
+        texts = []
+
+        for r in results:
+
+            if len(r) >= 2:
+                texts.append(str(r[1]))
+
+        text = " ".join(texts)
+
+        return text, results
+
+    except Exception as e:
+
+        print("\nOCR Fehler")
+        print(e)
+
+        return "", []
+
+    except Exception as e:
+
+        print("\nOCR Fehler")
+        print(e)
+
+        return ""
 
 # gen. LLM (vLLM READY)
 class LocalLLM:
@@ -561,6 +646,7 @@ def fuse_scores(
 
     if len(sorted_scores) > 1:
         top2_label, top2_score = sorted_scores[1]
+
     else:
         top2_label, top2_score = "none", 0.0
 
@@ -571,14 +657,14 @@ def fuse_scores(
         "final_conf": top1_score,
         "final_margin": margin,
         "final_scores": final_scores,
-        "top2_label": top2_label}
+        "top2_label": top2_label,
+        "top2_score": top2_score}
 
 def run_final_fusion(records):
 
     final_records = []
 
     for r in records:
-
         if r.get("is_filtered", False):
             continue
 
@@ -586,27 +672,19 @@ def run_final_fusion(records):
             rule_scores=r["rule_scores"],
             bert_scores=r["bert_scores"],
             cnn_scores=r["cnn_scores"],
-            # llm_label=r.get("llm_label"),
-            # llm_conf=r.get("llm_conf", 0.0),
-            cnn3_conf=r.get("cnn3_conf", 0.0)
-        )
+            cnn3_conf=r.get("cnn3_conf", 0.0))
 
-        final_label = fused["final_label"]
-        final_scores = fused["final_scores"]
-
-        final_conf = fused["final_conf"]
-        final_margin = fused["final_margin"]
-
-        uncertain = (
-                final_conf < 0.45
-                or final_margin < 0.08
-        )
+        #schonere Ausgabe ohne { usw
+        r["final_scores_str"] = json.dumps(
+            fused["final_scores"],
+            ensure_ascii=False)
 
         r["final_label"] = fused["final_label"]
         r["final_conf"] = fused["final_conf"]
         r["final_margin"] = fused["final_margin"]
         r["final_scores"] = fused["final_scores"]
-
+        r["top2_label"] = fused["top2_label"]
+        r["top2_score"] = fused["top2_score"]
         final_records.append(r)
 
     return final_records
@@ -749,69 +827,6 @@ def get_image_from_row(row):
 # ============================================================
 # Harte Regeln
 # ============================================================
-MRT_HIRN_T1_SHORT = [
-    r"\bbrain\b.*\bt1\b",
-    r"\bhead\b.*\bt1\b",
-    r"\bcerebr\w*\b.*\bt1\b",
-    r"\bcranial\b.*\bt1\b",
-    r"\bt1[- ]weighted\b.*\bbrain\b",
-    r"\bbrain\s+mri\b.*\bt1\b",
-]
-MRT_HIRN_T2_SHORT = [
-    r"\bbrain\b.*\bt2\b",
-    r"\bhead\b.*\bt2\b",
-    r"\bcerebr\w*\b.*\bt2\b",
-    r"\bcranial\b.*\bt2\b",
-    r"\bt2[- ]weighted\b.*\bbrain\b",
-    r"\bbrain\s+mri\b.*\bt2\b",
-]
-MRT_HIRN_FLAIR_SHORT = [
-    r"\bbrain\b.*\bflair\b",
-    r"\bcranial\b.*\bflair\b",
-    r"\bcerebr\w*\b.*\bflair\b",
-    r"\bhead\b.*\bflair\b",
-    r"\bflair\b.*\bbrain\b",
-    r"\bfluid[- ]attenuated inversion recovery\b",
-]
-MRT_HIRN_T1_C_SHORT = [
-    r"\bbrain\b.*\bt1\s*\+\s*c\b",
-    r"\bpost[- ]contrast\b.*\bbrain\b.*\bmri\b",
-    r"\bgadolinium[- ]enhanced\b.*\bbrain\b.*\bmri\b",
-    r"\bcontrast[- ]enhanced\b.*\bbrain\b.*\bmri\b",
-    r"\bt1\s*\+\s*c\b.*\bbrain\b",
-    r"\bt1\s+with\s+contrast\b.*\bbrain\b",
-]
-# Kurze RULES MRT BODY – Sublisten
-MRT_PROSTATA_T1_SHORT = [
-    r"\bprostat\w*\b.*\bt1\b",
-    r"\bt1[- ]weighted\b.*\bprostat\w*\b",
-    r"\bprostate\s+mri\b.*\bt1\b",
-    r"\bpelvic\s+mri\b.*\bprostat\w*\b.*\bt1\b",
-]
-MRT_PROSTATA_T2_SHORT = [
-    r"\bprostat\w*\b.*\bt2\b",
-    r"\bt2[- ]weighted\b.*\bprostat\w*\b",
-    r"\bprostate\s+mri\b.*\bt2\b",
-    r"\bpelvic\s+mri\b.*\bprostat\w*\b.*\bt2\b",
-    r"\bzonal anatomy\b.*\bprostat\w*\b.*\bt2\b",
-]
-MRT_BODY_GENERAL_SHORT = [
-    r"\bpelvic\s+mri\b",
-    r"\bpelvic\s+mr\b",
-    r"\bprostate\s+mri\b",
-    r"\bprostate\s+mr\b",
-    r"\bmpmri\b",
-    r"\bmultiparametric\s+mri\b.*\bprostat\w*\b",
-    r"\babdominal\s+mri\b",
-    r"\bbreast\s+mri\b",
-    r"\bliver\s+mri\b",
-    r"\bkidney\s+mri\b",
-    r"\brenal\s+mri\b",
-    r"\bspine\s+mri\b",
-    r"\bknee\s+mri\b",
-    r"\bcardiac\s+mri\b",
-    r"\bheart\s+mri\b",
-]
 # Lange RULES MRT HIRN – Sublisten
 MRT_HIRN_T1_LONG = [
     r"\bbrain\b.*\bt1\b",
@@ -820,6 +835,10 @@ MRT_HIRN_T1_LONG = [
     r"\bcranial\b.*\bt1\b",
     r"\bt1[- ]weighted\b.*\bbrain\b",
     r"\bbrain\s+mri\b.*\bt1\b",
+    r"\bbrain\s+magnetic\s+resonance\b",
+    r"\bmra\b",
+    r"\binternal\s+carotid\s+artery\b",
+    r"\bica\b",
 ]
 MRT_HIRN_T2_LONG = [
     r"\bbrain\b.*\bt2\b",
@@ -828,6 +847,10 @@ MRT_HIRN_T2_LONG = [
     r"\bcranial\b.*\bt2\b",
     r"\bt2[- ]weighted\b.*\bbrain\b",
     r"\bbrain\s+mri\b.*\bt2\b",
+    r"\bbrain\s+magnetic\s+resonance\b",
+    r"\bmra\b",
+    r"\binternal\s+carotid\s+artery\b",
+    r"\bica\b",
 ]
 MRT_HIRN_FLAIR_LONG = [
     r"\bbrain\b.*\bflair\b",
@@ -846,7 +869,6 @@ MRT_HIRN_T1_C_LONG = [
     r"\bt1\s*\+\s*c\b.*\bbrain\b",
     r"\bt1\s+with\s+contrast\b.*\bbrain\b",
 ]
-
 # RULES MRT BODY – Sublisten
 MRT_PROSTATA_T1_LONG = [
     r"\bprostat\w*\b.*\bt1\b",
@@ -908,19 +930,7 @@ def interleave_patterns(*pattern_lists):
                 mixed.append(pattern)
     return mixed
 # Ich wollte Hirn zusammenfassen und Prostata (auch auf viel Koerper trainiert, hiess aber durch CNN so)
-# Interleave kurze Regeln (Kartenmisch-artig) quasi da Reihenfolge jeweiliger Klasse gleich wichtig ist m1 = [a, b] und m2 = [c, d] wird m_hirn = [a, c, b, d]
-MRT_HIRN_RULES_SHORT = interleave_patterns(
-    MRT_HIRN_T1_SHORT,
-    MRT_HIRN_T2_SHORT,
-    MRT_HIRN_FLAIR_SHORT,
-    MRT_HIRN_T1_C_SHORT,
-)
-MRT_BODY_RULES_SHORT = interleave_patterns(
-    MRT_PROSTATA_T1_SHORT,
-    MRT_PROSTATA_T2_SHORT,
-    MRT_BODY_GENERAL_SHORT,
-)
-# Interleave lange Regeln
+# Interleave lange Regeln (Kartenmisch-artig) quasi da Reihenfolge jeweiliger Klasse gleich wichtig ist m1 = [a, b] und m2 = [c, d] wird m_hirn = [a, c, b, d]
 MRT_HIRN_RULES_LONG = interleave_patterns(
     MRT_HIRN_T1_LONG,
     MRT_HIRN_T2_LONG,
@@ -932,82 +942,6 @@ MRT_BODY_RULES_LONG = interleave_patterns(
     MRT_PROSTATA_T2_LONG,
     MRT_BODY_GENERAL_LONG,
 )
-# Weitere Regeln - kurze
-CT_HYBRID_RULES_SHORT = [
-    r"\bpet\s*/\s*ct\b",
-    r"\bpet-ct\b",
-    r"\bspect\s*/\s*ct\b",
-    r"\bspect-ct\b",
-    r"\bfused\s+(pet|spect)\s*[-/]?\s*ct\b",
-    r"\bhybrid\s+(pet|spect)\s*[-/]?\s*ct\b",
-    r"\bco[- ]registered\s+(pet|spect)\s+(and\s+)?ct\b",
-]
-CT_RULES_SHORT = [
-    r"\bct\b",
-    r"\bcomputed tomography\b",
-    r"\baxial ct\b",
-    r"\bcoronal ct\b",
-    r"\bsagittal ct\b",
-    r"\bcontrast[- ]enhanced ct\b",
-    r"\bhelical ct\b",
-    r"\bmdct\b",
-    r"\bhrct\b",
-]
-XRAY_ANGIOGRAPHY_RULES_SHORT = [
-    r"\bangioplast\w*\b",
-    r"\bangiography\w*\b",
-    r"\bpta\b",
-    r"\bptca\b",
-    r"\bpci\b",
-    r"\bfluoroscopy\b",
-    r"\bc[- ]arm\b",
-    r"\bangiograph\w*\b",
-    r"\bdsa\b",
-]
-XRAY_RULES_SHORT = [
-    r"\bx[- ]?ray\b",
-    r"\bradiograph\b",
-    r"\bplain film\b",
-    r"\bap view\b",
-    r"\bpa view\b",
-    r"\blateral view\b",
-]
-US_RULES_SHORT = [
-    r"\bultrasound\b",
-    r"\bsonograph\w*\b",
-    r"\bechograph\w*\b",
-    r"\bdoppler\b",
-]
-MICROSCOPY_RULES_SHORT = [
-    r"\bmicroscopy\b",
-    r"\bhistology\b",
-    r"\bimmunohistochemistry\b",
-    r"\bh\s*&\s*e\b",
-]
-
-PATHOLOGY_RULES_SHORT = [
-    r"\bpathology\b",
-    r"\bbiopsy\b",
-    r"\bpathological findings\b",
-]
-
-SURGERY_RULES_SHORT = [
-    r"\bintraoperative\b",
-    r"\bsurgical findings\b",
-    r"\boperation\b",
-]
-
-ENDOSCOPY_RULES_SHORT = [
-    r"\bendoscopy\b",
-    r"\bcolonoscopy\b",
-]
-
-CHART_RULES_SHORT = [
-    r"\bchart\b",
-    r"\bgraph\b",
-    r"\bplot\b",
-]
-
 # Weitere Regeln - lange
 CT_HYBRID_RULES_LONG = [
     r"\bpet\s*/\s*ct\b",
@@ -1084,6 +1018,7 @@ US_RULES_LONG = [
     r"\bultrasonograph\w*\b",
     r"\bechograph\w*\b",
     r"\bechocardiograph\w*\b",
+    r"\bultrasonic\b",
     r"\bdoppler\b",
     r"\bduplex sonograph\w*\b",
     r"\bendoscopic ultrasound\b",
@@ -1095,6 +1030,7 @@ US_RULES_LONG = [
     r"\btransrectal\b",
     r"\btransabdominal\b",
 ]
+#Filter Regeln
 MICROSCOPY_RULES_LONG = [
     r"\bmicroscopy\b",
     r"\bmicroscopic\b",
@@ -1110,6 +1046,16 @@ MICROSCOPY_RULES_LONG = [
     r"\bstaining\b",
     r"\bcells\/hpf\b",
     r"\bhigh[- ]power field\b",
+    r"\bmicroscop\w*\b",
+    r"\bconfocal\b",
+    r"\bfluorescen\w*\b.*\bmicroscop\w*\b",
+    r"\belectron\s+microscop\w*\b",
+    r"\bsem\b",  # scanning electron microscopy
+    r"\btem\b",  # transmission electron microscopy
+    r"\bimmunofluorescen\w*\b",
+    r"\bstained\s+section\b",
+    r"\bcell\s+culture\b",
+    r"\bhigh[- ]magnification\b",
 ]
 PATHOLOGY_RULES_LONG = [
     r"\bpathological findings\b",
@@ -1121,12 +1067,23 @@ PATHOLOGY_RULES_LONG = [
     r"\bcell infiltration\b",
     r"\beosinophil counts\b",
     r"\binflammatory cell infiltration\b",
+    r"\bhistolog\w*\b",
+    r"\bh&e\b",
+    r"\bhematoxylin\b",
+    r"\beosin\b",
+    r"\bimmunohistochem\w*\b",
+    r"\bparaffin[- ]embedded\b",
+    r"\btissue\s+section\b",
+    r"\bbiopsy\b",
+    r"\bpatholog\w*\b",
+    r"\bstroma\b",
 ]
 SURGERY_RULES_LONG = [
     r"\bintraoperative\b",
     r"\boperative findings\b",
     r"\bsurgical findings\b",
     r"\bsurgery\b",
+    r"\bsurgical\b",
     r"\bsurgical view\b",
     r"\boperation\b",
     r"\bresected specimen\b",
@@ -1137,7 +1094,17 @@ SURGERY_RULES_LONG = [
     r"\bphoto\b",
     r"\bwound\b",
     r"\blesion photograph\b",
-]
+    r"\bskin\b",
+    r"\bcutaneous\b",
+    r"\bdermatolog\w*\b",
+    r"\bclinical\s+photograph\b",
+    r"\bexternal\s+appearance\b",
+    r"\blesion\b.*\bskin\b",
+    r"\bface\b",
+    r"\boral\s+cavity\b",
+    r"\bphotograph\b",
+    r"\bpatient\s+photo\b"]
+
 ENDOSCOPY_RULES_LONG = [
     r"\bendoscopy\b",
     r"\bendoscopic\b",
@@ -1150,6 +1117,16 @@ ENDOSCOPY_RULES_LONG = [
     r"\benteroscopy\b",
     r"\bcolono fiberscope\b",
     r"\bcf\b",
+    r"\bendoscop\w*\b",
+    r"\bcolonoscopy\b",
+    r"\bgastroscop\w*\b",
+    r"\blaparoscop\w*\b",
+    r"\bbronchoscop\w*\b",
+    r"\bcystoscop\w*\b",
+    r"\barthroscop\w*\b",
+    r"\bduodenoscop\w*\b",
+    r"\besophagoscop\w*\b",
+    r"\bflexible\s+scope\b",
 ]
 CHART_RULES_LONG = [
     r"\bchart\b",
@@ -1186,20 +1163,6 @@ LABEL_PRIORITY = {
     "chart_or_diagram": 34,
 }
 # RULES
-RULES_SHORT = [
-    ("xray_fluoroskopie_angiographie", XRAY_ANGIOGRAPHY_RULES_SHORT),
-    ("us", US_RULES_SHORT),
-    ("ct_kombimodalitaet_spect+ct_pet+ct", CT_HYBRID_RULES_SHORT),
-    ("mrt_hirn", MRT_HIRN_RULES_SHORT),
-    ("mrt_body", MRT_BODY_RULES_SHORT),
-    ("ct", CT_RULES_SHORT),
-    ("xray", XRAY_RULES_SHORT),
-    ("microscopy", MICROSCOPY_RULES_SHORT),
-    ("pathology", PATHOLOGY_RULES_SHORT),
-    ("surgery_real", SURGERY_RULES_SHORT),
-    ("endoscopy", ENDOSCOPY_RULES_SHORT),
-    ("chart_or_diagram", CHART_RULES_SHORT),
-]
 RULES_LONG = [
     ("xray_fluoroskopie_angiographie", XRAY_ANGIOGRAPHY_RULES_LONG),
     ("us", US_RULES_LONG),
@@ -1214,6 +1177,13 @@ RULES_LONG = [
     ("endoscopy", ENDOSCOPY_RULES_LONG),
     ("chart_or_diagram", CHART_RULES_LONG),
 ]
+FILTER_CLASSES = {
+    "microscopy": MICROSCOPY_RULES_LONG,
+    "pathology": PATHOLOGY_RULES_LONG,
+    "surgery_real": SURGERY_RULES_LONG,
+    "endoscopy": ENDOSCOPY_RULES_LONG,
+    "chart_or_diagram": CHART_RULES_LONG,
+    }
 
 def rule_based_classify_with_rules(text: str, rules, label_priority=None):
 
@@ -1232,57 +1202,48 @@ def rule_based_classify_with_rules(text: str, rules, label_priority=None):
     SPECIAL_CLASS_BONUS = {
         "ct": 8,
         "xray_fluoroskopie_angiographie": 5,
-        "us": 2,
+        "us": 8,
     }
-
-    # =========================================================
     # Parallel matching
-    # =========================================================
-
     hits = {}
-
     for label, patterns in rules:
-
         for pattern in patterns:
-
             try:
                 matched = re.search(pattern, t)
-
             except re.error:
                 print(f"Regex Fehler: {pattern}")
                 continue
-
             if matched:
-
                 if label not in hits:
                     hits[label] = {
                         "score": 0,
                         "patterns": [],
                     }
-
                 hits[label]["score"] += 1
                 hits[label]["patterns"].append(pattern)
 
     if not hits:
         return "unknown", "no_rule_match", "", {}
 
-    strong_context_labels = [
-        "surgery_real",
-        "pathology",
-        "microscopy",
-        "endoscopy",
-        "chart_or_diagram",
-    ]
+    # Regeln Filter
+    matched_filter_classes = [cls for cls in hits if cls in FILTER_CLASSES]
 
-    for label in strong_context_labels:
+    # Falls irgendeine starke Filterklasse matched
+    if matched_filter_classes:
+        best_filter = sorted(
+            matched_filter_classes,
+            key=lambda x: (hits[x]["score"], label_priority.get(x, 0)),
+            reverse=True)[0]
 
-        if label in hits:
-            hits[label]["score"] += 3
+        matched_patterns = hits[best_filter]["patterns"]
 
-    # =========================================================
+        return (
+            best_filter,
+            f"forced_filter:{best_filter}",
+            " | ".join(matched_patterns[:5]),
+            hits)
+
     # Bonus fuer spezifische Radiologieklassen
-    # =========================================================
-
     for label, bonus in SPECIAL_CLASS_BONUS.items():
 
         if label in hits:
@@ -1478,7 +1439,7 @@ def early_balanced_sampling(ds, per_class, limit=None):
 
         rule_pred, reason, matched, hits = rule_based_classify_with_rules(
             text, RULES_LONG, LABEL_PRIORITY)
-
+        #Regelfilter
         if rule_pred not in FINAL_CLASSES:
             continue
 
@@ -1759,8 +1720,47 @@ def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_ma
     (Rules + CNN + BERT + LLM Entscheidung)
     """
     text = r.get("caption")
+    original_text = r.get("caption")
     row = r.get("row")
     rule_hits = r.get("rule_hits")
+
+    # Wichtig OCR nur im Multipanel-Fall (i.e. Fig. 2A etc)
+    is_multi, multi_match = is_multipanel_caption(text)
+    if is_multi:
+        image = get_image_from_row(row)
+        if image is not None:
+            ocr_text, ocr_meta = run_ocr_pil(image)
+            panel_sections = split_multipanel_caption(text)
+            # OCR erkennt dominante Panels
+            VALID_PANELS = {"A", "B", "C", "D", "E", "F"}
+            found_panels = []
+            for token in ocr_text.split():
+                token = re.sub(r"[^A-Za-z]", "", token).upper()     #Dann wird: OCR (a) Ergebnis A, [B] zu B
+                if token in VALID_PANELS:
+                    found_panels.append(token)
+
+            found_panels = list(dict.fromkeys(found_panels))
+
+            # Falls OCR z.B. A erkennt:
+            # benutze nur Text von Panel A |----|
+            selected_panel_texts = []
+            for p in found_panels:
+                if p in panel_sections:
+                    selected_panel_texts.append(
+                        panel_sections[p])
+
+            # Falls OCR erfolgreich:
+            # Caption ersetzen
+            if len(selected_panel_texts) > 0:
+                text = " ".join(selected_panel_texts)
+                r["ocr_used"] = True
+                r["ocr_text"] = ocr_text
+                r["selected_panels"] = found_panels
+            else:
+                r["ocr_used"] = False
+        else:
+            r["ocr_used"] = False
+
     # =========================
     # RULES
     # =========================
@@ -1863,109 +1863,6 @@ def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_ma
     rule_pred = top_label(rule_scores)
     bert_pred = top_label(bert_scores)
     cnn_pred = top_label(cnn_scores)
-    # # =========================
-    # # LLM Entscheidung KONFLIKT + CNN LOGIK
-    # # =========================
-    #
-    #
-    # conflict_level = len({
-    #     rule_pred,
-    #     bert_pred,
-    #     cnn_pred})
-    #
-    # # ============================================================
-    # # Unsicherheit
-    # # ============================================================
-    # # cnn_uncertain = (
-    # #         cnn_conf < cnn_thresh
-    # #         or cnn_margin < cnn_margin_thresh
-    # # )
-    #
-    # bert_uncertain = (
-    #         bert_conf < bert_thresh
-    # )
-    #
-    # BERT_EIGENTLICH_STRONG = 0.75
-    # CNN_EIGENTLICH_STRONG = 0.675
-    # # ============================================================
-    # # LLM nötig?
-    # # ============================================================
-    #
-    # use_llm = False
-    #
-    # # 🔴 Fall 1: CNN unsicher + kein Konsens
-    # if cnn_uncertain and conflict_level >= 2:
-    #     use_llm = True
-    #
-    # # 🟢 Fall 2: kompletter Konflikt LLM
-    # if conflict_level == 3:
-    #     if cnn_conf > 0.6 and cnn_margin > 0.17:
-    #         use_llm = False  # CNN sicher.CNN entscheidet
-    #     elif rule_conf >= 1.0 and rule_conf == 1:
-    #         use_llm = False  # Rule_conf immer 1 wenn R. findet, aber mindestens conf lvl soll gelten
-    #     elif bert_conf >= 0.75:
-    #         use_llm = False  # BERT sicher. entscheidet
-    #     # 🔴
-    #     elif rule_pred != cnn_pred and bert_pred != cnn_pred:
-    #         use_llm = True
-    #     else:
-    #         use_llm = True
-    #     print(
-    #         f"R:{rule_pred} "
-    #         f"B:{bert_pred} "
-    #         f"C:{cnn_pred} "
-    #         f"| lvl={conflict_level} "
-    #         f"| conf={cnn_conf:.2f} "
-    #         f"| margin={cnn_margin:.2f} "
-    #         f"| LLM={use_llm}"
-    #     )
-    #
-    # # 🟢 Fall 3: alles einig → KEIN LLM
-    # elif conflict_level == 1:
-    #     use_llm = False
-    #     print(
-    #         f"R:{rule_pred} "
-    #         f"B:{bert_pred} "
-    #         f"C:{cnn_pred} "
-    #         f"| lvl={conflict_level} "
-    #         f"| conf={cnn_conf:.2f} "
-    #         f"| margin={cnn_margin:.2f} "
-    #         f"| LLM={use_llm}"
-    #     )
-    # # 🟢 Fall 4: 2 stimmen überein + CNN sicher
-    # elif conflict_level == 2 and cnn_conf > CNN_EIGENTLICH_STRONG and cnn_margin > 0.1:
-    #     use_llm = False
-    #     print(
-    #         f"R:{rule_pred} "
-    #         f"B:{bert_pred} "
-    #         f"C:{cnn_pred} "
-    #         f"| lvl={conflict_level} "
-    #         f"| conf={cnn_conf:.2f} "
-    #         f"| margin={cnn_margin:.2f} "
-    #         f"| LLM={use_llm}"
-    #     )
-    # # 🔴 Fall 5: Konflikt gegeben, CNN weiss es mittelmaessig
-    # elif conflict_level >= 2 and 0.49 <= cnn_conf < CNN_EIGENTLICH_STRONG:
-    #     use_llm = True
-    # # 🔴 Fall 6: Konflikt gegeben, CNN kann nicht konkretisieren
-    # elif conflict_level == 3 and cnn_margin <= 0.024:
-    #     use_llm = True
-    #
-    # # 🟢 Fall 7: BERT stark + CNN stabil
-    # elif bert_conf >= BERT_EIGENTLICH_STRONG:
-    #     use_llm = False
-    #     print(
-    #         f"R:{rule_pred} "
-    #         f"B:{bert_pred} "
-    #         f"C:{cnn_pred} "
-    #         f"| lvl={conflict_level} "
-    #         f"| conf={cnn_conf:.2f} "
-    #         f"| margin={cnn_margin:.2f} "
-    #         f"| LLM={use_llm}"
-    #     )
-    # else:
-    #     use_llm = False
-
 
     # =========================
     # Debug + Speicherung
@@ -1974,6 +1871,7 @@ def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_ma
         "pmc_id": r["pmc_id"],
         "row_id": r["row_id"],
         "caption": text,
+        "full_caption": original_text,
         "row": row,
 
         "rule_pred": rule_pred,
@@ -1981,8 +1879,6 @@ def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_ma
         "cnn_pred": cnn_pred,
         "bert_conf": bert_conf,
         "cnn3_pred": cnn3_pred,
-
-        # "llm_needed": use_llm,
 
         "rule_scores": rule_scores,
         "bert_scores": bert_scores,
@@ -1993,6 +1889,11 @@ def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_ma
 
         "cnn1_top3": cnn1_top3,
         "cnn2_top3": cnn2_top3,
+
+        "ocr_used": r.get("ocr_used", False),
+        "ocr_meta": r.get("ocr_meta", []),
+        "ocr_text": r.get("ocr_text", ""),
+        "selected_panels": r.get("selected_panels", []),
 
         "cnn3_conf": cnn3_conf,
         "rule_reason": r.get("rule_reason", ""),
@@ -2384,8 +2285,6 @@ def build_balanced_dataset(
                         bert_thresh=bert_thresh,
                         cnn_margin_thresh=cnn_margin_thresh)    #die tresholds von adaptive trehsolds, die die treshs von parser.add_arg haben
 
-        # processed = run_llm_stage(processed, llm)
-
         processed = run_final_fusion(processed)
         if len(presample) == 0:
             print("\nLeerer Presample Chunk")
@@ -2547,73 +2446,6 @@ def build_balanced_dataset(
         print(c, counts[c])
 
     return final
-
-# def run_llm_stage(records, llm):
-#     llm_needed_count = sum(
-#         r.get("llm_needed", False)
-#         for r in records)
-#
-#     no_llm_count = sum(
-#         not r.get("llm_needed", False)
-#         for r in records)
-#
-#     total_count = len(records)
-#
-#     print("\n===== LLM USAGE =====")
-#     print(f"LLM nötig:      {llm_needed_count}")
-#     print(f"Ohne LLM:       {no_llm_count}")
-#     print(f"Gesamt:         {total_count}")
-#
-#     if total_count > 0:
-#         print(f"LLM Anteil: {llm_needed_count / total_count * 100:.2f}%")
-#     # =====================================================
-#     # Nur LLM-Fälle sammeln
-#     # =====================================================
-#     texts = []
-#     llm_indices = []
-#     for i, r in enumerate(records):
-#         if r.get("llm_needed", False):
-#             text = r.get("caption", "")
-#             if not isinstance(text, str):
-#                 text = str(text)
-#
-#             texts.append(text)
-#             llm_indices.append(i)
-#
-#     # =====================================================
-#     # Keine LLM Fälle
-#     # =====================================================
-#     if len(texts) == 0:
-#         for r in records:
-#             r["llm_label"] = None
-#             r["llm_conf"] = 0.0
-#         return records
-#
-#     # =====================================================
-#     # LLM INFERENZ
-#     # =====================================================
-#     llm_results = llm.batch_predict(texts)
-#
-#     # =====================================================
-#     # Mapping zurück
-#     # =====================================================
-#     for idx, (label, conf) in zip(llm_indices, llm_results):
-#
-#         records[idx]["llm_label"] = label
-#         records[idx]["llm_conf"] = conf
-#
-#     # =====================================================
-#     # Defaults für Nicht-LLM
-#     # =====================================================
-#
-#     for r in records:
-#         if "llm_label" not in r:
-#             r["llm_label"] = r.get(
-#                 "quick_label",
-#                 "unknown")
-#             r["llm_conf"] = 0.0
-#
-#     return records
 
 # ============================================================
 # Inspizieren/Distr/Debug/Übersicht
@@ -2821,27 +2653,21 @@ def classify_dataset(
         device)
 
     # ============================================================
-    # Phase 3: Records sammeln (ohne LLM)
+    # Phase 3: Records sammeln
     # ============================================================
     print("\nExtrahiere Records + RULES + CNN + BERT ...")
     print("\nPhase 3: CNN + BERT auf Subset")
     records = process_batch(records0, ctx, cnn_thresh, bert_thresh, cnn_margin_thresh)
     print("records nach batch:", len(records))
-    # ============================================================
-    # Phase 4: LLM initialisieren
-    # ============================================================
-    # print("\nInitialize LLaMa Mistral ...")
-    # llm = LocalLLM(model_path=llamamistral_path)
-    # records = run_llm_stage(records, llm)
 
     # ============================================================
-    # Phase 5: Final fusion
+    # Phase 4: Final fusion
     records = run_final_fusion(records)
 
     existing_records = records
     # ============================================================
     # Volle iterative Build Pipeline:
-    # Phase 6: Post-Balancing
+    # Phase 5: Post-Balancing
     # ============================================================
 
     records = build_balanced_dataset(ds,
@@ -2858,14 +2684,14 @@ def classify_dataset(
         cnn_margin_thresh,
         micro_round_failures)
     # ============================================================
-    # Phase 7: Bilder speichern (f. Viewer)
+    # Phase: Bilder speichern (f. Viewer),
     # ============================================================
     image_output_dir = output_csv.parent / "exported_images"
 
     print("\nSpeichere ausgewählte Bilder ...")
     save_selected_images(records, image_output_dir)
     # ============================================================
-    # Phase 8: Endergebnisse Head ausgeben
+    # Phase: Endergebnisse Head ausgeben
     # ============================================================
     # existing_records haben 'row', entfernen>nicht explodiert
     for r in records:
@@ -2909,10 +2735,6 @@ def classify_dataset(
         print(f"Filter-Rate: {stats['filtered_count'] / len(records0) * 100:.2f}%")
         print(f"Filter-Rate_kept: {stats['filtered_count'] / stats['kept_count'] * 100:.2f}%")
 
-    # print("\n===== DEBUG =====")
-    # print("LLM needed:", sum(r.get("llm_needed", False) for r in records))
-    # print("No LLM:", sum(not r.get("llm_needed", False) for r in records))
-
 # ============================================================
 # CLI
 # ============================================================
@@ -2937,12 +2759,6 @@ def parse_args():
         default=None,
         help="Lokaler Pfad zu BiomedBERT/PubMedBERT"
     )
-    # parser.add_argument(
-    #     "--llamamistral_path",
-    #     type=str,
-    #     required=True,
-    #     help="Lokaler Pfad zum generativen LLM, LLaMA/Mistral Modell"
-    # )
     parser.add_argument(
         "--cnn1_path",
         type=str,
@@ -2976,21 +2792,23 @@ def parse_args():
     parser.add_argument(
         "--refill_presample",
         type=int,
-        default=300,
+        default=400,
         help="Anzahl spätere Nachlade-Chunks Postsample *im* Refill"
     )
     parser.add_argument(
         "--max_rounds",
         type=int,
-        default=20,
+        default=6,
         help="Anzahl Sicherheitslimit im Refill (=Runden Runs Durchlaeufe)"
     )
     parser.add_argument(
         "--cnn_thresh",
         type=float,
         default=0.82,
-        help="CNN confidence threshold für sichere Entscheidungen"
+        help="CNN confidence threshold für sichere Entscheidungen."
     )
+    #höherer Threshold = strenger / konservativer
+    #niedrigerer Threshold = toleranter / mehr akzeptierte Fälle
     parser.add_argument(
         "--bert_thresh",
         type=float,
