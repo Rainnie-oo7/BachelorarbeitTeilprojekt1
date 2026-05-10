@@ -12,13 +12,33 @@ import json
 import threading
 from queue import Queue
 
+def build_image_index(image_dir):
+
+    image_index = {}
+
+    image_dir = Path(image_dir)
+
+    for fp in image_dir.rglob("*"):
+
+        if not fp.is_file():
+            continue
+
+        if fp.suffix.lower() not in [".jpg", ".jpeg", ".png"]:
+            continue
+
+        image_index[fp.name] = fp
+
+    print(f"Indexed images: {len(image_index)}")
+
+    return image_index
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-CSV_PATH = "test_per5.csv"
-IMAGE_DIR = "exported_images"
+CSV_PATH = "/home/b/PycharmProjects/ba1pmc/make_CLS/round_checkpoints/round_004.csv"
+IMAGE_DIR = "/home/b/PycharmProjects/ba1pmc/make_CLS/round_checkpoints/images_after_rounds"
+IMAGE_INDEX = build_image_index(IMAGE_DIR)
 
 THUMB_SIZE = (900, 900)
 
@@ -74,6 +94,34 @@ class AsyncImageLoader:
 # ============================================================
 # MAIN VIEWER
 # ============================================================
+def build_image_path(image_dir, row):
+
+    pmc_id = row.get("pmc_id", "unknown")
+    row_id = row.get("row_id", "unknown")
+
+    label = row.get("final_label")
+
+    if pd.isna(label) or not label:
+        label = row.get("rule_pred", "unknown")
+
+    label = str(label)
+
+    # Klassenordner
+    path = (
+        Path(image_dir)
+        / label
+        / f"{pmc_id}_{row_id}.jpg"
+    )
+
+    # Fallback alter Stil ohne Klassenordner
+    if not path.exists():
+
+        path = (
+            Path(image_dir)
+            / f"{pmc_id}_{row_id}.jpg"
+        )
+
+    return path
 
 class PMCViewer:
 
@@ -318,10 +366,10 @@ class PMCViewer:
 
     def show_image(self, row):
 
-        pmc_id = row.get("pmc_id", "unknown")
-        row_id = row.get("row_id", "unknown")
-
-        path = self.image_dir / f"{pmc_id}_{row_id}.jpg"
+        path = build_image_path(
+            self.image_dir,
+            row
+        )
 
         img = self.loader.get(path)
 
@@ -399,10 +447,10 @@ class PMCViewer:
 
             row = self.filtered_df.iloc[idx]
 
-            pmc_id = row.get("pmc_id", "unknown")
-            row_id = row.get("row_id", "unknown")
-
-            path = self.image_dir / f"{pmc_id}_{row_id}.jpg"
+            path = build_image_path(
+                self.image_dir,
+                row
+            )
 
             paths.append(path)
 

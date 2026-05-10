@@ -29,18 +29,18 @@ python make_CLS/pipeline_0.py \
   --micro_round_failures 40
   > log300test_per5.txt 2>&1
 
-python make_CLS/pipeline_0.py \
+python make_CLS/pipeline_1.py \
   --dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB \
-  --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/test_per5.csv \
-  --biomedbert_path /home/b/Dokumente/biomedbert \
-  --cnn1_path /home/b/Dokumente/cnn1/convu_try_3t.pth \
-  --cnn2_path /home/b/Dokumente/cnn2/convu_folderlabel_mrt_body_mrt_hirn.pth \
-  --cnn3_path /home/b/Dokumente/cnn3/cnn_multiclass.pth \
+  --pre_output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/preoutput_per5000.csv \
+  --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/output_per5000.csv \
+  --cnn1_path /home/b/Dokumente/cnn1/cnn1.pth \
+  --cnn2_path /home/b/Dokumente/cnn2/cnn2.pth \
+  --cnn3_path /home/b/Dokumente/cnn3/cnn3filter.pth \
+  --cnn_strongfilter 0.94 \
+  --cnn_mediumfilter 0.6 \
   --cnn_thresh 0.60 \
-  --bert_thresh 0.68 \
-  --cnn_margin_thresh 0.07 \
-  --micro_round_failures 400
-  > log300test_per5.txt 2>&1
+  --micro_round_failures 500
+  > logrun.txt 2>&1
 
 #################################################################
 # PMC-VIEWER

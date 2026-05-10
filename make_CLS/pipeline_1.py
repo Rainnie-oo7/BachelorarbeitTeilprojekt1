@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-open-pmc Klassifikation mit Rules + BERT + LLM + CNN
+open-pmc Klassifikation mit Rules + CNN
 Erwartete Struktur:
 dataset_root/
     data-00000-of-00059.arrow
@@ -10,19 +10,28 @@ dataset_root/
     dataset_info.json
     state.json
 Beispiel:
-python make_CLS/pipeline_0.py \
+python make_CLS/pipeline_1.py \
   --dataset_root /home/user/PycharmProjects/ba1pmc/PMC-41GB \
-  --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/test_per5.csv \
-  --biomedbert_path /home/user/Dokumente/biomedbert \
-  --llamamistral_path /home/user/Dokumente/LLaMa_Mistral \
-  --cnn1_path /home/user/Dokumente/cnn1/convu_try_3t.pth \
-  --cnn2_path /home/user/Dokumente/cnn2/convu_folderlabel_mrt_body_mrt_hirn.pth \
-  --cnn3_path /home/user/Dokumente/cnn3/cnn_multiclass.pth
-  --cnn_thresh 0.82 \
-  --bert_thresh 0.88 \
-  --cnn_margin_thresh 0.18 \
-  --micro_round_failures 40
-  > log300test_per5.txt 2>&1
+  --pre_output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/testpreper1000.csv \
+  --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/test_per1000.csv \
+  --cnn1_path /home/user/Dokumente/cnn1/cnn1.pth \
+  --cnn2_path /home/user/Dokumente/cnn2/cnn2.pth \
+  --cnn3_path /home/user/Dokumente/cnn3/cnn3filter.pth \
+  --cnn_strongfilter 0.94 \
+  --cnn_mediumfilter 0.6 \
+  --cnn_thresh 0.60 \
+  --micro_round_failures 500
+  > logrun.txt 2>&1
+
+CNN1_CLASS_COUNTS_RAW = {
+    "ct":                                  98158,
+    "ct_kombimodalitaet_spect+ct_pet+ct": 418723,
+    "us":                                  23804,}
+CNN2_CLASS_COUNTS_RAW = {
+    "xray":                                60852,
+    "xray_fluoroskopie_angiographie":       6433,
+    "mrt_hirn":                           337909,
+    "mrt_body":                            32006}
 """
 
 from __future__ import annotations
@@ -50,13 +59,11 @@ import torch.nn.functional as F
 import pandas as pd
 from tqdm import tqdm
 from datasets import Dataset, concatenate_datasets
-from transformers import AutoTokenizer, AutoModel
-from transformers import AutoModelForCausalLM
 
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
 
-# Finale Klassen u. Mapping
+# Klassen u. Mapping
 FINAL_CLASSES = [
     "xray",
     "xray_fluoroskopie_angiographie",
@@ -65,42 +72,28 @@ FINAL_CLASSES = [
     "mrt_body",
     "ct",
     "ct_kombimodalitaet_spect+ct_pet+ct"]
-CNN1_CLASS_NAMES = [
-    'xray',
-    'xray_fluoroskopie_angiographie',
-    'us',
-    'mrt_hirn_flair',
-    'mrt_hirn_t1',
-    'mrt_hirn_t2',
-    'mrt_hirn_t1_c',
-    'mrt_prostata_t1',
-    'mrt_prostata_t2',
+CNN1_CLASS_NAMES = [        #strikt Reihenfolge!!!
     'ct',
-    'ct_kombimodalitaet_spect+ct_pet+ct'
+    'ct_kombimodalitaet_spect+ct_pet+ct',
+    'us',
     ]
 CNN1_MAPPING = {
-    "xray": "xray",
-    "xray_fluoroskopie_angiographie": "xray_fluoroskopie_angiographie",
-    "us": "us",
-    "mrt_hirn_flair": "mrt_hirn",
-    "mrt_hirn_t1": "mrt_hirn",
-    "mrt_hirn_t2": "mrt_hirn",
-    "mrt_hirn_t1_c": "mrt_hirn",
-    "mrt_prostata_t1": "mrt_body",
-    "mrt_prostata_t2": "mrt_body",
     "ct": "ct",
     "ct_kombimodalitaet_spect+ct_pet+ct": "ct_kombimodalitaet_spect+ct_pet+ct",
+    "us": "us"
     }
-CNN2_CLASS_NAMES = [
-    "xray",
-    "xray_fluoroskopie_angiographie",
+CNN2_CLASS_NAMES = [        #strikt Reihenfolge!!!
+    "mrt_body",
     "mrt_hirn",
-    "mrt_body"]
+    "xray",
+    "xray_fluoroskopie_angiographie"
+    ]
 CNN2_MAPPING = {
+    "mrt_body": "mrt_body",
+    "mrt_hirn": "mrt_hirn",
     "xray": "xray",
     "xray_fluoroskopie_angiographie": "xray_fluoroskopie_angiographie",
-    "mrt_hirn": "mrt_hirn",
-    "mrt_body": "mrt_body"}
+   }
 CNN3_CLASS_NAMES = [
     "histologie",
     "haut",
@@ -109,29 +102,16 @@ CNN3_CLASS_NAMES = [
     "mikroskopie",
     "chirurgie",
 ]
-# fuer Weight Log-Scaling. Anzahlen Bild in CNN Custom Finetuning
-CNN1_CLASS_COUNTS_RAW = {
-    "xray": 54419,
-    "xray_fluoroskopie_angiographie": 3000,
-    "us": 23804,
-    "mrt_hirn": 4528,
-    "mrt_body": 1666,
-    "ct": 98158,
-    "ct_kombimodalitaet_spect+ct_pet+ct": 418723
+CNN1_ALLOWED = {
+    "ct",
+    "ct_kombimodalitaet_spect+ct_pet+ct",
+    "us"
 }
-CNN2_CLASS_COUNTS_RAW = {
-    "xray": 60852,
-    "xray_fluoroskopie_angiographie": 6433,
-    "mrt_hirn": 337909,
-    "mrt_body": 32006
-}
-WEIGHTS = {
-    "rules": 0.333,
-    "bert": 0.333,
-    "cnn": 0.333,
-    # "llm": 0.2,
-
-    "cnn3": 0.3
+CNN2_ALLOWED = {
+    "xray",
+    "xray_fluoroskopie_angiographie",
+    "mrt_hirn",
+    "mrt_body"
 }
 # ALLGEMEINE TIERE
 ANIMAL_LIST = [
@@ -284,13 +264,25 @@ def split_multipanel_caption(text):
         return {}, ""
 
     pattern = r"""
-    (?:\(([A-Z])\))      # (A)
+    (?:\(([A-Z])\))                           # (A)
     |
-    (?:\(([a-z])\))      # (a)
+    (?:\(([a-z])\))                           # (a)
     |
-    (?:\bPanel\s+([A-Z])\b)
+    (?:\((\d+)\))                             # (1)
     |
-    (?:^([A-Z])[:\.])
+    (?:\bPanel\s+([A-Z])\b)                   # Panel A
+    |
+    (?:\bPanel\s+(\d+)\b)                     # Panel 1
+    |
+    (?:\bfig(?:ure)?\.?\s*\d+\s*([A-Z])\b)       # Fig 2A
+    |
+    (?:^|\n|\.\s|\;\s)([A-Z])[:\.]            # A:
+    |
+    (?:^|\n|\.\s|\;\s)([a-z])[:\.]            # a:
+    |
+    (?:^|\n|\.\s|\;\s)([A-Z])\s+(?=[A-Z])     # A CT image...
+    |
+    (?:^|\n|\.\s|\;\s)([a-z])\s+(?=[A-Z])     # a CT image...
     """
 
     matches = list(
@@ -318,10 +310,17 @@ def split_multipanel_caption(text):
 
     for i, match in enumerate(matches):
 
-        panel = next(
-            g for g in match.groups()
-            if g is not None
-        ).upper()
+        panel = None
+
+        for g in match.groups():
+
+            if g is not None:
+                panel = str(g).upper()
+                break
+
+        # Kein echtes Panel gefunden
+        if panel is None:
+            continue
 
         start = match.end()
 
@@ -338,14 +337,11 @@ def split_multipanel_caption(text):
 
 ocrreader = easyocr.Reader(
     ['en'],
-    gpu=False
-)
+    gpu=False)
 
 def run_ocr_pil(image):
-
     if image is None:
         return "", []
-
     try:
 
         results = ocrreader.readtext(
@@ -371,86 +367,6 @@ def run_ocr_pil(image):
         print(e)
 
         return "", []
-
-    except Exception as e:
-
-        print("\nOCR Fehler")
-        print(e)
-
-        return ""
-
-# gen. LLM (vLLM READY)
-class LocalLLM:
-    def __init__(self, model_path: str):
-
-        model_path = Path(osp.normpath(model_path))
-
-        if not model_path.exists():
-            raise FileNotFoundError(f"LLM Pfad existiert nicht: {model_path}")
-
-        print("Lade Mistral von:", model_path)
-
-        self.device = "cpu"
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
-
-        self.tokenizer.pad_token = self.tokenizer.eos_token      # verhindert Warnung
-
-        self.model = AutoModelForCausalLM.from_pretrained(model_path,
-            torch_dtype=torch.float32,
-            local_files_only=True)
-
-        self.model.to(self.device)
-        self.model.eval()
-
-        self.model.config.pad_token_id = self.model.config.eos_token_id
-
-    def batch_predict(self, texts, batch_size=8):
-        results = []
-
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-
-            prompts = [
-                f"""Classify into one of {FINAL_CLASSES}.
-Choose one label from {FINAL_CLASSES}
-
-Answer ONLY the label.
-
-Text: {text}
-"""
-
-                for text in batch
-            ]
-
-            inputs = self.tokenizer(
-                prompts,
-                padding=True,
-                truncation=True,
-                return_tensors="pt"
-            ).to(self.device)
-
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=64
-                )
-
-            generated = outputs[:, inputs["input_ids"].shape[1]:]
-
-            decoded = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
-
-            for d in decoded:
-                label = d.strip().lower()
-
-                for cls in FINAL_CLASSES:
-                    if cls in label:
-                        results.append((cls, 0.7))
-                        break
-                else:
-                    results.append(("unknown", 0.0))
-
-        return results
 
 class SimpleCNN(nn.Module):
     def __init__(self, num_classes):
@@ -529,224 +445,12 @@ def map_scores_to_final(full_scores, mapping):
             final_scores[final_cls] += prob
 
     return final_scores
-# CNN fusion mit log-scaled weights of derer Klassen
-def fuse_cnn_weighted(cnn1_scores, cnn2_scores, w1, w2, alpha=0.5):
-    fused = {}
-
-    for c in FINAL_CLASSES:
-        s1 = cnn1_scores.get(c, 0.0)
-        s2 = cnn2_scores.get(c, 0.0)
-
-        # Soft weighting
-        s1_weighted = s1 * (1 + alpha * w1.get(c, 0.0))
-        s2_weighted = s2 * (1 + alpha * w2.get(c, 0.0))
-
-        fused[c] = (s1_weighted + s2_weighted)
-    return fused
-
-def compute_cnn_confidence_and_margin(cnn_scores):
-    # Berechnet:
-    # - cnn_conf   → höchste Wahrscheinlichkeit
-    # - cnn_margin → Abstand zum zweitbesten Label
-    # Args:
-    #     cnn_scores (dict): {label: score}
-    # Returns:
-    #     cnn_conf (float)
-    #     cnn_margin (float)
-    #     top1_label (str)
-    #     top2_label (str)
-
-    if not cnn_scores:
-        return 0.0, 0.0, "none", "none"
-
-    # Sortiere nach Score (absteigend)
-    sorted_items = sorted(
-        cnn_scores.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )
-
-    # Top-1
-    top1_label, top1_score = sorted_items[0]
-
-    # Top-2 (falls vorhanden)
-    if len(sorted_items) > 1:
-        top2_label, top2_score = sorted_items[1]
-    else:
-        top2_label, top2_score = "none", 0.0
-
-    # Confidence
-    cnn_conf = top1_score
-
-    # Margin
-    cnn_margin = top1_score - top2_score
-
-    return cnn_conf, cnn_margin, top1_label, top2_label
-
-# log scaling weights anstatt hard gating of classes (asymmetric classes)
-def compute_model_weights(class_counts, final_classes):
-    import math
-
-    weights = {}
-
-    # Log scaling
-    for c in final_classes:
-        count = class_counts.get(c, 0)
-        weights[c] = math.log(count + 1)
-
-    # Normalisierung
-    max_w = max(weights.values()) if weights else 1.0
-
-    if max_w == 0:
-        return {c: 0.0 for c in final_classes}
-
-    for c in weights:
-        weights[c] /= max_w  # [0,1]
-
-    return weights
-
-cnn1_weights = compute_model_weights(CNN1_CLASS_COUNTS_RAW, FINAL_CLASSES)
-cnn2_weights = compute_model_weights(CNN2_CLASS_COUNTS_RAW, FINAL_CLASSES)
-
-# normalize all in WEIGHTS, da s1_weighted = s1 * (1 + alpha * w1.get(c, 0.0)) = UEBER 1 !!!
-def normalize_scores(scores):
-    total = sum(scores.values())
-    if total == 0:
-        return scores
-    return {k: v / total for k, v in scores.items()}
 
 def is_cnn_uncertain(cnn_conf, cnn_margin, conf_threshold=0.4, margin_threshold=0.03):
     relative_margin = cnn_margin / (cnn_conf + 1e-6)
     # Entscheidet, ob CNN unsicher ist.
     # Returns: bool: True = unsicher → LLM prüfen
     return (cnn_conf < conf_threshold or relative_margin < margin_threshold)
-
-# Final-Classes Fusion # Ein zentrales probabilistisches Fusionssystem.
-def fuse_scores(
-        rule_scores,
-        bert_scores,
-        cnn_scores,
-        llm_label=None,
-        llm_conf=0.0,
-        cnn3_conf=0.0
-):
-    final_scores = {}
-
-    for label in FINAL_CLASSES:
-
-        score = (
-            WEIGHTS["rules"] * rule_scores.get(label, 0.0)
-            + WEIGHTS["bert"] * bert_scores.get(label, 0.0)
-            + WEIGHTS["cnn"] * cnn_scores.get(label, 0.0))
-
-        # CNN3 Trash-Penalty
-        score *= (1.0 - WEIGHTS["cnn3"] * cnn3_conf)
-
-        final_scores[label] = score
-
-    # Normalize
-    total = sum(final_scores.values())
-
-    if total > 0:
-        final_scores = {
-            k: v / total
-            for k, v in final_scores.items()}
-
-    # Top1 / Top2
-    sorted_scores = sorted(
-        final_scores.items(),
-        key=lambda x: x[1],
-        reverse=True)
-
-    top1_label, top1_score = sorted_scores[0]
-
-    if len(sorted_scores) > 1:
-        top2_label, top2_score = sorted_scores[1]
-
-    else:
-        top2_label, top2_score = "none", 0.0
-
-    margin = top1_score - top2_score
-
-    return {
-        "final_label": top1_label,
-        "final_conf": top1_score,
-        "final_margin": margin,
-        "final_scores": final_scores,
-        "top2_label": top2_label,
-        "top2_score": top2_score}
-
-def run_final_fusion(records):
-
-    final_records = []
-
-    for r in records:
-        if r.get("is_filtered", False):
-            continue
-
-        fused = fuse_scores(
-            rule_scores=r["rule_scores"],
-            bert_scores=r["bert_scores"],
-            cnn_scores=r["cnn_scores"],
-            cnn3_conf=r.get("cnn3_conf", 0.0))
-
-        final_scores = fused["final_scores"]
-
-        #schonere Ausgabe ohne { usw
-        r["final_scores_str"] = json.dumps(
-            fused["final_scores"],
-            ensure_ascii=False)
-
-        # CNN3 stärker als jede finale Klasse -> wegfiltern
-        #Es war [cnn3_conf] 0.524... aber  [final_scores_str]{maxlabel"xray": 0.4924.. Wurde nicht weggefiltert
-        cnn3_conf = r.get("cnn3_conf", 0.0)
-
-        max_final_score = max(final_scores.values()) if final_scores else 0.0
-
-        if cnn3_conf > (max_final_score + 0.01):    #0.01 etwas Spielraum geben sonst minimale Unter. filtern bereits weg
-            r["is_filtered"] = True
-            r["filter_reason"] = "cnn3stronger_than_any_cnn"
-            continue
-
-        r["final_label"] = fused["final_label"]
-        r["final_conf"] = fused["final_conf"]
-        r["final_margin"] = fused["final_margin"]
-        r["final_scores"] = fused["final_scores"]
-        r["top2_label"] = fused["top2_label"]
-        r["top2_score"] = fused["top2_score"]
-        final_records.append(r)
-
-    return final_records
-# ============================================================
-# Hash-Sampling (100k Ziel)
-# ============================================================
-def stable_hash_key(key: str) -> int:
-    return int(hashlib.md5(key.encode()).hexdigest(), 16)
-
-def stable_hash_record(record):
-    key = f"{record['pmc_id']}_{record['row_id']}"
-    return stable_hash_key(key)
-
-def stable_hash_index(idx: int) -> int:
-    return stable_hash_key(str(idx))
-
-def select_balanced(records, per_class):
-    buckets = {c: [] for c in FINAL_CLASSES}
-
-    for r in records:
-        label = r["final_label"]
-        if label in buckets:
-            buckets[label].append(r)
-
-    final = []
-    for c in buckets:
-        sorted_bucket = sorted(
-            buckets[c],
-            key=stable_hash_record
-        )
-        final.extend(sorted_bucket[:per_class])
-
-    return final
 
 # ============================================================
 # Text-Normalisierung
@@ -1380,6 +1084,35 @@ def predict_with_cnn(model, image, transform, device, class_names):
         return [], {}
 
 # ============================================================
+# Rules müssen eindeutig sein CNN muss zustimmen
+# ============================================================
+AGREEMENT_CNN_CONF = 0.80
+AGREEMENT_CNN_MARGIN = 0.20
+
+
+def get_top_prediction(score_dict):
+
+    if not score_dict:
+        return None, 0.0, 0.0
+
+    sorted_items = sorted(
+        score_dict.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    top1_label, top1_score = sorted_items[0]
+
+    if len(sorted_items) > 1:
+        top2_score = sorted_items[1][1]
+    else:
+        top2_score = 0.0
+
+    margin = top1_score - top2_score
+
+    return top1_label, top1_score, margin
+
+# ============================================================
 # Fast pre-sampling (nur Rules)
 # ============================================================
 # ============================================================
@@ -1425,21 +1158,20 @@ def debug_sampling(records, per_class, class_key="rule_pred"):
             print(f"{cls}: {c}")
 
     if not ok:
-        raise ValueError("Sampling ist nicht balanced!")
+        print("\nWARNUNG: Early sampling noch nicht vollständig balanced.")
 
     print("\nSampling korrekt balanced!")
 
-def early_balanced_sampling(ds, per_class, limit=None):
+def early_balanced_sampling(ds, per_class, limit=None, early_presample=None):
 
     buckets = defaultdict(list)
 
-    # Hash-basierte Reihenfolge (=reproduktiv zufaellig)
     indices = list(range(len(ds)))
-    indices.sort(key=stable_hash_index)
+    random.shuffle(indices)
 
     max_n = min(len(indices), limit) if limit is not None else len(indices)
 
-    for idx in tqdm(indices[:max_n], desc="Early sampling (RULES only)"):
+    for n_processed, idx in enumerate(tqdm(indices[:max_n], desc="Early sampling (Rules, Panelsearch, Rule & Animals Filtering)")):
 
         row = ds[idx]
 
@@ -1457,17 +1189,67 @@ def early_balanced_sampling(ds, per_class, limit=None):
             continue
 
         # MULTIPANEL FILTER
+        # =========================================================
+        # MULTIPANEL + OCR
+        # =========================================================
+
         is_multi, multi_match = is_multipanel_caption(text)
+
         if is_multi:
-            # rejected_samples.append({
-            #     "reason": "multipanel_caption",
-            #     "matched_term": multi_match,
-            #     "caption": text
-            # })
-            continue
+
+            image = get_image_from_row(row)
+
+            if image is not None:
+
+                ocr_text, ocr_meta = run_ocr_pil(image)
+
+                panel_sections, prefix_text = split_multipanel_caption(text)
+
+                VALID_PANELS = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14"}
+
+                found_panels = []
+
+                for token in ocr_text.split():
+
+                    token = re.sub(
+                        r"[^A-Za-z0-9]",
+                        "",
+                        token
+                    ).upper()
+
+                    if token in VALID_PANELS:
+                        found_panels.append(token)
+
+                # duplicates entfernen
+                found_panels = list(dict.fromkeys(found_panels))
+
+                selected_panel_texts = []
+
+                for p in found_panels:
+
+                    if p in panel_sections:
+                        combined_text = (
+                                prefix_text + " " + panel_sections[p]
+                        ).strip()
+
+                        selected_panel_texts.append(combined_text)
+
+                # OCR erfolgreich
+                if len(selected_panel_texts) > 0:
+
+                    text = " ".join(selected_panel_texts)
+
+                # OCR erfolglos
+                else:
+
+                    # Fallback:
+                    # ganzen Text behalten
+                    pass
 
         rule_pred, reason, matched, hits = rule_based_classify_with_rules(
             text, RULES_LONG, LABEL_PRIORITY)
+        # print("rule_pred:", rule_pred)
+        # print("text:", text[:250])
         #Regelfilter
         if rule_pred not in FINAL_CLASSES:
             continue
@@ -1495,6 +1277,9 @@ def early_balanced_sampling(ds, per_class, limit=None):
             print(f"\nAlle Klassen voll (per_class) bei idx={idx} → STOP")
             break
 
+        if early_presample is not None and n_processed >= early_presample:
+            print(f"\nEarly presample limit erreicht: {early_presample}")
+            break
     # Flatten
     records = []
     for c in FINAL_CLASSES:
@@ -1503,182 +1288,6 @@ def early_balanced_sampling(ds, per_class, limit=None):
     print(f"\nGesammelt: {len(records)} Samples")
 
     return records
-
-# ============================================================
-# Similarity-BERT-Klassifikation (Cosine-Ahnlichkeit zu gegebener Description)
-# ============================================================
-
-CLASS_TEXTS: Dict[str, str] = {
-    "xray": (
-        "X-ray radiography, radiograph, plain radiograph, chest x-ray, abdominal x-ray, "
-        "skeletal radiograph, projection radiography, conventional x-ray, AP view, PA view, "
-        "lateral view, portable x-ray, panoramic radiograph, dorsoplantar projection, "
-        "plain film, frontal radiograph, lateral radiograph."
-    ),
-    "xray_fluoroskopie_angiographie": (
-        "Fluoroscopy, fluoroscopic x-ray imaging, real-time x-ray imaging, c-arm fluoroscopy, "
-        "x-ray guided interventional procedure, fluoroscopic guidance, contrast fluoroscopy, "
-        "angiography, angiographic image, digital subtraction angiography, DSA, catheter angiography, "
-        "vascular intervention, angioplasty, balloon angioplasty, percutaneous transluminal angioplasty, "
-        "PTA, PTCA, coronary angioplasty, stent placement, percutaneous coronary intervention, PCI."
-    ),
-    "us": (
-        "Ultrasound imaging, sonography, ultrasonography, echography, echocardiography, "
-        "B-mode ultrasound, doppler ultrasound, duplex sonography, endoscopic ultrasound, EUS, "
-        "color doppler, power doppler, sonographic examination, ultrasonographic image."
-    ),
-    "mrt_hirn": (
-        "Brain MRI, cranial MRI, cerebral MRI, neuro MRI, head MRI, magnetic resonance imaging of the brain, "
-        "T1-weighted brain MRI, T2-weighted brain MRI, FLAIR brain MRI, fluid-attenuated inversion recovery, "
-        "DWI brain MRI, ADC brain MRI, contrast-enhanced T1 brain MRI, gadolinium-enhanced brain MRI, "
-        "post-contrast brain MRI, axial brain MRI, sagittal brain MRI, coronal brain MRI."
-    ),
-    "mrt_body": (
-        "Body MRI, magnetic resonance imaging outside the brain, abdominal MRI, pelvic MRI, prostate MRI, "
-        "breast MRI, liver MRI, renal MRI, kidney MRI, cardiac MRI, heart MRI, spine MRI, knee MRI, "
-        "whole-body MRI, multiparametric prostate MRI, mpMRI, prostate T1-weighted MRI, prostate T2-weighted MRI, "
-        "diffusion-weighted prostate MRI, ADC map of prostate MRI, dynamic contrast-enhanced prostate MRI, DCE MRI, "
-        "pelvic MR imaging of the prostate gland."
-    ),
-    "ct": (
-        "Computed tomography, CT scan, computed tomographic image, axial CT, coronal CT, sagittal CT, "
-        "contrast-enhanced CT, non-contrast CT, helical CT, multidetector CT, MDCT, HRCT, "
-        "brain CT, chest CT, abdominal CT, pelvic CT, Hounsfield units."
-    ),
-    "ct_kombimodalitaet_spect+ct_pet+ct": (
-        "Hybrid CT imaging with PET or SPECT, PET/CT, PET-CT, fused PET-CT image, hybrid PET/CT imaging, "
-        "co-registered PET and CT, combined positron emission tomography and computed tomography, "
-        "SPECT/CT, SPECT-CT, fused SPECT-CT image, hybrid single-photon emission computed tomography and CT, "
-        "nuclear medicine hybrid imaging, tracer uptake co-registered with CT anatomy."
-    ),
-    "microscopy": (
-        "Microscopy, microscopic image, histology, histopathology, pathology slide, tissue section, "
-        "H and E stain, hematoxylin and eosin staining, immunohistochemistry, IHC staining, "
-        "cells per high-power field, microscopic tissue morphology."
-    ),
-    "pathology": (
-        "Pathology, pathological findings, biopsy findings, tissue pathology, biopsy specimen, "
-        "inflammatory cells, eosinophil counts, pathological examination, tissue specimen, "
-        "cell infiltration, histopathological diagnosis."
-    ),
-    "surgery_real": (
-        "Real clinical photograph, photo, a photo of, photograph, surgical photograph, intraoperative photograph, operative findings, "
-        "surgical field, surgical view, surgical photo, photo of surgery, photo of surgical, gross, macroscopic specimen, resected specimen, gross specimen, "
-        "wound photograph, lesion photograph, real-world medical image from operation or clinical examination."
-    ),
-    "endoscopy": (
-        "Endoscopy, colonoscopy, gastroscopy, bronchoscopy, enteroscopy, duodenoscopy, laparoscopic view, "
-        "endoscopic findings, mucosal findings, colono fiberscope, gastrointestinal endoscopy."
-    ),
-    "chart_or_diagram": (
-        "Chart, graph, plot, line graph, bar chart, histogram, box plot, schematic, workflow figure, "
-        "timeline, clinical course figure, therapeutic management chart, Kaplan-Meier curve, ROC curve."
-    ),
-    "unknown": (
-        "Unknown or not identifiable modality, insufficient information, unclear caption."
-    ),
-}
-
-class BertSimilarityClassifier:
-    def __init__(
-        self,
-        model_path: str,
-        device: Optional[str] = None,
-        max_length: int = 128,
-    ):
-        self.model_path = model_path
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.max_length = max_length
-
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path,
-            local_files_only=True,
-            use_fast=True
-        )
-        self.model = AutoModel.from_pretrained(
-            model_path,
-            local_files_only=True
-        ).to(self.device)
-        self.model.eval()
-
-        self.labels = list(CLASS_TEXTS.keys())
-        self.label_texts = [CLASS_TEXTS[label] for label in self.labels]
-        self.label_embs = self._encode_texts(self.label_texts, batch_size=16)
-
-    @torch.no_grad()
-    def _mean_pool(self, last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
-        summed = (last_hidden_state * mask).sum(dim=1)
-        counts = mask.sum(dim=1).clamp(min=1e-9)
-        return summed / counts
-
-    @torch.no_grad()
-    def _encode_texts(self, texts: List[str], batch_size: int = 16) -> torch.Tensor:
-        all_embs = []
-
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-
-            enc = self.tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                max_length=self.max_length,
-                return_tensors="pt"
-            )
-            enc = {k: v.to(self.device) for k, v in enc.items()}
-
-            out = self.model(**enc)
-            pooled = self._mean_pool(out.last_hidden_state, enc["attention_mask"])
-            pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
-            all_embs.append(pooled.cpu())
-
-        return torch.cat(all_embs, dim=0)
-
-    @torch.no_grad()
-    def predict_batch(
-        self,
-        texts: List[str],
-        threshold: float = 0.30,
-        batch_size: int = 32,
-    ) -> List[Dict]:
-        text_embs = self._encode_texts(texts, batch_size=batch_size)
-        sims = text_embs @ self.label_embs.T
-
-        results = []
-        for i in range(sims.shape[0]):
-            row = sims[i]
-            best_idx = int(torch.argmax(row).item())
-            best_score = float(row[best_idx].item())
-            label = self.labels[best_idx]
-
-            if best_score < threshold:
-                label = "unknown"
-
-            sorted_idx = torch.argsort(row, descending=True).tolist()
-            top2 = [(self.labels[j], float(row[j].item())) for j in sorted_idx[:2]]
-
-            results.append({
-                "label": label,
-                "score": best_score,
-                "top2": top2,
-            })
-
-        return results
-# ============================================================
-# Dense-linear-Layer-Softmax über Embeddings (klassisches antrainieren) BERT-Klassifikation
-# ============================================================
-class BertClassifier(nn.Module):
-    def __init__(self, bert_model, num_classes):
-        super().__init__()
-        self.bert = bert_model
-        self.classifier = nn.Linear(768, num_classes)
-
-    def forward(self, input_ids, attention_mask):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        cls = outputs.last_hidden_state[:, 0]
-        return self.classifier(cls)
-# braucht Trainingsdaten
 
 # ============================================================
 # Arrow-Dateien laden
@@ -1709,14 +1318,12 @@ def load_arrow_shards(arrow_files: List[Path]) -> Dataset:
 class ModelContext:
     def __init__(
         self,
-        bert_clf,
         cnn1_model,
         cnn2_model,
         cnn3_model,
         cnn_transform,
         device
     ):
-        self.bert = bert_clf
         self.cnn1 = cnn1_model
         self.cnn2 = cnn2_model
         self.cnn3 = cnn3_model
@@ -1743,11 +1350,9 @@ def top_label(scores):
 # ============================================================
 # Verarbeitung (Ph. 3)
 # ============================================================
-def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_margin_thresh):
-    """
-    Das ist mein Phase-3 Code für ein Sample
-    (Rules + CNN + BERT + LLM Entscheidung)
-    """
+def process_single_record(r, ctx: ModelContext, cnn_strongfilter,
+cnn_mediumfilter, cnn_thresh):
+    # Das ist mein Phase-3 Code für ein Sample (Rules + CNN)
     text = r.get("caption")
     original_text = r.get("caption")
     row = r.get("row")
@@ -1759,12 +1364,26 @@ def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_ma
         image = get_image_from_row(row)
         if image is not None:
             ocr_text, ocr_meta = run_ocr_pil(image)
+            r["ocr_meta"] = ocr_meta
             panel_sections, prefix_text = split_multipanel_caption(text)
+            # print("\n===== PANEL DEBUG =====")
+            # print("TEXT:")
+            # print(text)
+            #
+            # print("\nPREFIX:")
+            # print(prefix_text)
+            #
+            # print("\nPANELS FOUND:")
+            # print(panel_sections.keys())
+            #
+            # for k, v in panel_sections.items():
+            #     print(f"\nPANEL {k}:")
+            #     print(v[:300])
             # OCR erkennt dominante Panels
             VALID_PANELS = {"A", "B", "C", "D", "E", "F"}
             found_panels = []
             for token in ocr_text.split():
-                token = re.sub(r"[^A-Za-z]", "", token).upper()     #Dann wird: OCR (a) Ergebnis A, [B] zu B
+                token = re.sub(r"[^A-Za-z0-9]", "", token).upper()
                 if token in VALID_PANELS:
                     found_panels.append(token)
 
@@ -1799,32 +1418,6 @@ def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_ma
         rule_scores[r["rule_pred"]] = 1.0
 
     # =========================
-    # BERT
-    # =========================
-    if ctx.bert:
-        if text is None:
-            text = ""
-
-        if not isinstance(text, str):
-            text = str(text)
-
-        text = text.strip()
-
-        if len(text) == 0:
-            text = "unknown"
-
-        bert_out = ctx.bert.predict_batch([text])[0]
-        bert_scores = {c: 0.0 for c in FINAL_CLASSES}
-        if bert_out["label"] in FINAL_CLASSES:
-            bert_scores[bert_out["label"]] = bert_out["score"]
-    else:
-        bert_scores = {c: 0.0 for c in FINAL_CLASSES}
-        bert_out = {"label": "none", "score": 0.0}
-    # =========================Umgehung, weil manchmal selbst row None war
-    if row is None:
-        print("\nRow ist None")
-        return None
-    # =========================
     # CNN1 + CNN2
     # =========================
     image = get_image_from_row(row)
@@ -1837,62 +1430,137 @@ def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_ma
         ctx.cnn2, image, ctx.transform, ctx.device, CNN2_CLASS_NAMES)
     cnn2_scores = map_scores_to_final(cnn2_full, CNN2_MAPPING)
 
-    cnn_scores = fuse_cnn_weighted(cnn1_scores, cnn2_scores, cnn1_weights, cnn2_weights, alpha=0.5)
-    cnn_scores = normalize_scores(cnn_scores)
+    for k in FINAL_CLASSES:
+        v = cnn2_scores.get(k, 0.0)
+        # print(f"{k:<45} {v:.6f}")
+
+    # ============================================================
+    # CNN1 Spezialist
+    # ============================================================
+    cnn1_best = "unknown"
+    cnn1_conf = 0.0
+    cnn1_allowed = False
+
+    if cnn1_top3:
+        best_label, best_score = cnn1_top3[0]
+
+        mapped = CNN1_MAPPING.get(best_label, "unknown")
+
+        cnn1_best = mapped
+        cnn1_conf = best_score
+
+        if mapped in CNN1_ALLOWED:
+            cnn1_allowed = True
+
+    # ============================================================
+    # CNN2 Spezialist
+    # ============================================================
+    cnn2_best = "unknown"
+    cnn2_conf = 0.0
+    cnn2_allowed = False
+
+    if cnn2_top3:
+        best_label, best_score = cnn2_top3[0]
+
+        mapped = CNN2_MAPPING.get(best_label, "unknown")
+
+        cnn2_best = mapped
+        cnn2_conf = best_score
+
+        if mapped in CNN2_ALLOWED:
+            cnn2_allowed = True
+
+    # ============================================================
+    # Finale Expertenentscheidung
+    # ============================================================
+    final_label = "unknown"
+    final_conf = 0.0
+    decision_source = "none"
+
+    if cnn1_allowed and cnn1_conf >= cnn_thresh:
+
+        final_label = cnn1_best
+        final_conf = cnn1_conf
+        decision_source = "cnn1"
+
+    elif cnn2_allowed and cnn2_conf >= cnn_thresh:
+
+        final_label = cnn2_best
+        final_conf = cnn2_conf
+        decision_source = "cnn2"
+
+    # print("decision_source:", decision_source)
+    # print("label:", final_label)
+    # print("conf:", final_conf)
+    cnn_pred = final_label
+    cnn_conf_final = final_conf
+
+    # ============================================================
+    # AGREEMENT FILTER
+    # ============================================================
+
+    rule_pred = r.get("rule_pred", "unknown")
+
+    cnn_pred_label = final_label
+
+    cnn_margin = abs(cnn1_conf - cnn2_conf)
+
+    AGREEMENT_CNN_CONF = 0.80
+    AGREEMENT_CNN_MARGIN = 0.20
+
+    agreement_pass = (
+            rule_pred == cnn_pred_label
+            and cnn_conf_final >= AGREEMENT_CNN_CONF
+            and cnn_margin >= AGREEMENT_CNN_MARGIN
+    )
+
+    # Konflikt -> sofort rauswerfen
+    if not agreement_pass:
+        r["is_filtered"] = True
+        r["filter_reason"] = "rule_cnn_disagreement"
+
+        return r
+
     # =========================
     # CNN3 Filtering + CNN1&CNN2-Uncertainty Filtering
     # =========================
-    cnn_conf, cnn_margin, _, _ = compute_cnn_confidence_and_margin(cnn_scores)
-
-    cnn_uncertain = is_cnn_uncertain(cnn_conf, cnn_margin)
-
     cnn3_top3, cnn3_full = predict_with_cnn(
         ctx.cnn3, image, ctx.transform, ctx.device, CNN3_CLASS_NAMES)
     cnn3_pred = top_label(cnn3_top3)
-    CNN3_STRONG = 0.93
-    CNN3_MEDIUM = 0.65
-    # rule_conf = max(rule_scores.values())
-    rule_conf = max(
-        v["score"]
-        for v in rule_hits.values()
-    ) if rule_hits else 0
-    bert_conf = max(bert_scores.values())
+
     if cnn3_full:
         cnn3_conf = max(cnn3_full.values())
     else:
         cnn3_conf = 0.0
-    if cnn3_conf >= CNN3_STRONG:
-        # sehr sicher Rauswurf
-        r["is_filtered"] = True
-        r["filter_reason"] = "cnn3_strong"
-        return r
 
-    elif cnn3_conf >= CNN3_MEDIUM:
-        # unsicher. nur filtern wenn andere schwach
-        if bert_conf <= 0.5 and cnn_conf <= 0.5:
+    expert_conf = max(cnn1_conf, cnn2_conf)
+
+    if cnn3_conf >= cnn_strongfilter:
+        if expert_conf <= 0.65:
+            r["is_filtered"] = True
+            r["filter_reason"] = "cnn3_strong"
+            return r
+
+    elif cnn3_conf >= cnn_mediumfilter:
+        if expert_conf <= 0.465:
             r["is_filtered"] = True
             r["filter_reason"] = "cnn3_medium"
+
             return r
-    # Idee:
-    # CNN3 darf nur filtern, wenn:
-    # - Konsens, - andere Modelle nicht stark sind
-    # - gehört zu Filterklassen
-    # - CNN3 ziemlich sicher ist
-    CNN3_CONF_MIN = 0.745  # (0.55) aber hochgetan: Ueber 0.745 sind es Trash-Bilder
-    PRE_CONF_MAX = 0.7  # (0.35) (0.66) aber hochgedrillt: nach 0.7 sind sich die anderen modelle sicher
-    # Klassen der Modelle muessen >0.7 haben. Muellmann moechte nur >=0.75.
-    # Wenn Muellmann selbst unsicher ist, ist >0.7 gut genug, um als Klasse angenommen zu werden
+
+    CNN3_CONF_MIN = 0.96
+    PRE_CONF_MAX = 0.45
+
     if (
-        cnn3_conf > CNN3_CONF_MIN and
-        bert_conf < PRE_CONF_MAX and
-        cnn_conf < PRE_CONF_MAX):       #sehr viel fg
+            cnn3_conf > CNN3_CONF_MIN
+            and cnn1_conf < PRE_CONF_MAX
+            and cnn2_conf < PRE_CONF_MAX
+    ):
         r["is_filtered"] = True
         r["filter_reason"] = "noconsent"
         return r
 
     rule_pred = top_label(rule_scores)
-    bert_pred = top_label(bert_scores)
-    cnn_pred = top_label(cnn_scores)
 
     # =========================
     # Debug + Speicherung
@@ -1905,17 +1573,15 @@ def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_ma
         "row": row,
 
         "rule_pred": rule_pred,
-        "bert_pred": bert_pred,
         "cnn_pred": cnn_pred,
-        "bert_conf": bert_conf,
         "cnn3_pred": cnn3_pred,
 
-        "rule_scores": rule_scores,
-        "bert_scores": bert_scores,
-        "cnn_scores": cnn_scores,
+        "final_label": final_label,
+        "final_conf": final_conf,
+        "final_margin": final_conf,
 
-        "cnn_conf": cnn_conf,
-        "cnn_margin": cnn_margin,
+        "rule_scores": rule_scores,
+        "decision_source": decision_source,
 
         "cnn1_top3": cnn1_top3,
         "cnn2_top3": cnn2_top3,
@@ -1933,27 +1599,28 @@ def process_single_record(r, ctx: ModelContext,  cnn_thresh, bert_thresh, cnn_ma
     }
 
     return result
+
 def process_batch(
     presample,
     ctx,
-    cnn_thresh,
-    bert_thresh,
-    cnn_margin_thresh):
+    cnn_strongfilter,
+    cnn_mediumfilter,
+    cnn_thresh):
 
     processed = []
     filtered_counts = Counter()
 
     # Parallele Verarbeitung
-    with ThreadPoolExecutor(max_workers=12) as ex:
+    with ThreadPoolExecutor(max_workers=10) as ex:
 
         futures = [
             ex.submit(
                 process_single_record,
                 r,
                 ctx,
-                cnn_thresh,
-                bert_thresh,
-                cnn_margin_thresh
+                cnn_strongfilter,
+                cnn_mediumfilter,
+                cnn_thresh
             )
             for r in presample
         ]
@@ -1961,7 +1628,7 @@ def process_batch(
         for fut in tqdm(
                 as_completed(futures),
                 total=len(futures),
-                desc="Processing"):
+                desc="CNN Processing"):
             try:
                 out = fut.result()
 
@@ -1999,9 +1666,8 @@ def process_batch(
 # Voraussetzung: existieren bereits:
 #
 # FINAL_CLASSES
-# stable_hash_record()
+# zufallsrecord()
 # process_single_record()
-# run_final_fusion()
 # extract_text_from_row()
 
 # ============================================================
@@ -2031,8 +1697,7 @@ def fast_local_balancing(existing, pool, per_class):
         (r["pmc_id"], r["row_id"])
         for r in existing)
 
-    # Aus presamp. Deterministisch
-    pool = sorted(pool, key=stable_hash_record)
+    random.shuffle(pool)
 
     # FILL
     for r in pool:
@@ -2059,48 +1724,34 @@ def fast_local_balancing(existing, pool, per_class):
     # FINAL
     final = []
     for c in FINAL_CLASSES:
-        bucket = sorted(buckets[c],
-            key=stable_hash_record)
+        random.shuffle(buckets[c])
+        final.extend(buckets[c][:per_class])
 
-        final.extend(bucket[:per_class])
     return final
 
 # ============================================================
 # PRESAMPLE AUS GROSSEM DATASET
 # ============================================================
 def sample_new_chunk(ds, global_used, sample_size=100):
-    candidates = []
-# --------------------------------------------------------
-# Hash-stabile Reihenfolge
-# --------------------------------------------------------
-    for idx in range(len(ds)):
-        row = ds[idx]
-        try:
-            text, meta = extract_text_from_row(row)
-        except Exception:
-            continue
 
-        key = (meta.get("PMC_ID", ""),idx)
-
-        if key in global_used:
-            continue
-
-        record = {
-            "pmc_id": meta.get("PMC_ID", ""),
-            "row_id": idx}
-
-        h = stable_hash_record(record)
-
-        candidates.append((h, idx))
-    candidates.sort(key=lambda x: x[0])
+    indices = list(range(len(ds)))
+    random.shuffle(indices)
 
     selected = []
 
-    for _, idx in candidates[:sample_size]:
+    for idx in indices:
+
         row = ds[idx]
+
         try:
             text, meta = extract_text_from_row(row)
+
         except Exception:
+            continue
+
+        key = (meta.get("PMC_ID", ""), idx)
+
+        if key in global_used:
             continue
 
         r = {
@@ -2108,9 +1759,13 @@ def sample_new_chunk(ds, global_used, sample_size=100):
             "caption": text,
             "pmc_id": meta.get("PMC_ID", ""),
             "row_id": idx,
-            "rule_pred": "unknown"}
+            "rule_pred": "unknown"
+        }
 
         selected.append(r)
+
+        if len(selected) >= sample_size:
+            break
 
     return selected
 
@@ -2125,11 +1780,11 @@ def build_balanced_dataset(
         refill_presample,
         per_class,
         max_rounds,
-
+        cnn_strongfilter,
+        cnn_mediumfilter,
         cnn_thresh,
-        bert_thresh,
-        cnn_margin_thresh,
-        micro_round_failures):
+        micro_round_failures,
+        output_csv):
     # --------------------------------------------------------
     # Global
     # --------------------------------------------------------
@@ -2206,23 +1861,7 @@ def build_balanced_dataset(
             decay=0.04
         )
 
-        bert_thresh = adaptive_threshold(
-            start=bert_thresh,
-            min_value=0.60,
-            refill_round=effective_round,
-            decay=0.035
-        )
-
-        cnn_margin_thresh = adaptive_threshold(
-            start=cnn_margin_thresh,
-            min_value=0.08,
-            refill_round=effective_round,
-            decay=0.015
-        )
-
         print(f"\nCNN Threshold: {cnn_thresh:.3f}")
-        print(f"BERT Threshold: {bert_thresh:.3f}")
-        print(f"Margin Threshold: {cnn_margin_thresh:.3f}")
 
         # ====================================================
         # Presample Size
@@ -2266,7 +1905,13 @@ def build_balanced_dataset(
         # ====================================================
         presample = []
 
-        for local_idx, row in enumerate(candidate_chunk):
+        for local_idx, row in enumerate(
+                tqdm(
+                    candidate_chunk,
+                    desc="Prepare Presample",
+                    total=len(candidate_chunk),
+                    leave=False
+                )):
             key = row["__key__"]
             # --------------------------------------------
             # Arrow-Webds hat rohe Felder ['__key__', '__url__', 'jpg', 'jsonl']. Fuer global genutzt ja/nein Filter reicht blosses __key__
@@ -2274,14 +1919,18 @@ def build_balanced_dataset(
             # --------------------------------------------
             if key in global_used:
                 continue
-
-            global_used.add(key)
             # --------------------------------------------
             # Text extrahieren
             # --------------------------------------------
             text, meta = extract_text_from_row(row)
 
             text = normalize_text(text)
+
+            rule_pred, reason, matched, hits = rule_based_classify_with_rules(
+                text,
+                RULES_LONG,
+                LABEL_PRIORITY
+            )
             # --------------------------------------------
             # Leere Texte ignorieren
             # --------------------------------------------
@@ -2303,7 +1952,13 @@ def build_balanced_dataset(
                 "pmc_id": meta.get("PMC_ID", ""),
                 "caption": text,
                 "row": row,
+                "rule_pred": rule_pred,
+                "rule_reason": reason,
+                "rule_hits": hits,
+                "matched_patterns": matched.split(" | ") if matched else [],
                 "modality_gt": meta.get("modality", "unknown")}
+
+            global_used.add(key)
 
             presample.append(record)
 
@@ -2311,11 +1966,10 @@ def build_balanced_dataset(
         processed = process_batch(
                         presample,
                         ctx,
-                        cnn_thresh=cnn_thresh,
-                        bert_thresh=bert_thresh,
-                        cnn_margin_thresh=cnn_margin_thresh)    #die tresholds von adaptive trehsolds, die die treshs von parser.add_arg haben
+                        cnn_strongfilter=cnn_strongfilter,
+                        cnn_mediumfilter=cnn_mediumfilter,
+                        cnn_thresh=cnn_thresh)    #die tresholds von adaptive trehsolds, die die treshs von parser.add_arg haben
 
-        processed = run_final_fusion(processed)
         if len(presample) == 0:
             print("\nLeerer Presample Chunk")
             continue
@@ -2375,22 +2029,13 @@ def build_balanced_dataset(
             final_margin = r.get("final_margin", 0.0)
 
             accept_threshold = adaptive_threshold(
-                start=0.72,
-                min_value=0.45,
+                start=0.58,
+                min_value=0.40,
                 refill_round=effective_round,
-                decay=0.025
+                decay=0.02
             )
 
-            margin_threshold = adaptive_threshold(
-                start=0.18,
-                min_value=0.05,
-                refill_round=effective_round,
-                decay=0.01
-            )
-
-            accept = (
-                    final_conf >= accept_threshold
-                    and final_margin >= margin_threshold)
+            accept = final_conf >= accept_threshold
             # --------------------------------------------
             # Accept / Remaining
             # --------------------------------------------
@@ -2442,7 +2087,45 @@ def build_balanced_dataset(
             stagnation_counter = 0
 
         print(f"\nStagnation Counter: {stagnation_counter}")
+        # ====================================================
+        # ROUND CHECKPOINT SAVE
+        # ====================================================
+        print("\nSpeichere Round-Checkpoint ...")
+        round_dir = output_csv.parent / "round_checkpoints"
 
+        round_dir.mkdir(parents=True, exist_ok=True)
+        # CSV
+        checkpoint_csv = (
+                round_dir
+                / f"round_{effective_round:03d}.csv"
+        )
+
+        save_records = []
+
+        for rr in accepted_records:
+            tmp = dict(rr)
+
+            # Arrow-Zeilen entfernen
+            tmp.pop("row", None)
+
+            save_records.append(tmp)
+
+        df_round = pd.DataFrame(save_records)
+
+        df_round.to_csv(
+            checkpoint_csv,
+            index=False,
+            encoding="utf-8")
+        print(f"Checkpoint CSV: {checkpoint_csv}")
+        # Bilder
+        checkpoint_img_dir = (round_dir / "images_after_rounds")
+
+        # überschreibt einfach dieselbe Datei. Neue Bilder werden einfach ergänzt.
+        save_selected_images(
+            accepted_records,
+            checkpoint_img_dir)
+
+        print(f"Checkpoint Bilder: {checkpoint_img_dir}")
         if stagnation_counter >= 100:
             print("\nRefill stagniert -> Abbruch")
             break
@@ -2560,17 +2243,30 @@ def save_selected_images(records, output_dir):
     saved = 0
 
     for r in records:
-        row = r["row"]
+        row = r.get("row")
+
+        if row is None:
+            continue
 
         img = get_image_from_row(row)
+
         if img is None:
             continue
 
         pmc_id = r.get("pmc_id", "unknown")
         row_id = r.get("row_id", "unknown")
 
+        label = r.get("final_label")
+
+        if label is None:
+            label = r.get("rule_pred", "unknown")
+
+        class_dir = output_dir / label
+        class_dir.mkdir(parents=True, exist_ok=True)
+
         fname = f"{pmc_id}_{row_id}.jpg"
-        path = output_dir / fname
+
+        path = class_dir / fname
 
         try:
             img.save(path)
@@ -2600,21 +2296,21 @@ def adaptive_threshold(
 
 def classify_dataset(
     dataset_root: Path,
+    pre_output_csv: Path,
     output_csv: Path,
-    biomedbert_path: Optional[str],
     cnn1_path: str,
     cnn2_path: str,
     cnn3_path: str,
     limit: Optional[int],
     inspectlimit: int,
     per_class: int,
+    early_presample: int,
     initial_presample: int,
     refill_presample: int,
     max_rounds: int,
-
+    cnn_strongfilter: float,
+    cnn_mediumfilter: float,
     cnn_thresh: float,
-    bert_thresh: float,
-    cnn_margin_thresh: float,
     micro_round_failures: int,
 
     inspect_only: bool = False,
@@ -2649,18 +2345,13 @@ def classify_dataset(
     # ============================================================
     # Phase 2: schnelle Vorauswahl Early Sampler
     # ============================================================
-    records0 = early_balanced_sampling(ds, per_class, limit)
+    records0 = early_balanced_sampling(ds, per_class, limit, early_presample)
     # Gewaehrleist, dass wirklich alle Klassen Eintraganzahl=per_class haben.
     debug_sampling(records0, per_class)
-    # BERT
-    bert_clf = None
-    if biomedbert_path:
-        print("\nInitialize BERT Similarity...")
-        bert_clf = BertSimilarityClassifier(model_path=biomedbert_path)
 
     # CNN
     print("\nInitialize Convolutional Neural Network...")
-    cnn1_model = SimpleCNN(num_classes=11)
+    cnn1_model = SimpleCNN(num_classes=3)
     cnn1_model.load_state_dict(torch.load(cnn1_path, map_location=device))
     cnn1_model.to(device).eval()
 
@@ -2675,7 +2366,6 @@ def classify_dataset(
     cnn_transform = transform
 
     ctx = ModelContext(
-        bert_clf,
         cnn1_model,
         cnn2_model,
         cnn3_model,
@@ -2685,14 +2375,33 @@ def classify_dataset(
     # ============================================================
     # Phase 3: Records sammeln
     # ============================================================
-    print("\nExtrahiere Records + RULES + CNN + BERT ...")
-    print("\nPhase 3: CNN + BERT auf Subset")
-    records = process_batch(records0, ctx, cnn_thresh, bert_thresh, cnn_margin_thresh)
+    print("\nExtrahiere Records + RULES + CNN ...")
+    print("\nPhase 3: CNN auf Subset")
+    records = process_batch(records0, ctx, cnn_strongfilter, cnn_mediumfilter, cnn_thresh)
     print("records nach batch:", len(records))
 
+    cnn_output_dir = output_csv.parent / "cnn_processed_images"
+
+    print("\nSpeichere CNN-processed Bilder ...")
+
+    save_selected_images(
+        records,
+        cnn_output_dir
+    )
+    for r in records:
+        r.pop("row", None)
+    df = pd.DataFrame(records)
+    empty_mask = df["caption"].fillna("").astype(str).str.strip().eq("")
+    df.loc[empty_mask, "final_label"] = "unknown"
+    df.loc[empty_mask, "Begründung"] = "empty_text"
+    df.loc[empty_mask, "Begründung"] = "empty_text"
+
+    pre_output_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(pre_output_csv, index=False, encoding="utf-8")
+
+    print(f"\nCSV gespeichert unter:\n{pre_output_csv}")
     # ============================================================
     # Phase 4: Final fusion
-    records = run_final_fusion(records)
 
     existing_records = records
     # ============================================================
@@ -2702,27 +2411,29 @@ def classify_dataset(
 
     records = build_balanced_dataset(ds,
         ctx,
-        # llm,
         existing_records,
         initial_presample,
         refill_presample,
         per_class,
         max_rounds,
-
+        cnn_strongfilter,
+        cnn_mediumfilter,
         cnn_thresh,
-        bert_thresh,
-        cnn_margin_thresh,
-        micro_round_failures)
-    # ============================================================
-    # Phase: Bilder speichern (f. Viewer),
-    # ============================================================
-    image_output_dir = output_csv.parent / "exported_images"
+        micro_round_failures,
+        output_csv)
 
-    print("\nSpeichere ausgewählte Bilder ...")
-    save_selected_images(records, image_output_dir)
     # ============================================================
     # Phase: Endergebnisse Head ausgeben
     # ============================================================
+    final_output_dir = output_csv.parent / "final_presample_images"
+
+    print("\nSpeichere Early-Presample Bilder ...")
+
+    save_selected_images(
+        records0,
+        final_output_dir
+    )
+
     # existing_records haben 'row', entfernen>nicht explodiert
     for r in records:
         r.pop("row", None)
@@ -2778,16 +2489,16 @@ def parse_args():
         help="Ordner mit data-*.arrow, dataset_info.json, state.json"
     )
     parser.add_argument(
+        "--pre_output_csv",
+        type=str,
+        required=True,
+        help="Pfad zur Presample-Ausgabe-CSV"
+    )
+    parser.add_argument(
         "--output_csv",
         type=str,
         required=True,
-        help="Pfad zur Ausgabe-CSV"
-    )
-    parser.add_argument(
-        "--biomedbert_path",
-        type=str,
-        default=None,
-        help="Lokaler Pfad zu BiomedBERT/PubMedBERT"
+        help="Pfad zur Final-Ausgabe-CSV"
     )
     parser.add_argument(
         "--cnn1_path",
@@ -2810,21 +2521,30 @@ def parse_args():
     parser.add_argument(
         "--per_class",
         type=int,
-        # default=3,
-        default=1000,
+        default=10,
+        # default=5000,
         help="Anzahl Samples pro finaler Klasse (hash-balanced)"
+    )
+    parser.add_argument(
+        "--early_presample",
+        type=int,
+        default=200,
+        help="Nur diese Anzahl Samples in ersten Run (=Phase 2) klassifizieren"
     )
     parser.add_argument(
         "--initial_presample",
         type=int,
-        default=50000,
+        # default=50000,
+        # default=6000,
+        default=500,
         help="Menge des ersten großes Presample vor Refill"
     )
     parser.add_argument(
         "--refill_presample",
         type=int,
         # default=200,
-        default=25000,
+        default=300,
+        # default=25000,
         help="Anzahl spätere Nachlade-Chunks Postsample *im* Refill"
     )
     parser.add_argument(
@@ -2841,20 +2561,21 @@ def parse_args():
     )
     #höherer Threshold = strenger / konservativer niedrigerer Threshold = toleranter / mehr akzeptierte Fälle
     parser.add_argument(
-        "--bert_thresh",
+        "--cnn_mediumfilter",
         type=float,
-        default=0.88,
-        help="BERT confidence threshold für sichere Entscheidungen"
+        default=0.5,
+        help="CNN confidence threshold für sichere Entscheidungen."
     )
     parser.add_argument(
-        "--cnn_margin_thresh",
+        "--cnn_strongfilter",
         type=float,
-        default=0.18,
-        help="CNN Margin Threshold zwischen Top1 und Top2"
+        default=0.75,
+        help="CNN confidence threshold für sichere Entscheidungen."
     )
     parser.add_argument(
         "--micro_round_failures",
         type=int,
+        # default=30,
         default=400,
         help="Anzahl erfolgloser Samples bis Micro-Round erhöht wird"
     )
@@ -2871,12 +2592,6 @@ def parse_args():
         help="Limit für Inspektionsfunktionen (z.B. Verteilungen)"
     )
     parser.add_argument(
-        "--bert_threshold",
-        type=float,
-        default=0.30,
-        help="Schwelle Fallback für BERT-Gang, sonst unknown"
-    )
-    parser.add_argument(
         "--inspect_only",
         action="store_true",
         help="Nur Struktur/Beispiele ausgeben, keine Klassifikation"
@@ -2889,26 +2604,26 @@ def main():
     args = parse_args()
 
     dataset_root = Path(args.dataset_root)
+    pre_output_csv = Path(args.pre_output_csv)
     output_csv = Path(args.output_csv)
 
     classify_dataset(
         dataset_root=dataset_root,
+        pre_output_csv=pre_output_csv,
         output_csv=output_csv,
-        biomedbert_path=args.biomedbert_path,
-        # llamamistral_path=args.llamamistral_path,
         cnn1_path=args.cnn1_path,
         cnn2_path=args.cnn2_path,
         cnn3_path=args.cnn3_path,
         inspectlimit=args.inspectlimit,
         limit=args.limit,
         per_class=args.per_class,
+        early_presample=args.early_presample,
         initial_presample=args.initial_presample,
         refill_presample=args.refill_presample,
         max_rounds=args.max_rounds,
-
         cnn_thresh=args.cnn_thresh,
-        bert_thresh=args.bert_thresh,
-        cnn_margin_thresh=args.cnn_margin_thresh,
+        cnn_strongfilter=args.cnn_strongfilter,
+        cnn_mediumfilter=args.cnn_mediumfilter,
         micro_round_failures=args.micro_round_failures,
 
         inspect_only=args.inspect_only,

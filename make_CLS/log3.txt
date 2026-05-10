@@ -1,0 +1,118 @@
+(ba1pmc) b@scherv:~/PycharmProjects/ba1pmc$ python make_CLS/pipeline_1.py   --dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB   --pre_output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/testpreper1000.csv   --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/test_per1000.csv   --cnn1_path /home/b/Dokumente/cnn1/cnn1.pth   --cnn2_path /home/b/Dokumente/cnn2/cnn2.pth   --cnn3_path /home/b/Dokumente/cnn3/cnn3filter.pth   --cnn_strongfilter 0.94   --cnn_mediumfilter 0.6   --cnn_thresh 0.60   --micro_round_failures 500
+Using CPU. Note: This module is much faster with a GPU.
+Gefundene Arrow-Dateien: 59
+Lade Arrow-Shards: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 59/59 [00:00<00:00, 1240.88it/s]
+Gesamtanzahl Zeilen: 1745049
+Spalten: ['__key__', '__url__', 'jpg', 'jsonl']
+Text wird aus row['jsonl'] extrahiert.
+
+===== DEBUG: Erstes Sample =====
+Spalten: ['__key__', '__url__', 'jpg', 'jsonl']
+__key__: <class 'str'>
+__url__: <class 'str'>
+jpg: <class 'PIL.JpegImagePlugin.JpegImageFile'>
+jsonl: <class 'bytes'>
+
+jsonl Vorschau:
+b'{"PMC_ID": "PMC9474956", "image": "train-0000-000000.jpg", "sub_caption": "Findings after prednisolone administration. a Colonoscopy findings: disappearance of the redness and edema of the colonic mucosa. b Pathological findings of biopsy from colonoscopy: improvement of inflammatory cell infiltration and numerous eosinophil counts, 1\\u201310 cells/HPF", "full_caption": "Preoperative CT and intraoperative findings. a Preoperative CT: a poor contrast effect on the small intestine. b Intraoperative findings: strangulated bowel obstruction caused by an intestinal mesenteric hiatal hernia. White arrow: intestinal mesenteric hiatal hernia", "intext_refs_summary": "", "intext_refs": "A 5-year-old male was taken to a nearby clinic with complaints of abdominal pain and vomiting. Blood examination '
+
+JSON Keys:
+['PMC_ID', 'image', 'sub_caption', 'full_caption', 'intext_refs_summary', 'intext_refs', 'modality']
+
+PMC_ID: PMC9474956
+image: train-0000-000000.jpg
+modality: N
+full_caption: Preoperative CT and intraoperative findings. a Preoperative CT: a poor contrast effect on the small intestine. b Intraoperative findings: strangulated bowel obstruction caused by an intestinal mesenteric hiatal hernia. White arrow: intestinal mesenteric hiatal hernia
+sub_caption: Findings after prednisolone administration. a Colonoscopy findings: disappearance of the redness and edema of the colonic mucosa. b Pathological findings of biopsy from colonoscopy: improvement of inflammatory cell infiltration and numerous eosinophil counts, 1–10 cells/HPF
+Prüfe modality-Verteilung: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 2000/2000 [00:00<00:00, 3954.49it/s]
+
+===== modality-Verteilung (Ausschnitt) =====
+R: 1021
+N: 524
+M: 406
+V: 49
+
+
+Schnelle Vorauswahl Early Sampler...
+Early sampling (Rules, Panelsearch, Rule & Animals Filtering):   0%|                                                                                                                                    | 0/1745049 [00:00<?, ?it/s]/home/b/anaconda3/envs/ba1pmc/lib/python3.10/site-packages/torch/utils/data/dataloader.py:775: UserWarning: 'pin_memory' argument is set as true but no accelerator is found, then device pinned memory won't be used.
+  super().__init__(loader)
+Early sampling (Rules, Panelsearch, Rule & Animals Filtering):   0%|                                                                                                                       | 697/1745049 [00:27<23:10:24, 20.91it/s]
+Early presample limit erreicht: 700
+Early sampling (Rules, Panelsearch, Rule & Animals Filtering):   0%|                                                                                                                       | 701/1745049 [00:27<18:49:22, 25.74it/s]
+
+Gesammelt: 132 Samples
+
+===== Early Sampling Checksum&Debug =====
+
+Gefundene Klassen:
+ct: 82
+ct_kombimodalitaet_spect+ct_pet+ct: 2
+mrt_body: 2
+mrt_hirn: 8
+us: 16
+xray: 14
+xray_fluoroskopie_angiographie: 8
+
+Fehlende Labels: 0
+Total gültige Labels: 132
+
+===== Checksum =====
+xray: 14 (expected 5000)
+xray_fluoroskopie_angiographie: 8 (expected 5000)
+us: 16 (expected 5000)
+mrt_hirn: 8 (expected 5000)
+mrt_body: 2 (expected 5000)
+ct: 82 (expected 5000)
+ct_kombimodalitaet_spect+ct_pet+ct: 2 (expected 5000)
+
+WARNUNG: Early sampling noch nicht vollständig balanced.
+
+Sampling korrekt balanced!
+
+Initialize Convolutional Neural Network...
+
+Extrahiere Records + RULES + CNN ...
+
+Phase 3: CNN auf Subset
+CNN Processing: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 132/132 [00:03<00:00, 41.94it/s]
+
+Filtered: Counter({'rule_cnn_disagreement': 122})
+records nach batch: 10
+records nach batch: 10
+
+Speichere CNN-processed Bilder ...
+Gespeichert: 10 Bilder in /home/b/PycharmProjects/ba1pmc/make_CLS/cnn_processed_images
+
+CSV gespeichert unter:
+/home/b/PycharmProjects/ba1pmc/make_CLS/testpreper1000.csv
+
+============================================================
+ROUND 0
+============================================================
+
+Aktuelle Verteilung:
+xray 0
+xray_fluoroskopie_angiographie 0
+us 0
+mrt_hirn 0
+mrt_body 0
+ct 10
+ct_kombimodalitaet_spect+ct_pet+ct 0
+
+Fehlende Klassen:
+{'xray', 'ct_kombimodalitaet_spect+ct_pet+ct', 'xray_fluoroskopie_angiographie', 'ct', 'us', 'mrt_body', 'mrt_hirn'}
+
+Micro Round: 0
+Effective Round: 0
+
+CNN Threshold: 0.600
+
+Chunk: 0 -> 3000
+Chunkgröße: 3000
+Nach global_used: 3000
+CNN Processing:   0%|                                                                                                                                                                              | 2/3000 [00:00<02:54, 17.15it/s]/home/b/anaconda3/envs/ba1pmc/lib/python3.10/site-packages/torch/utils/data/dataloader.py:775: UserWarning: 'pin_memory' argument is set as true but no accelerator is found, then device pinned memory won't be used.
+  super().__init__(loader)
+CNN Processing:  25%|███████████████████████████████████████████▌                                                                                                                                | 759/3000 [00:49<02:52, 12.98it/s
+
+
+
