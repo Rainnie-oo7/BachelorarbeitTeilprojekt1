@@ -1,6 +1,26 @@
 #################################################################
 # Pipeline/Klassifikator
 #################################################################
+python make_CLS/pipeline_2.py \
+  --dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB \
+  --pre_output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/preoutput_per10.csv \
+  --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/output_per10.csv \
+  --cnn_path /home/b/Dokumente/cnnCLS/cnncls.pth \
+  --cnn3_path /home/b/Dokumente/cnn3/cnn3filter.pth \
+  --cnn_strongfilter 0.94 \
+  --cnn_mediumfilter 0.6 \
+  --cnn_thresh 0.60 \
+  --micro_round_failures 500
+  > logrun.txt 2>&1
+
+
+
+
+
+
+
+
+
 python make_CLS/pipeline_0.py \
   --dataset_root /home/user/PycharmProjects/ba1pmc/PMC-41GB \
   --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/test_per5.csv \
