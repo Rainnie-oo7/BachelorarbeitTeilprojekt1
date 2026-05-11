@@ -928,15 +928,6 @@ def rule_based_classify_with_rules(text: str, rules, label_priority=None):
     if label_priority is None:
         label_priority = {}
 
-    # =========================================================
-    # Score_boni
-    # =========================================================
-
-    SPECIAL_CLASS_BONUS = {
-        "ct": 8,
-        "xray_fluoroskopie_angiographie": 5,
-        "us": 8,
-    }
     # Parallel matching
     hits = {}
     for label, patterns in rules:
@@ -976,11 +967,6 @@ def rule_based_classify_with_rules(text: str, rules, label_priority=None):
             " | ".join(matched_patterns[:5]),
             hits)
 
-    # Bonus fuer spezifische Radiologieklassen
-    for label, bonus in SPECIAL_CLASS_BONUS.items():
-
-        if label in hits:
-            hits[label]["score"] += bonus
 
     # =========================================================
     # Harte Priorisierung
@@ -1347,6 +1333,63 @@ def top_label(scores):
             return max(scores, key=lambda x: x.get("score", 0)).get("label", "none")
 
     return "none"
+
+def enrich_debug_fields(
+    r,
+    text,
+    original_text,
+    row,
+
+    rule_pred,
+    rule_scores,
+
+    cnn_pred,
+    cnn1_top3,
+    cnn2_top3,
+
+    cnn3_pred,
+    cnn3_conf,
+
+    final_label,
+    final_conf,
+
+    decision_source
+):
+
+    r["caption"] = text
+    r["full_caption"] = original_text
+
+    r["row"] = row
+
+    r["rule_pred"] = rule_pred
+    r["rule_scores"] = rule_scores
+
+    r["cnn_pred"] = cnn_pred
+
+    r["cnn1_top3"] = cnn1_top3
+    r["cnn2_top3"] = cnn2_top3
+
+    r["cnn3_pred"] = cnn3_pred
+    r["cnn3_conf"] = cnn3_conf
+
+    r["final_label"] = final_label
+    r["final_conf"] = final_conf
+    r["final_margin"] = final_conf
+
+    r["decision_source"] = decision_source
+
+    r["ocr_used"] = r.get("ocr_used", False)
+    r["ocr_meta"] = r.get("ocr_meta", [])
+    r["ocr_text"] = r.get("ocr_text", "")
+    r["selected_panels"] = r.get("selected_panels", [])
+
+    r["rule_reason"] = r.get("rule_reason", "")
+    r["rule_hits"] = r.get("rule_hits", {})
+    r["matched_patterns"] = r.get("matched_patterns", [])
+    r["modality_gt"] = r.get("modality_gt", "unknown")
+
+    return r
+
 # ============================================================
 # Verarbeitung (Ph. 3)
 # ============================================================
@@ -1495,32 +1538,6 @@ cnn_mediumfilter, cnn_thresh):
     cnn_pred = final_label
     cnn_conf_final = final_conf
 
-    # ============================================================
-    # AGREEMENT FILTER
-    # ============================================================
-
-    rule_pred = r.get("rule_pred", "unknown")
-
-    cnn_pred_label = final_label
-
-    cnn_margin = abs(cnn1_conf - cnn2_conf)
-
-    AGREEMENT_CNN_CONF = 0.80
-    AGREEMENT_CNN_MARGIN = 0.20
-
-    agreement_pass = (
-            rule_pred == cnn_pred_label
-            and cnn_conf_final >= AGREEMENT_CNN_CONF
-            and cnn_margin >= AGREEMENT_CNN_MARGIN
-    )
-
-    # Konflikt -> sofort rauswerfen
-    if not agreement_pass:
-        r["is_filtered"] = True
-        r["filter_reason"] = "rule_cnn_disagreement"
-
-        return r
-
     # =========================
     # CNN3 Filtering + CNN1&CNN2-Uncertainty Filtering
     # =========================
@@ -1539,12 +1556,57 @@ cnn_mediumfilter, cnn_thresh):
         if expert_conf <= 0.65:
             r["is_filtered"] = True
             r["filter_reason"] = "cnn3_strong"
+
+            r = enrich_debug_fields(
+                r=r,
+                text=text,
+                original_text=original_text,
+                row=row,
+
+                rule_pred=rule_pred,
+                rule_scores=rule_scores,
+
+                cnn_pred=cnn_pred,
+                cnn1_top3=cnn1_top3,
+                cnn2_top3=cnn2_top3,
+
+                cnn3_pred=cnn3_pred,
+                cnn3_conf=cnn3_conf,
+
+                final_label=final_label,
+                final_conf=final_conf,
+
+                decision_source=decision_source
+            )
+
             return r
 
     elif cnn3_conf >= cnn_mediumfilter:
         if expert_conf <= 0.465:
             r["is_filtered"] = True
             r["filter_reason"] = "cnn3_medium"
+
+            r = enrich_debug_fields(
+                r=r,
+                text=text,
+                original_text=original_text,
+                row=row,
+
+                rule_pred=rule_pred,
+                rule_scores=rule_scores,
+
+                cnn_pred=cnn_pred,
+                cnn1_top3=cnn1_top3,
+                cnn2_top3=cnn2_top3,
+
+                cnn3_pred=cnn3_pred,
+                cnn3_conf=cnn3_conf,
+
+                final_label=final_label,
+                final_conf=final_conf,
+
+                decision_source=decision_source
+            )
 
             return r
 
@@ -1558,57 +1620,89 @@ cnn_mediumfilter, cnn_thresh):
     ):
         r["is_filtered"] = True
         r["filter_reason"] = "noconsent"
+
+        r = enrich_debug_fields(
+            r=r,
+            text=text,
+            original_text=original_text,
+            row=row,
+
+            rule_pred=rule_pred,
+            rule_scores=rule_scores,
+
+            cnn_pred=cnn_pred,
+            cnn1_top3=cnn1_top3,
+            cnn2_top3=cnn2_top3,
+
+            cnn3_pred=cnn3_pred,
+            cnn3_conf=cnn3_conf,
+
+            final_label=final_label,
+            final_conf=final_conf,
+
+            decision_source=decision_source
+        )
+
         return r
 
     rule_pred = top_label(rule_scores)
 
-    # =========================
-    # Debug + Speicherung
-    # =========================
-    result = {
-        "pmc_id": r["pmc_id"],
-        "row_id": r["row_id"],
-        "caption": text,
-        "full_caption": original_text,
-        "row": row,
+    # ============================================================
+    # AGREEMENT FILTER
+    # ============================================================
 
-        "rule_pred": rule_pred,
-        "cnn_pred": cnn_pred,
-        "cnn3_pred": cnn3_pred,
+    rule_pred = r.get("rule_pred", "unknown")
 
-        "final_label": final_label,
-        "final_conf": final_conf,
-        "final_margin": final_conf,
+    cnn_pred_label = final_label
 
-        "rule_scores": rule_scores,
-        "decision_source": decision_source,
+    agreement_pass = (
+            rule_pred == cnn_pred_label
+            and cnn_conf_final >= 0.55
+    )
 
-        "cnn1_top3": cnn1_top3,
-        "cnn2_top3": cnn2_top3,
+    # Konflikt -> sofort rauswerfen
+    if not agreement_pass:
+        r["is_filtered"] = True
+        r["filter_reason"] = "rule_cnn_disagreement"
 
-        "ocr_used": r.get("ocr_used", False),
-        "ocr_meta": r.get("ocr_meta", []),
-        "ocr_text": r.get("ocr_text", ""),
-        "selected_panels": r.get("selected_panels", []),
+        r = enrich_debug_fields(
+            r=r,
+            text=text,
+            original_text=original_text,
+            row=row,
 
-        "cnn3_conf": cnn3_conf,
-        "rule_reason": r.get("rule_reason", ""),
-        "rule_hits": r.get("rule_hits", {}),
-        "matched_patterns": r.get("matched_patterns", []),
-        "modality_gt": r.get("modality_gt", "unknown")
-    }
+            rule_pred=rule_pred,
+            rule_scores=rule_scores,
 
-    return result
+            cnn_pred=cnn_pred,
+            cnn1_top3=cnn1_top3,
+            cnn2_top3=cnn2_top3,
+
+            cnn3_pred=cnn3_pred,
+            cnn3_conf=cnn3_conf,
+
+            final_label=final_label,
+            final_conf=final_conf,
+
+            decision_source=decision_source
+        )
+
+        return r
+
+
+
 
 def process_batch(
     presample,
     ctx,
     cnn_strongfilter,
     cnn_mediumfilter,
-    cnn_thresh):
+    cnn_thresh,
+    disagreement_dir=None):
 
     processed = []
     filtered_counts = Counter()
+    disagreement_records = []
 
     # Parallele Verarbeitung
     with ThreadPoolExecutor(max_workers=10) as ex:
@@ -1644,17 +1738,78 @@ def process_batch(
                 filtered_counts["unknown"] += 1
                 continue
 
-            if out.get("is_filtered"): #cnn3certainty & cnn-uncertainty & Konsens R/B/C-Modelle
-                filtered_counts[
-                    out.get("filter_reason", "unknown")
-                ] += 1
+            if out.get("is_filtered"):
+
+                reason = out.get("filter_reason", "unknown")
+
+                filtered_counts[reason] += 1
+
+                # ====================================================
+                # DISAGREEMENT SAVE
+                # ====================================================
+
+                if reason == "rule_cnn_disagreement":
+                    disagreement_records.append(out)
+
                 continue
 
             processed.append(out)
 
     print(f"\nFiltered: {filtered_counts}")
     print(f"records nach batch: {len(processed)}")
+    # ====================================================
+    # SAVE DISAGREEMENTS
+    # ====================================================
 
+    if disagreement_dir is not None and len(disagreement_records) > 0:
+
+        disagreement_dir = Path(disagreement_dir)
+
+        disagreement_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        # --------------------------------------------
+        # CSV
+        # --------------------------------------------
+
+        csv_records = []
+
+        for r in disagreement_records:
+
+            tmp = dict(r)
+
+            tmp.pop("row", None)
+
+            csv_records.append(tmp)
+
+        df_dis = pd.DataFrame(csv_records)
+
+        csv_path = disagreement_dir / "rule_cnn_disagreements.csv"
+
+        df_dis.to_csv(
+            csv_path,
+            index=False,
+            encoding="utf-8"
+        )
+
+        print(f"\nDisagreement CSV gespeichert:")
+        print(csv_path)
+
+        # --------------------------------------------
+        # Bilder
+        # --------------------------------------------
+
+        img_dir = disagreement_dir / "images"
+
+        save_selected_images(
+            disagreement_records,
+            img_dir
+        )
+
+        print(f"Disagreement Bilder gespeichert:")
+        print(img_dir)
     return processed
 
 # ============================================================
@@ -1968,7 +2123,8 @@ def build_balanced_dataset(
                         ctx,
                         cnn_strongfilter=cnn_strongfilter,
                         cnn_mediumfilter=cnn_mediumfilter,
-                        cnn_thresh=cnn_thresh)    #die tresholds von adaptive trehsolds, die die treshs von parser.add_arg haben
+                        cnn_thresh=cnn_thresh,
+                        disagreement_dir=output_csv.parent / "disagreements")
 
         if len(presample) == 0:
             print("\nLeerer Presample Chunk")
@@ -2348,6 +2504,46 @@ def classify_dataset(
     records0 = early_balanced_sampling(ds, per_class, limit, early_presample)
     # Gewaehrleist, dass wirklich alle Klassen Eintraganzahl=per_class haben.
     debug_sampling(records0, per_class)
+    print("\nSpeichere Early-Rules Dataset ...")
+
+    early_rules_dir = output_csv.parent / "early_rules_dataset"
+
+    early_rules_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # ------------------------------------------------------------
+    # Bilder speichern
+    # ------------------------------------------------------------
+
+    save_selected_images(
+        records0,
+        early_rules_dir / "images"
+    )
+
+    # ------------------------------------------------------------
+    # CSV speichern
+    # ------------------------------------------------------------
+
+    csv_records = []
+
+    for r in records0:
+        tmp = dict(r)
+
+        tmp.pop("row", None)
+
+        csv_records.append(tmp)
+
+    df_early = pd.DataFrame(csv_records)
+
+    early_csv = early_rules_dir / "early_rules.csv"
+
+    df_early.to_csv(
+        early_csv,
+        index=False,
+        encoding="utf-8"
+    )
 
     # CNN
     print("\nInitialize Convolutional Neural Network...")
@@ -2377,29 +2573,12 @@ def classify_dataset(
     # ============================================================
     print("\nExtrahiere Records + RULES + CNN ...")
     print("\nPhase 3: CNN auf Subset")
-    records = process_batch(records0, ctx, cnn_strongfilter, cnn_mediumfilter, cnn_thresh)
+    records = process_batch(records0, ctx, cnn_strongfilter, cnn_mediumfilter, cnn_thresh, disagreement_dir=output_csv.parent / "disagreements")
     print("records nach batch:", len(records))
 
-    cnn_output_dir = output_csv.parent / "cnn_processed_images"
-
-    print("\nSpeichere CNN-processed Bilder ...")
-
-    save_selected_images(
-        records,
-        cnn_output_dir
-    )
     for r in records:
         r.pop("row", None)
-    df = pd.DataFrame(records)
-    empty_mask = df["caption"].fillna("").astype(str).str.strip().eq("")
-    df.loc[empty_mask, "final_label"] = "unknown"
-    df.loc[empty_mask, "Begründung"] = "empty_text"
-    df.loc[empty_mask, "Begründung"] = "empty_text"
 
-    pre_output_csv.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(pre_output_csv, index=False, encoding="utf-8")
-
-    print(f"\nCSV gespeichert unter:\n{pre_output_csv}")
     # ============================================================
     # Phase 4: Final fusion
 

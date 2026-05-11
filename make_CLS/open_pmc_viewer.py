@@ -36,8 +36,89 @@ def build_image_index(image_dir):
 # CONFIG
 # ============================================================
 
-CSV_PATH = "/home/b/PycharmProjects/ba1pmc/make_CLS/round_checkpoints/round_004.csv"
-IMAGE_DIR = "/home/b/PycharmProjects/ba1pmc/make_CLS/round_checkpoints/images_after_rounds"
+MODE = "final"
+
+"""
+MODES:
+
+"final"
+→ finale Round-Checkpoints
+
+"disagreements"
+→ nur Rule/CNN Konflikte
+
+"early_rules"
+→ reine Rule-basierte Early-Samples
+"""
+
+BASE_DIR = Path(
+    "/home/b/PycharmProjects/ba1pmc/make_CLS"
+)
+
+# ============================================================
+# FINAL DATASET
+# ============================================================
+
+if MODE == "final":
+
+    CSV_PATH = (
+        BASE_DIR
+        / "round_checkpoints"
+        / "round_001.csv"
+    )
+
+    IMAGE_DIR = (
+        BASE_DIR
+        / "round_checkpoints"
+        / "images_after_rounds"
+    )
+
+# ============================================================
+# DISAGREEMENTS
+# ============================================================
+
+elif MODE == "disagreements":
+
+    CSV_PATH = (
+        BASE_DIR
+        / "disagreements"
+        / "rule_cnn_disagreements.csv"
+    )
+
+    IMAGE_DIR = (
+        BASE_DIR
+        / "disagreements"
+        / "images"
+    )
+
+# ============================================================
+# EARLY RULES
+# ============================================================
+
+elif MODE == "early_rules":
+
+    CSV_PATH = (
+        BASE_DIR
+        / "early_rules_dataset"
+        / "early_rules.csv"
+    )
+
+    IMAGE_DIR = (
+        BASE_DIR
+        / "early_rules_dataset"
+        / "images"
+    )
+
+else:
+
+    raise ValueError(f"Unknown MODE: {MODE}")
+
+print("\nCSV_PATH:")
+print(CSV_PATH)
+
+print("\nIMAGE_DIR:")
+print(IMAGE_DIR)
+
 IMAGE_INDEX = build_image_index(IMAGE_DIR)
 
 THUMB_SIZE = (900, 900)
@@ -46,6 +127,7 @@ BG = "#1e1e1e"
 FG = "#dddddd"
 
 FONT = ("Consolas", 10)
+
 
 
 # ============================================================
@@ -128,12 +210,30 @@ class PMCViewer:
     def __init__(self, root):
 
         self.root = root
-        self.root.title("PMC DEBUG VIEWER")
+        self.root.title("PMC DEBUG VIEWER [{MODE}]")
         self.root.geometry("1800x1000")
         self.root.configure(bg=BG)
 
         print("Lade CSV ...")
         self.df = pd.read_csv(CSV_PATH, low_memory=False)
+
+        # ============================================================
+        # MODE FILTER
+        # ============================================================
+
+        if MODE == "disagreements":
+
+            if "filter_reason" in self.df.columns:
+                self.df = self.df[
+                    self.df["filter_reason"]
+                    .astype(str)
+                    .str.contains("disagreement", case=False, na=False)
+                ]
+
+                print(
+                    "Nur Disagreements geladen:",
+                    len(self.df)
+                )
 
         self.filtered_df = self.df.copy()
 
@@ -295,13 +395,62 @@ class PMCViewer:
 
         for idx, row in self.filtered_df.iterrows():
 
+            rule_pred = row.get("rule_pred", "?")
+            cnn_pred = row.get("cnn_pred", "?")
+            final_label = row.get("final_label", "?")
+            cnn3_pred = row.get("cnn3_pred", "?")
+
             txt = (
                 f"{idx} | "
-                f"{row.get('final_label','?')} | "
-                f"{str(row.get('caption',''))[:60]}"
+                f"RULE={rule_pred} | "
+                f"CNN={cnn_pred} | "
+                f"CNN3={cnn3_pred} | "
+                f"FINAL={final_label} | "
+                f"{str(row.get('caption', ''))[:60]}"
             )
 
             self.listbox.insert(tk.END, txt)
+
+            rule_pred = str(row.get("rule_pred", "")).strip().lower()
+            cnn_pred = str(row.get("cnn_pred", "")).strip().lower()
+
+            idx_listbox = self.listbox.size() - 1
+
+            filter_reason = str(
+                row.get("filter_reason", "")
+            ).lower()
+
+            if "cnn3" in filter_reason:
+                self.listbox.itemconfig(
+                    idx_listbox,
+                    bg="#5a3b00",
+                    fg="#ffd27f"
+                )
+
+                continue
+            # ============================================================
+            # AGREEMENT
+            # ============================================================
+
+            if rule_pred == cnn_pred:
+
+                self.listbox.itemconfig(
+                    idx_listbox,
+                    bg="#143214",  # dunkelgrün
+                    fg="#aaffaa"
+                )
+
+            # ============================================================
+            # DISAGREEMENT
+            # ============================================================
+
+            else:
+
+                self.listbox.itemconfig(
+                    idx_listbox,
+                    bg="#401414",  # dunkelrot
+                    fg="#ffaaaa"
+                )
 
         self.status.config(
             text=f"{len(self.filtered_df)} Samples"
@@ -400,6 +549,38 @@ class PMCViewer:
         lines = []
 
         lines.append("=" * 80)
+
+        rule_pred = row.get("rule_pred", "?")
+        cnn_pred = row.get("cnn_pred", "?")
+
+        is_agreement = (
+                str(rule_pred).strip().lower()
+                ==
+                str(cnn_pred).strip().lower()
+        )
+
+        lines.append("")
+
+        cnn3_pred = row.get("cnn3_pred", "?")
+        cnn3_conf = row.get("cnn3_conf", "?")
+
+        if is_agreement:
+
+            lines.append("## AGREMENT ##")
+            lines.append(f"RULE : {rule_pred}")
+            lines.append(f"CNN  : {cnn_pred}")
+            lines.append(f"CNN3 : {cnn3_pred}")
+            lines.append(f"C3CF : {cnn3_conf}")
+
+        else:
+
+            lines.append("!! DISAGREMENT !!")
+            lines.append(f"RULE : {rule_pred}")
+            lines.append(f"CNN  : {cnn_pred}")
+            lines.append(f"CNN3 : {cnn3_pred}")
+            lines.append(f"C3CF : {cnn3_conf}")
+
+        lines.append("")
 
         for col in row.index:
 

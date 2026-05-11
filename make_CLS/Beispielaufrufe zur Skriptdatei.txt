@@ -31,8 +31,8 @@ python make_CLS/pipeline_0.py \
 
 python make_CLS/pipeline_1.py \
   --dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB \
-  --pre_output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/preoutput_per5000.csv \
-  --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/output_per5000.csv \
+  --pre_output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/preoutput_per10.csv \
+  --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/output_per10.csv \
   --cnn1_path /home/b/Dokumente/cnn1/cnn1.pth \
   --cnn2_path /home/b/Dokumente/cnn2/cnn2.pth \
   --cnn3_path /home/b/Dokumente/cnn3/cnn3filter.pth \
