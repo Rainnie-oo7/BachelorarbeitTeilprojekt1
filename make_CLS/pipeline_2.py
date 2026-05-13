@@ -16,7 +16,7 @@ python make_CLS/pipeline_2.py \
   --output_csv /home/user/PycharmProjects/ba1pmc/make_CLS/output_per10.csv \
   --cnn_path /home/user/Dokumente/cnnCLS/cnncls.pth \
   --cnn3_path /home/user/Dokumente/cnn3/cnn3filter.pth \
-  --cnn_strongfilter 0.94 \
+  --cnn3filter 0.94 \
   --cnn_mediumfilter 0.6 \
   --cnn_thresh 0.60 \
   --micro_round_failures 500
@@ -29,6 +29,7 @@ import os.path as osp
 from pathlib import Path
 from PIL import Image
 import re
+import string
 import json
 import argparse
 import numpy as np
@@ -54,13 +55,13 @@ from concurrent.futures import as_completed
 
 # Klassen u. Mapping
 FINAL_CLASSES = [
-    "xray",
-    "xray_fluoroskopie_angiographie",
-    "us",
-    "mrt_hirn",
+    'ct',
+    'ct_kombimodalitaet_spect+ct_pet+ct',
+    'us',
     "mrt_body",
-    "ct",
-    "ct_kombimodalitaet_spect+ct_pet+ct"]
+    "mrt_hirn",
+    "xray",
+    "xray_fluoroskopie_angiographie"]
 CNN_CLASS_NAMES = [        #strikt Reihenfolge!!!
     'ct',
     'ct_kombimodalitaet_spect+ct_pet+ct',
@@ -70,8 +71,11 @@ CNN_CLASS_NAMES = [        #strikt Reihenfolge!!!
     "xray",
     "xray_fluoroskopie_angiographie"
     ]
-
-CNN3_CLASS_NAMES = [
+CNN2_CLASS_NAMES = [ #strikt Reihenfolge!!!
+    "ct",
+    "xray"
+]
+CNN3_CLASS_NAMES = [    #strikt Reihenfolge!!!
     "histologie",
     "haut",
     "chart",
@@ -224,81 +228,539 @@ def is_multipanel_caption(text: str):
     if match:
         return True, match.group(0)
     return False, None
+def is_real_panel_start(match, text):
 
-def split_multipanel_caption(text):
+    start = match.start()
+    end = match.end()
+
+    before = text[max(0, start - 40):start]
+    after = text[end:min(len(text), end + 80)]
+
+    before_lower = before.lower()
+    after_strip = after.strip()
+
+    # -------------------------------------------------
+    # Typische Referenz-Kontexte -> NICHT Panelstart
+    # Higher magnification of the image in (A) oder: their Figure 2A oder The arrow in (B) indicates ...
+    # -------------------------------------------------
+
+    BAD_BEFORE = [
+        "in ",
+        "from ",
+        "of ",
+        "panel ",
+        "figure ",
+        "fig ",
+        "shown in ",
+        "seen in ",
+        "image in ",
+        "corresponding to ",
+        "indicates ",
+    ]
+
+    for b in BAD_BEFORE:
+        if before_lower.endswith(b):
+            return False
+
+    # -------------------------------------------------
+    # Nach einem echten Panel kommt meist:
+    # Großbuchstabe oder Zahl oder Wort
+    # -------------------------------------------------
+
+    if len(after_strip) == 0:
+        return False
+
+    first = after_strip[0]
+
+    if not (
+        first.isupper()
+        or first.isdigit()
+    ):
+        return False
+
+    return True
+
+def is_real_multipanel(text):
 
     if not isinstance(text, str):
-        return {}, ""
+        return False
 
-    pattern = r"""
-    (?:\(([A-Z])\))                           # (A)
-    |
-    (?:\(([a-z])\))                           # (a)
-    |
-    (?:\((\d+)\))                             # (1)
-    |
-    (?:\bPanel\s+([A-Z])\b)                   # Panel A
-    |
-    (?:\bPanel\s+(\d+)\b)                     # Panel 1
-    |
-    (?:\bfig(?:ure)?\.?\s*\d+\s*([A-Z])\b)       # Fig 2A
-    |
-    (?:^|\n|\.\s|\;\s)([A-Z])[:\.]            # A:
-    |
-    (?:^|\n|\.\s|\;\s)([a-z])[:\.]            # a:
-    |
-    (?:^|\n|\.\s|\;\s)([A-Z])\s+(?=[A-Z])     # A CT image...
-    |
-    (?:^|\n|\.\s|\;\s)([a-z])\s+(?=[A-Z])     # a CT image...
-    """
-
-    matches = list(
-        re.finditer(
-            pattern,
-            text,
-            flags=re.VERBOSE | re.IGNORECASE
-        )
+    # Alle echten Panelmarker
+    matches = re.findall(
+        r"\([A-Za-z]\)",
+        text
     )
 
-    if len(matches) == 0:
-        return {}, text
+    if len(matches) < 2:
+        return False
+
+    # Starke echte Subcaption-Starts
+    strong = re.findall(
+        r"(?:^|[\.\;\:]\s*)\([A-Za-z]\)\s+[A-Z]",
+        text
+    )
+
+    # Mindestens 2 echte Blöcke
+    if len(strong) >= 2:
+        return True
+
+    return False
+
+
+# ============================================================
+# PANEL MATCHING
+# ============================================================
+
+PANEL_REGEX = re.compile(
+    r"""
+
+    # --------------------------------------------------------
+    # (A)
+    # --------------------------------------------------------
+    \(\s*([A-Z])\s*\)
+
+    |
+
+    # --------------------------------------------------------
+    # (a)
+    # --------------------------------------------------------
+    \(\s*([a-z])\s*\)
+
+    |
+
+    # --------------------------------------------------------
+    # (A, B)
+    # (A,B,C)
+    # --------------------------------------------------------
+    \(\s*
+        ([A-Z])
+        \s*,\s*
+        ([A-Z](?:\s*,\s*[A-Z])*)
+    \s*\)
+
+    |
+
+    # --------------------------------------------------------
+    # (a, b)
+    # --------------------------------------------------------
+    \(\s*
+        ([a-z])
+        \s*,\s*
+        ([a-z](?:\s*,\s*[a-z])*)
+    \s*\)
+
+    |
+
+    # --------------------------------------------------------
+    # (A-H)
+    # (A–H)
+    # --------------------------------------------------------
+    \(\s*
+        ([A-Z])
+        \s*[–-]\s*
+        ([A-Z])
+    \s*\)
+
+    |
+
+    # --------------------------------------------------------
+    # (a-h)
+    # --------------------------------------------------------
+    \(\s*
+        ([a-z])
+        \s*[–-]\s*
+        ([a-z])
+    \s*\)
+
+    """,
+    re.VERBOSE
+)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def expand_panel_range(start_letter, end_letter):
+    alphabet = string.ascii_uppercase
+
+    start_idx = alphabet.index(start_letter.upper())
+    end_idx = alphabet.index(end_letter.upper())
+
+    if start_idx > end_idx:
+        return []
+
+    return list(
+        alphabet[start_idx:end_idx + 1]
+    )
+
+
+def expand_panel_range_lower(start_letter, end_letter):
+    alphabet = string.ascii_lowercase
+
+    start_idx = alphabet.index(start_letter.lower())
+    end_idx = alphabet.index(end_letter.lower())
+
+    if start_idx > end_idx:
+        return []
+
+    return [
+        x.upper()
+        for x in alphabet[start_idx:end_idx + 1]
+    ]
+
+
+def parse_match_to_panels(match):
+    groups = match.groups()
+
+    # --------------------------------------------------------
+    # (A)
+    # --------------------------------------------------------
+
+    if groups[0]:
+        return [groups[0]]
+
+    # --------------------------------------------------------
+    # (a)
+    # --------------------------------------------------------
+
+    if groups[1]:
+        return [groups[1].upper()]
+
+    # --------------------------------------------------------
+    # (A, B, C)
+    # --------------------------------------------------------
+
+    if groups[2]:
+        first = groups[2]
+
+        others = [
+            x.strip()
+            for x in groups[3].split(",")
+        ]
+
+        return [first] + others
+
+    # --------------------------------------------------------
+    # (a, b, c)
+    # --------------------------------------------------------
+
+    if groups[4]:
+        first = groups[4].upper()
+
+        others = [
+            x.strip().upper()
+            for x in groups[5].split(",")
+        ]
+
+        return [first] + others
+
+    # --------------------------------------------------------
+    # (A-H)
+    # --------------------------------------------------------
+
+    if groups[6]:
+        return expand_panel_range(
+            groups[6],
+            groups[7]
+        )
+
+    # --------------------------------------------------------
+    # (a-h)
+    # --------------------------------------------------------
+
+    if groups[8]:
+        return expand_panel_range_lower(
+            groups[8],
+            groups[9]
+        )
+
+    return []
+
+def split_multipanel_caption(text, debug=False):
+
+    if not text or not isinstance(text, str):
+        return {}, ""
+
+    original_text = text
+
+    matches = list(PANEL_REGEX.finditer(text))
+
+    range_panels = set()
+
+    for m in matches:
+
+        full = m.group(0)
+
+        r = re.match(
+            r"\(([A-Z])-([A-Z])\)",
+            full
+        )
+
+        if r:
+
+            start_letter = r.group(1)
+            end_letter = r.group(2)
+
+            expanded = expand_panel_range(
+                start_letter,
+                end_letter
+            )
+
+            for p in expanded:
+                range_panels.add(p)
+    # # ========================================================
+    # # DEBUG
+    # # ========================================================
+    #
+    # if debug:
+    #
+    #     print("\n============================================================")
+    #     print("MULTIPANEL DEBUG")
+    #     print("============================================================")
+    #
+    #     print("\nTEXT:")
+    #     print(original_text)
+    #
+    #     print(f"\nMATCH COUNT: {len(matches)}")
+    #
+    #     for i, m in enumerate(matches):
+    #
+    #         print(f"\n--- MATCH {i} ---")
+    #
+    #         print("FULL MATCH:")
+    #         print(repr(m.group(0)))
+    #
+    #         print("GROUPS:")
+    #         print(m.groups())
+    #
+    #         print("PANELS:")
+    #         print(parse_match_to_panels(m))
+    #
+    #         print("START:", m.start())
+    #         print("END  :", m.end())
+
+    # ========================================================
+    # NO MATCHES
+    # ========================================================
+
+    if not matches:
+        return {}, text.strip()
 
     sections = {}
 
-    # =====================================================
-    # PREFIX vor erstem Panel
-    # =====================================================
-
     prefix_text = text[:matches[0].start()].strip()
 
-    # =====================================================
-    # Panels
-    # =====================================================
+    # ========================================================
+    # BAD CONTEXTS
+    # ========================================================
+
+    BAD_CONTEXTS = [
+        "shown in",
+        "arrow in",
+        "arrows in",
+        "seen in",
+        "shown on",
+        "corresponding to",
+        "compared with",
+        "figure",
+        "fig.",
+        "magnification of",
+        "higher magnification",
+    ]
+
+    NON_PANEL_SINGLE_LETTERS = {
+        "T",
+        "B",
+    }
+
+    # ========================================================
+    # LOOP
+    # ========================================================
 
     for i, match in enumerate(matches):
 
-        panel = None
+        start = match.start()
+        end = match.end()
 
-        for g in match.groups():
+        current_panels = parse_match_to_panels(match)
 
-            if g is not None:
-                panel = str(g).upper()
-                break
-
-        # Kein echtes Panel gefunden
-        if panel is None:
+        if len(current_panels) == 0:
             continue
 
-        start = match.end()
+        # ----------------------------------------------------
+        # BAD CONTEXT FILTER
+        # ----------------------------------------------------
 
-        if i + 1 < len(matches):
-            end = matches[i + 1].start()
+        context_before = text[
+                         max(0, start - 40):start
+                         ].lower()
+
+        bad_context_hit = False
+
+        for bad in BAD_CONTEXTS:
+
+            if context_before.strip().endswith(bad):
+                bad_context_hit = True
+                break
+
+        if bad_context_hit:
+
+            # if debug:
+            #     print("\nSKIPPED CONTEXT:")
+            #     print(current_panels)
+            #     print(context_before)
+
+            continue
+
+        # ----------------------------------------------------
+        # NEXT MATCH
+        # ----------------------------------------------------
+
+        if i < len(matches) - 1:
+            next_start = matches[i + 1].start()
         else:
-            end = len(text)
+            next_start = len(text)
 
-        panel_text = text[start:end].strip()
+        panel_text = text[end:next_start].strip()
 
-        sections[panel] = panel_text
+        clean = re.sub(
+            r"\s+",
+            " ",
+            panel_text
+        ).strip()
+
+        # ----------------------------------------------------
+        # VERY SHORT FRAGMENTS
+        # ----------------------------------------------------
+
+        if len(clean) < 8:
+
+            # if debug:
+            #     print("\nSKIPPED SHORT:")
+            #     print(current_panels)
+            #     print(repr(clean))
+
+            continue
+
+        # ----------------------------------------------------
+        # ENUMERATION FILTER
+        # ----------------------------------------------------
+
+        # ============================================================
+        # ENUMERATION FILTER
+        # ============================================================
+
+        clean_lower = clean.lower()
+
+        MEDICAL_ENUM_KEYWORDS = [
+            "t1",
+            "t2",
+            "flair",
+            "dwi",
+            "adc",
+            "mri",
+            "ct",
+            "pet",
+            "x-ray",
+            "xray",
+            "ultrasound",
+            "sagittal",
+            "coronal",
+            "axial",
+            "contrast",
+            "fat-suppressed",
+            "enhanced",
+            "diffusion",
+            "echo",
+            "spin",
+            "repetition time",
+            "te",
+            "tr",
+        ]
+
+        is_medical_enum = any(
+            k in clean_lower
+            for k in MEDICAL_ENUM_KEYWORDS
+        )
+
+        # Nur extrem kurze NICHT-medizinische Enumerationen skippen
+        if (
+                len(clean.split()) <= 5
+                and not is_medical_enum
+        ):
+            if debug:
+                print("\nSKIPPED ENUMERATION:")
+                print(repr(clean))
+
+            continue
+
+        # ----------------------------------------------------
+        # BROKEN ENDINGS
+        # ----------------------------------------------------
+
+        if re.search(
+                r"\b(and|or|with|to|of|for|in|on|the|a)$",
+                clean.lower()
+        ):
+
+            if debug:
+                print("\nSKIPPED BROKEN:")
+                print(current_panels)
+                print(repr(clean))
+
+            continue
+
+        # ----------------------------------------------------
+        # SAVE FOR ALL PANELS
+        # ----------------------------------------------------
+
+        # print("\nPANELS:")
+        # print(current_panels)
+        #
+        # print("\nPANEL TEXT:")
+        # print(clean)
+
+        for p in current_panels:
+
+            # T/B fake panels vermeiden
+            if p in NON_PANEL_SINGLE_LETTERS:
+
+                next_chars = text[end:end + 20]
+
+                if not re.match(
+                        r"\s+[A-Z]",
+                        next_chars
+                ):
+
+                    if debug:
+                        print("\nSKIPPED NON PANEL LETTER:")
+                        print(p)
+
+                    continue
+
+            if p not in sections:
+                sections[p] = clean
+            else:
+                sections[p] += " " + clean
+
+    # ========================================================
+    # FINAL DEBUG
+    # ========================================================
+
+    if debug:
+
+        print("\nFINAL SECTIONS:")
+        print(json.dumps(
+            sections,
+            indent=2,
+            ensure_ascii=False
+        ))
+
+        print("\nPREFIX:")
+        print(prefix_text)
+
+        print("============================================================")
 
     return sections, prefix_text
 
@@ -335,32 +797,152 @@ def run_ocr_pil(image):
 
         return "", []
 
+def apply_multipanel_ocr_pipeline(text, row):
+    default_result = {
+        "text": text,
+
+        "ocr_used": False,
+        "ocr_text": "",
+        "ocr_meta": [],
+
+        "selected_panels": [],
+
+        "ocr_found_panels": [],
+        "ocr_panel_section_keys": [],
+        "ocr_selected_panel_count": 0,
+        "ocr_selected_texts": [],
+    }
+
+    original_text = text
+
+    ocr_used = False
+    ocr_text = ""
+    selected_panels = []
+
+    is_multi, _ = is_multipanel_caption(text)
+
+    if not is_multi:
+        return default_result
+
+    # Ist es wirklich eine echte Subcaption-Struktur?
+    if not is_real_multipanel(text):
+        return default_result
+
+    image = get_image_from_row(row)
+
+    if image is None:
+        return default_result
+
+    ocr_text, ocr_meta = run_ocr_pil(image)
+
+    panel_sections, prefix_text = split_multipanel_caption(text)
+
+    VALID_PANELS = {
+        "A","B","C","D","E","F","G","H",
+        "I","J","K","L","M","N","O","P",
+        "Q","R","S","T",
+        "1","2","3","4","5","6","7","8","9"
+    }
+
+    found_panels = []
+
+    tokens = re.findall(
+        r"\b[A-Z]\b|\b\d+\b",
+        ocr_text.upper()
+    )
+
+    for token in tokens:
+
+        token = re.sub(
+            r"[^A-Za-z0-9]",
+            "",
+            token
+        ).upper()
+
+        if token in VALID_PANELS:
+            found_panels.append(token)
+
+    found_panels = list(dict.fromkeys(found_panels))
+
+    if len(found_panels) == 0:
+        default_result["ocr_text"] = ocr_text
+        default_result["ocr_meta"] = ocr_meta
+
+        return default_result
+
+    selected_texts = []
+
+    for p in found_panels:
+
+        if p in panel_sections:
+
+            combined_text = (
+                prefix_text + " " + panel_sections[p]
+            ).strip()
+
+            selected_texts.append(combined_text)
+
+    if len(selected_texts) == 0:
+        return default_result
+
+    final_text = " ".join(selected_texts)
+
+    default_result["text"] = final_text
+
+    default_result["ocr_used"] = True
+    default_result["ocr_text"] = ocr_text
+    default_result["ocr_meta"] = ocr_meta
+
+    default_result["selected_panels"] = found_panels
+
+    default_result["ocr_found_panels"] = found_panels
+    default_result["ocr_panel_section_keys"] = list(panel_sections.keys())
+    default_result["ocr_selected_panel_count"] = len(selected_texts)
+    default_result["ocr_selected_texts"] = selected_texts
+
+    return default_result
+
+
 class SimpleCNN(nn.Module):
+
     def __init__(self, num_classes):
+
         super().__init__()
 
         self.features = nn.Sequential(
+
             nn.Conv2d(3, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2),
+            nn.MaxPool2d(2, 2),
 
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.ReLU(),
+            nn.MaxPool2d(2, 2),
 
-            nn.AdaptiveAvgPool2d((1, 1))
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
         )
+
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
 
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(64, 128),
+            nn.Linear(128, 256),
             nn.ReLU(),
-            nn.Linear(128, num_classes)
+            nn.Linear(256, num_classes)
         )
 
     def forward(self, x):
+
         x = self.features(x)
+
+        x = self.pool(x)
+
         x = self.classifier(x)
+
         return x
+
 
 class ThirdCNN(nn.Module):
     def __init__(self, num_classes):
@@ -457,9 +1039,7 @@ def extract_text_from_row(row) -> Tuple[str, dict]:
     intext_refs_summary = str(meta.get("intext_refs_summary", "") or "").strip()
     intext_refs = str(meta.get("intext_refs", "") or "").strip()
 
-    if full_caption and sub_caption:
-        text = full_caption + " " + sub_caption
-    elif full_caption:
+    if full_caption:
         text = full_caption
     elif sub_caption:
         text = sub_caption
@@ -642,8 +1222,10 @@ CT_RULES_LONG = [
     r"\bct\b",
     r"\bct scan\b",
     r"\bcomputed tomography\b",
+    r"\bcomputed tomography angiography\b",
     r"\bcomputed tomograph\w*\b",
     r"\baxial ct\b",
+    r"\bcta\b",
     r"\bcoronal ct\b",
     r"\bsagittal ct\b",
     r"\bcontrast[- ]enhanced ct\b",
@@ -1118,63 +1700,10 @@ def early_balanced_sampling(ds, per_class, limit=None, early_presample=None):
             # })
             continue
 
-        # MULTIPANEL FILTER
-        # =========================================================
-        # MULTIPANEL + OCR
-        # =========================================================
+        # Multipanel
+        mp = apply_multipanel_ocr_pipeline(text, row)
 
-        is_multi, multi_match = is_multipanel_caption(text)
-
-        if is_multi:
-
-            image = get_image_from_row(row)
-
-            if image is not None:
-
-                ocr_text, ocr_meta = run_ocr_pil(image)
-
-                panel_sections, prefix_text = split_multipanel_caption(text)
-
-                VALID_PANELS = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14"}
-
-                found_panels = []
-
-                for token in ocr_text.split():
-
-                    token = re.sub(
-                        r"[^A-Za-z0-9]",
-                        "",
-                        token
-                    ).upper()
-
-                    if token in VALID_PANELS:
-                        found_panels.append(token)
-
-                # duplicates entfernen
-                found_panels = list(dict.fromkeys(found_panels))
-
-                selected_panel_texts = []
-
-                for p in found_panels:
-
-                    if p in panel_sections:
-                        combined_text = (
-                                prefix_text + " " + panel_sections[p]
-                        ).strip()
-
-                        selected_panel_texts.append(combined_text)
-
-                # OCR erfolgreich
-                if len(selected_panel_texts) > 0:
-
-                    text = " ".join(selected_panel_texts)
-
-                # OCR erfolglos
-                else:
-
-                    # Fallback:
-                    # ganzen Text behalten
-                    pass
+        text = mp["text"]
 
         rule_pred, reason, matched, hits = rule_based_classify_with_rules(
             text, RULES_LONG, LABEL_PRIORITY)
@@ -1191,15 +1720,47 @@ def early_balanced_sampling(ds, per_class, limit=None, early_presample=None):
             continue
 
         buckets[rule_pred].append({
+
             "row_id": idx,
             "pmc_id": meta.get("PMC_ID", ""),
-            "caption": text,
+
+            "caption": mp["text"],
+
+            "original_caption": normalize_text(
+                extract_text_from_row(row)[0]
+            ),
+
             "row": row,
+
             "rule_pred": rule_pred,
             "rule_reason": reason,
             "rule_hits": hits,
+
             "modality_gt": meta.get("modality", "unknown"),
-            "matched_patterns": matched.split(" | ") if matched else []
+
+            "matched_patterns": matched.split(" | ")
+            if matched else [],
+
+            # ====================================================
+            # OCR DEBUG / MULTIPANEL INFO
+            # ====================================================
+
+            "ocr_used": mp["ocr_used"],
+            "ocr_text": mp["ocr_text"],
+            "ocr_meta": mp["ocr_meta"],
+
+            "selected_panels": mp["selected_panels"],
+
+            "ocr_found_panels": mp["ocr_found_panels"],
+
+            "ocr_panel_section_keys":
+                mp["ocr_panel_section_keys"],
+
+            "ocr_selected_panel_count":
+                mp["ocr_selected_panel_count"],
+
+            "ocr_selected_texts":
+                mp["ocr_selected_texts"],
         })
 
         # Early Stop
@@ -1249,11 +1810,13 @@ class ModelContext:
     def __init__(
         self,
         cnn_model,
+        cnn2_model,
         cnn3_model,
         cnn_transform,
         device
     ):
         self.cnn = cnn_model
+        self.cnn2 = cnn2_model
         self.cnn3 = cnn3_model
         self.transform = cnn_transform
         self.device = device
@@ -1286,6 +1849,7 @@ def enrich_debug_fields(
     rule_scores,
 
     cnn_pred,
+    cnn_scores,
     cnn_top3,
 
     cnn3_pred,
@@ -1294,7 +1858,12 @@ def enrich_debug_fields(
     final_label,
     final_conf,
 
-    decision_source
+    decision_source,
+
+    ocr_found_panels,
+    ocr_panel_section_keys,
+    ocr_selected_panel_count,
+    ocr_selected_texts,
 ):
 
     r["caption"] = text
@@ -1306,7 +1875,7 @@ def enrich_debug_fields(
     r["rule_scores"] = rule_scores
 
     r["cnn_pred"] = cnn_pred
-
+    r["cnn_scores"] = cnn_scores
     r["cnn_top3"] = cnn_top3
 
     r["cnn3_pred"] = cnn3_pred
@@ -1322,6 +1891,10 @@ def enrich_debug_fields(
     r["ocr_meta"] = r.get("ocr_meta", [])
     r["ocr_text"] = r.get("ocr_text", "")
     r["selected_panels"] = r.get("selected_panels", [])
+    r["ocr_found_panels"] = ocr_found_panels
+    r["ocr_panel_section_keys"] = ocr_panel_section_keys
+    r["ocr_selected_panel_count"] = ocr_selected_panel_count
+    r["ocr_selected_texts"] = ocr_selected_texts
 
     r["rule_reason"] = r.get("rule_reason", "")
     r["rule_hits"] = r.get("rule_hits", {})
@@ -1333,65 +1906,46 @@ def enrich_debug_fields(
 # ============================================================
 # Verarbeitung (Ph. 3)
 # ============================================================
-def process_single_record(r, ctx: ModelContext, cnn_strongfilter,
+def process_single_record(r, ctx: ModelContext, cnn3filter,
 cnn_mediumfilter, cnn_thresh):
     # Das ist mein Phase-3 Code für ein Sample (Rules + CNN)
     text = r.get("caption")
-    original_text = r.get("caption")
+    original_text = r.get("original_caption", text)
     row = r.get("row")
     rule_hits = r.get("rule_hits")
+    image = get_image_from_row(row)
+
+    ocr_found_panels = []
+    ocr_panel_section_keys = []
+    ocr_selected_panel_count = 0
+    ocr_selected_texts = []
 
     # Wichtig OCR nur im Multipanel-Fall (i.e. Fig. 2A etc)
-    is_multi, multi_match = is_multipanel_caption(text)
-    if is_multi:
-        image = get_image_from_row(row)
-        if image is not None:
-            ocr_text, ocr_meta = run_ocr_pil(image)
-            r["ocr_meta"] = ocr_meta
-            panel_sections, prefix_text = split_multipanel_caption(text)
-            # print("\n===== PANEL DEBUG =====")
-            # print("TEXT:")
-            # print(text)
-            #
-            # print("\nPREFIX:")
-            # print(prefix_text)
-            #
-            # print("\nPANELS FOUND:")
-            # print(panel_sections.keys())
-            #
-            # for k, v in panel_sections.items():
-            #     print(f"\nPANEL {k}:")
-            #     print(v[:300])
-            # OCR erkennt dominante Panels
-            VALID_PANELS = {"A", "B", "C", "D", "E", "F"}
-            found_panels = []
-            for token in ocr_text.split():
-                token = re.sub(r"[^A-Za-z0-9]", "", token).upper()
-                if token in VALID_PANELS:
-                    found_panels.append(token)
+    text = r.get("caption", original_text)
 
-            found_panels = list(dict.fromkeys(found_panels))
+    ocr_found_panels = r.get("ocr_found_panels", [])
+    ocr_panel_section_keys = r.get("ocr_panel_section_keys", [])
+    ocr_selected_panel_count = r.get("ocr_selected_panel_count", 0)
+    ocr_selected_texts = r.get("ocr_selected_texts", [])
 
-            # Falls OCR z.B. A erkennt:
-            # benutze nur Text von Panel A |----|
-            selected_panel_texts = []
-            for p in found_panels:
-                if p in panel_sections:
-                    combined_text = (prefix_text + " " + panel_sections[p]).strip()
+    r["ocr_used"] = r.get("ocr_used", False)
+    r["ocr_text"] = r.get("ocr_text", "")
+    r["ocr_meta"] = r.get("ocr_meta", [])
+    r["selected_panels"] = r.get("selected_panels", [])
 
-                    selected_panel_texts.append(combined_text)
+    rule_pred = "unknown"
 
-            # Falls OCR erfolgreich:
-            # Caption ersetzen
-            if len(selected_panel_texts) > 0:
-                text = " ".join(selected_panel_texts)
-                r["ocr_used"] = True
-                r["ocr_text"] = ocr_text
-                r["selected_panels"] = found_panels
-            else:
-                r["ocr_used"] = False
-        else:
-            r["ocr_used"] = False
+    cnn_pred = "unknown"
+    cnn_scores = {}
+    cnn_top3 = []
+
+    final_label = "unknown"
+    final_conf = 0.0
+
+    cnn_conf_final = 0.0
+    cnn_margin = 0.0
+
+    decision_source = "none"
 
     # =========================
     # RULES
@@ -1408,34 +1962,86 @@ cnn_mediumfilter, cnn_thresh):
             cnn_conf_final = 1.0
 
             decision_source = "rule_us_override"
-
             cnn_pred = "us"
             cnn_top3 = [("us", 1.0)]
 
+        # Mrt wird immer genommen
+        elif r.get("rule_pred") == "mrt_body":
+            final_label = "mrt_body"
+            final_conf = 1.0
+            cnn_conf_final = 1.0
+
+            decision_source = "rule_mrtbody_override"
+            cnn_pred = "mrt_body"
+            cnn_top3 = [("mrt_body", 1.0)]
+
+        elif r.get("rule_pred") == "mrt_hirn":
+            final_label = "mrt_hirn"
+            final_conf = 1.0
+            cnn_conf_final = 1.0
+
+            decision_source = "rule_mrthirn_override"
+            cnn_pred = "mrt_hirn"
+            cnn_top3 = [("mrt_hirn", 1.0)]
         else:
-            # =========================
-            # CNN
-            # =========================
-            image = get_image_from_row(row)
+            # ========================================================
+            # CT Regel -> CT/Xray Vergleich, Spezial CNN
+            # ========================================================
+            if r.get("rule_pred") == "ct":
 
-            cnn_top3, cnn_full = predict_with_cnn(
-                ctx.cnn,
-                image,
-                ctx.transform,
-                ctx.device,
-                CNN_CLASS_NAMES
-            )
+                ct_top3, ct_scores = predict_with_cnn(
+                    ctx.cnn2,
+                    image,
+                    ctx.transform,
+                    ctx.device,
+                    CNN2_CLASS_NAMES
+                )
 
-            cnn_scores = cnn_full
+                cnn_scores = ct_scores
+                cnn_top3 = ct_top3
 
-            cnn_pred, cnn_conf_final, cnn_margin = get_top_prediction(cnn_scores)
+                cnn_pred, cnn_conf_final, cnn_margin = get_top_prediction(
+                    cnn_scores
+                )
 
-            final_label = cnn_pred
-            final_conf = cnn_conf_final
+                # Nur Agreement erlaubt !Rules==CNN!
+                if cnn_pred == "ct":
 
-            decision_source = "cnn"
+                    final_label = "ct"
+                    final_conf = cnn_conf_final
 
-            cnn_pred = final_label
+                    decision_source = "CONFRM_ct_xray_cnn2"
+
+                else:
+
+                    final_label = "unknown"
+                    final_conf = cnn_conf_final
+
+                    decision_source = "REJCT_ct_xray_cnn2"
+
+            # ========================================================
+            # Normale CNNs
+            # ========================================================
+            else:
+
+                cnn_top3, cnn_full = predict_with_cnn(
+                    ctx.cnn,
+                    image,
+                    ctx.transform,
+                    ctx.device,
+                    CNN_CLASS_NAMES
+                )
+
+                cnn_scores = cnn_full
+
+                cnn_pred, cnn_conf_final, cnn_margin = get_top_prediction(
+                    cnn_scores
+                )
+
+                final_label = cnn_pred
+                final_conf = cnn_conf_final
+
+                decision_source = "cnn"
 
     # =========================
     # CNN3 Filtering + CNN-Uncertainty Filtering
@@ -1451,8 +2057,8 @@ cnn_mediumfilter, cnn_thresh):
 
     expert_conf = cnn_conf_final
 
-    if cnn3_conf >= cnn_strongfilter:
-        if expert_conf <= 0.65:
+    if cnn3_conf >= cnn3filter:
+        if expert_conf <= 0.79:
             r["is_filtered"] = True
             r["filter_reason"] = "cnn3_strong"
 
@@ -1466,6 +2072,7 @@ cnn_mediumfilter, cnn_thresh):
                 rule_scores=rule_scores,
 
                 cnn_pred=cnn_pred,
+                cnn_scores=cnn_scores,
                 cnn_top3=cnn_top3,
 
                 cnn3_pred=cnn3_pred,
@@ -1474,38 +2081,16 @@ cnn_mediumfilter, cnn_thresh):
                 final_label=final_label,
                 final_conf=final_conf,
 
-                decision_source=decision_source
+                decision_source=decision_source,
+
+                ocr_found_panels=ocr_found_panels,
+                ocr_panel_section_keys=ocr_panel_section_keys,
+                ocr_selected_panel_count=ocr_selected_panel_count,
+                ocr_selected_texts=ocr_selected_texts
             )
 
             return r
 
-    elif cnn3_conf >= cnn_mediumfilter:
-        if expert_conf <= 0.465:
-            r["is_filtered"] = True
-            r["filter_reason"] = "cnn3_medium"
-
-            r = enrich_debug_fields(
-                r=r,
-                text=text,
-                original_text=original_text,
-                row=row,
-
-                rule_pred=rule_pred,
-                rule_scores=rule_scores,
-
-                cnn_pred=cnn_pred,
-                cnn_top3=cnn_top3,
-
-                cnn3_pred=cnn3_pred,
-                cnn3_conf=cnn3_conf,
-
-                final_label=final_label,
-                final_conf=final_conf,
-
-                decision_source=decision_source
-            )
-
-            return r
 
     CNN3_CONF_MIN = 0.96
     PRE_CONF_MAX = 0.45
@@ -1527,6 +2112,7 @@ cnn_mediumfilter, cnn_thresh):
             rule_scores=rule_scores,
 
             cnn_pred=cnn_pred,
+            cnn_scores=cnn_scores,
             cnn_top3=cnn_top3,
 
             cnn3_pred=cnn3_pred,
@@ -1535,7 +2121,12 @@ cnn_mediumfilter, cnn_thresh):
             final_label=final_label,
             final_conf=final_conf,
 
-            decision_source=decision_source
+            decision_source=decision_source,
+
+            ocr_found_panels=ocr_found_panels,
+            ocr_panel_section_keys=ocr_panel_section_keys,
+            ocr_selected_panel_count=ocr_selected_panel_count,
+            ocr_selected_texts=ocr_selected_texts
         )
 
         return r
@@ -1548,10 +2139,19 @@ cnn_mediumfilter, cnn_thresh):
 
     cnn_pred_label = final_label
 
-    agreement_pass = (
-            rule_pred == cnn_pred_label
-            and cnn_conf_final >= 0.55
-    )
+    # CT Spezialfall
+    if decision_source == "CONFRM_ct_xray_cnn2":
+        agreement_pass = True
+
+    elif decision_source == "REJCT_ct_xray_cnn2":
+        agreement_pass = False
+
+    else:
+        agreement_pass = (
+                rule_pred == cnn_pred_label
+                and cnn_conf_final >= 0.55
+                and final_label in FINAL_CLASSES
+        )
 
     # Konflikt -> sofort rauswerfen
     if not agreement_pass:
@@ -1568,6 +2168,7 @@ cnn_mediumfilter, cnn_thresh):
             rule_scores=rule_scores,
 
             cnn_pred=cnn_pred,
+            cnn_scores=cnn_scores,
             cnn_top3=cnn_top3,
 
             cnn3_pred=cnn3_pred,
@@ -1576,7 +2177,12 @@ cnn_mediumfilter, cnn_thresh):
             final_label=final_label,
             final_conf=final_conf,
 
-            decision_source=decision_source
+            decision_source=decision_source,
+
+            ocr_found_panels=ocr_found_panels,
+            ocr_panel_section_keys=ocr_panel_section_keys,
+            ocr_selected_panel_count=ocr_selected_panel_count,
+            ocr_selected_texts=ocr_selected_texts
         )
 
         return r
@@ -1593,6 +2199,7 @@ cnn_mediumfilter, cnn_thresh):
         rule_scores=rule_scores,
 
         cnn_pred=cnn_pred,
+        cnn_scores=cnn_scores,
         cnn_top3=cnn_top3,
 
         cnn3_pred=cnn3_pred,
@@ -1601,7 +2208,12 @@ cnn_mediumfilter, cnn_thresh):
         final_label=final_label,
         final_conf=final_conf,
 
-        decision_source=decision_source
+        decision_source=decision_source,
+
+        ocr_found_panels=ocr_found_panels,
+        ocr_panel_section_keys=ocr_panel_section_keys,
+        ocr_selected_panel_count=ocr_selected_panel_count,
+        ocr_selected_texts=ocr_selected_texts
     )
 
     return r
@@ -1611,7 +2223,7 @@ cnn_mediumfilter, cnn_thresh):
 def process_batch(
     presample,
     ctx,
-    cnn_strongfilter,
+    cnn3filter,
     cnn_mediumfilter,
     cnn_thresh,
     disagreement_dir=None):
@@ -1628,7 +2240,7 @@ def process_batch(
                 process_single_record,
                 r,
                 ctx,
-                cnn_strongfilter,
+                cnn3filter,
                 cnn_mediumfilter,
                 cnn_thresh
             )
@@ -1851,7 +2463,7 @@ def build_balanced_dataset(
         refill_presample,
         per_class,
         max_rounds,
-        cnn_strongfilter,
+        cnn3filter,
         cnn_mediumfilter,
         cnn_thresh,
         micro_round_failures,
@@ -1996,6 +2608,10 @@ def build_balanced_dataset(
             text, meta = extract_text_from_row(row)
 
             text = normalize_text(text)
+            # Multipanel
+            mp = apply_multipanel_ocr_pipeline(text, row)
+
+            text = mp["text"]
 
             rule_pred, reason, matched, hits = rule_based_classify_with_rules(
                 text,
@@ -2027,7 +2643,19 @@ def build_balanced_dataset(
                 "rule_reason": reason,
                 "rule_hits": hits,
                 "matched_patterns": matched.split(" | ") if matched else [],
-                "modality_gt": meta.get("modality", "unknown")}
+                "modality_gt": meta.get("modality", "unknown"),
+
+                "ocr_used": mp["ocr_used"],
+                "ocr_text": mp["ocr_text"],
+                "ocr_meta": mp["ocr_meta"],
+
+                "selected_panels": mp["selected_panels"],
+
+                "ocr_found_panels": mp["ocr_found_panels"],
+                "ocr_panel_section_keys": mp["ocr_panel_section_keys"],
+                "ocr_selected_panel_count": mp["ocr_selected_panel_count"],
+                "ocr_selected_texts": mp["ocr_selected_texts"],
+            }
 
             global_used.add(key)
 
@@ -2037,7 +2665,7 @@ def build_balanced_dataset(
         processed = process_batch(
                         presample,
                         ctx,
-                        cnn_strongfilter=cnn_strongfilter,
+                        cnn3filter=cnn3filter,
                         cnn_mediumfilter=cnn_mediumfilter,
                         cnn_thresh=cnn_thresh,
                         disagreement_dir=output_csv.parent / "disagreements")
@@ -2371,6 +2999,7 @@ def classify_dataset(
     pre_output_csv: Path,
     output_csv: Path,
     cnn_path: str,
+    cnn2_path: str,
     cnn3_path: str,
     limit: Optional[int],
     inspectlimit: int,
@@ -2379,7 +3008,7 @@ def classify_dataset(
     initial_presample: int,
     refill_presample: int,
     max_rounds: int,
-    cnn_strongfilter: float,
+    cnn3filter: float,
     cnn_mediumfilter: float,
     cnn_thresh: float,
     micro_round_failures: int,
@@ -2466,6 +3095,10 @@ def classify_dataset(
     cnn_model.load_state_dict(torch.load(cnn_path, map_location=device))
     cnn_model.to(device).eval()
 
+    cnn2_model = SimpleCNN(num_classes=2)
+    cnn2_model.load_state_dict(torch.load(cnn2_path, map_location=device))
+    cnn2_model.to(device).eval()
+
     cnn3_model = ThirdCNN(num_classes=6)
     cnn3_model.load_state_dict(torch.load(cnn3_path, map_location=device))
     cnn3_model.to(device).eval()
@@ -2474,6 +3107,7 @@ def classify_dataset(
 
     ctx = ModelContext(
         cnn_model,
+        cnn2_model,
         cnn3_model,
         cnn_transform,
         device)
@@ -2483,7 +3117,7 @@ def classify_dataset(
     # ============================================================
     print("\nExtrahiere Records + RULES + CNN ...")
     print("\nPhase 3: CNN auf Subset")
-    records = process_batch(records0, ctx, cnn_strongfilter, cnn_mediumfilter, cnn_thresh, disagreement_dir=output_csv.parent / "disagreements")
+    records = process_batch(records0, ctx, cnn3filter, cnn_mediumfilter, cnn_thresh, disagreement_dir=output_csv.parent / "disagreements")
     print("records nach batch:", len(records))
 
     # ============================================================
@@ -2502,7 +3136,7 @@ def classify_dataset(
         refill_presample,
         per_class,
         max_rounds,
-        cnn_strongfilter,
+        cnn3filter,
         cnn_mediumfilter,
         cnn_thresh,
         micro_round_failures,
@@ -2516,7 +3150,7 @@ def classify_dataset(
     print("\nSpeichere Early-Presample Bilder ...")
 
     save_selected_images(
-        records0,
+        records,
         final_output_dir
     )
 
@@ -2527,8 +3161,8 @@ def classify_dataset(
 
     empty_mask = df["caption"].fillna("").astype(str).str.strip().eq("")
     df.loc[empty_mask, "final_label"] = "unknown"
-    df.loc[empty_mask, "Begründung"] = "empty_text"
-    df.loc[empty_mask, "Begründung"] = "empty_text"
+    df.loc[empty_mask, "decision_source"] = "empty_text"
+    df.loc[empty_mask, "decision_source"] = "empty_text"
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_csv, index=False, encoding="utf-8")
@@ -2539,7 +3173,7 @@ def classify_dataset(
     print(df["final_label"].value_counts(dropna=False))
 
     print("\n===== Verteilung decision_source =====")
-    print(df["Begründung"].value_counts(dropna=False))
+    print(df["decision_source"].value_counts(dropna=False))
 
     print("\n===== Verteilung modality_gt =====")
     print(df["modality_gt"].value_counts(dropna=False).head(20))
@@ -2593,6 +3227,12 @@ def parse_args():
         help="Lokaler Pfad zum custom CNN"
     )
     parser.add_argument(
+        "--cnn2_path",
+        type=str,
+        required=True,
+        help="Lokaler Pfad zum custom CNN nur CT<->Xray Unterscheidung"
+    )
+    parser.add_argument(
         "--cnn3_path",
         type=str,
         required=True,
@@ -2601,30 +3241,30 @@ def parse_args():
     parser.add_argument(
         "--per_class",
         type=int,
-        default=10,
-        # default=5000,
+        # default=10,
+        default=5000,
         help="Anzahl Samples pro finaler Klasse (hash-balanced)"
     )
     parser.add_argument(
         "--early_presample",
         type=int,
-        default=200,
+        default=10000,
         help="Nur diese Anzahl Samples in ersten Run (=Phase 2) klassifizieren"
     )
     parser.add_argument(
         "--initial_presample",
         type=int,
-        # default=50000,
+        default=50000,
         # default=6000,
-        default=500,
+        # default=500,
         help="Menge des ersten großes Presample vor Refill"
     )
     parser.add_argument(
         "--refill_presample",
         type=int,
         # default=200,
-        default=300,
-        # default=25000,
+        # default=300,
+        default=25000,
         help="Anzahl spätere Nachlade-Chunks Postsample *im* Refill"
     )
     parser.add_argument(
@@ -2647,7 +3287,7 @@ def parse_args():
         help="CNN confidence threshold für sichere Entscheidungen."
     )
     parser.add_argument(
-        "--cnn_strongfilter",
+        "--cnn3filter",
         type=float,
         default=0.75,
         help="CNN confidence threshold für sichere Entscheidungen."
@@ -2656,7 +3296,7 @@ def parse_args():
         "--micro_round_failures",
         type=int,
         # default=30,
-        default=400,
+        default=500,
         help="Anzahl erfolgloser Samples bis Micro-Round erhöht wird"
     )
     parser.add_argument(
@@ -2692,6 +3332,7 @@ def main():
         pre_output_csv=pre_output_csv,
         output_csv=output_csv,
         cnn_path=args.cnn_path,
+        cnn2_path=args.cnn2_path,
         cnn3_path=args.cnn3_path,
         inspectlimit=args.inspectlimit,
         limit=args.limit,
@@ -2701,7 +3342,7 @@ def main():
         refill_presample=args.refill_presample,
         max_rounds=args.max_rounds,
         cnn_thresh=args.cnn_thresh,
-        cnn_strongfilter=args.cnn_strongfilter,
+        cnn3filter=args.cnn3filter,
         cnn_mediumfilter=args.cnn_mediumfilter,
         micro_round_failures=args.micro_round_failures,
 

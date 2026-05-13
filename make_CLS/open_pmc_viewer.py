@@ -36,7 +36,7 @@ def build_image_index(image_dir):
 # CONFIG
 # ============================================================
 
-MODE = "final"
+MODE = "all"
 
 """
 MODES:
@@ -64,7 +64,7 @@ if MODE == "final":
     CSV_PATH = (
         BASE_DIR
         / "round_checkpoints"
-        / "round_001.csv"
+        / "round_008.csv"
     )
 
     IMAGE_DIR = (
@@ -108,6 +108,38 @@ elif MODE == "early_rules":
         / "early_rules_dataset"
         / "images"
     )
+# ============================================================
+# ALL
+# ============================================================
+
+elif MODE == "all":
+
+    FINAL_CSV = (
+        BASE_DIR
+        / "round_checkpoints"
+        / "round_000.csv"
+    )
+
+    DIS_CSV = (
+        BASE_DIR
+        / "disagreements"
+        / "rule_cnn_disagreements.csv"
+    )
+
+    FINAL_IMG_DIR = (
+        BASE_DIR
+        / "round_checkpoints"
+        / "images_after_rounds"
+    )
+
+    DIS_IMG_DIR = (
+        BASE_DIR
+        / "disagreements"
+        / "images"
+    )
+
+    CSV_PATH = None
+    IMAGE_DIR = None
 
 else:
 
@@ -119,7 +151,25 @@ print(CSV_PATH)
 print("\nIMAGE_DIR:")
 print(IMAGE_DIR)
 
-IMAGE_INDEX = build_image_index(IMAGE_DIR)
+# ============================================================
+# IMAGE INDEX
+# ============================================================
+
+if MODE == "all":
+
+    IMAGE_INDEX = {}
+
+    IMAGE_INDEX.update(
+        build_image_index(FINAL_IMG_DIR)
+    )
+
+    IMAGE_INDEX.update(
+        build_image_index(DIS_IMG_DIR)
+    )
+
+else:
+
+    IMAGE_INDEX = build_image_index(IMAGE_DIR)
 
 THUMB_SIZE = (900, 900)
 
@@ -189,10 +239,23 @@ def build_image_path(image_dir, row):
     label = str(label)
 
     # Klassenordner
+    if MODE == "all":
+
+        source = row.get("viewer_source", "final")
+
+        if source == "disagreement":
+            base_dir = DIS_IMG_DIR
+        else:
+            base_dir = FINAL_IMG_DIR
+
+    else:
+
+        base_dir = image_dir
+
     path = (
-        Path(image_dir)
-        / label
-        / f"{pmc_id}_{row_id}.jpg"
+            Path(base_dir)
+            / label
+            / f"{pmc_id}_{row_id}.jpg"
     )
 
     # Fallback alter Stil ohne Klassenordner
@@ -215,7 +278,24 @@ class PMCViewer:
         self.root.configure(bg=BG)
 
         print("Lade CSV ...")
-        self.df = pd.read_csv(CSV_PATH, low_memory=False)
+
+        if MODE == "all":
+
+            df_final = pd.read_csv(FINAL_CSV, low_memory=False)
+
+            df_dis = pd.read_csv(DIS_CSV, low_memory=False)
+
+            df_final["viewer_source"] = "final"
+            df_dis["viewer_source"] = "disagreement"
+
+            self.df = pd.concat(
+                [df_final, df_dis],
+                ignore_index=True
+            )
+
+        else:
+
+            self.df = pd.read_csv(CSV_PATH, low_memory=False)
 
         # ============================================================
         # MODE FILTER
@@ -237,7 +317,13 @@ class PMCViewer:
 
         self.filtered_df = self.df.copy()
 
-        self.image_dir = Path(IMAGE_DIR)
+        if MODE == "all":
+
+            self.image_dir = None
+
+        else:
+
+            self.image_dir = Path(IMAGE_DIR)
 
         self.loader = AsyncImageLoader()
 

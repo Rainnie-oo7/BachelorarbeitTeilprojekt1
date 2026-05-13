@@ -5,10 +5,10 @@ python make_CLS/pipeline_2.py \
   --dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB \
   --pre_output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/preoutput_per10.csv \
   --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/output_per10.csv \
-  --cnn_path /home/b/Dokumente/cnnCLS/cnncls.pth \
+  --cnn_path /home/b/Dokumente/cnnges/cnnges.pth \
+  --cnn2_path /home/b/Dokumente/cnnct-xr/cnnct-xr.pth \
   --cnn3_path /home/b/Dokumente/cnn3/cnn3filter.pth \
-  --cnn_strongfilter 0.94 \
-  --cnn_mediumfilter 0.6 \
+  --cnn3filter 0.5 \
   --cnn_thresh 0.60 \
   --micro_round_failures 500
   > logrun.txt 2>&1
