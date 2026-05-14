@@ -3291,13 +3291,13 @@ def parse_args():
     parser.add_argument(
         "--early_presample",
         type=int,
-        default=145000,
+        default=14500,
         help="Nur diese Anzahl Samples in ersten Run (=Phase 2) klassifizieren"
     )
     parser.add_argument(
         "--initial_presample",
         type=int,
-        default=145000,
+        default=14500,
         # default=6000,
         # default=500,
         help="Menge des ersten großes Presample vor Refill"
@@ -3307,7 +3307,7 @@ def parse_args():
         type=int,
         # default=200,
         # default=300,
-        default=145000,
+        default=14500,
         help="Anzahl spätere Nachlade-Chunks Postsample *im* Refill"
     )
     parser.add_argument(
@@ -3332,7 +3332,7 @@ def parse_args():
     parser.add_argument(
         "--cnn3filter",
         type=float,
-        default=0.95,
+        default=0.976,
         help="CNN confidence threshold für sichere Entscheidungen."
     )
     parser.add_argument(
