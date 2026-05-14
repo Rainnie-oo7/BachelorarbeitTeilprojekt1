@@ -14,8 +14,13 @@ python make_CLS/pipeline_2.py \
   > logrun.txt 2>&1
 
 
-
-
+python make_CLS/pipeline_2.py \
+  --dataset_root /home/b/PycharmProjects/ba1pmc/PMC-41GB \
+  --pre_output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/pre_ctkombi.csv \
+  --output_csv /home/b/PycharmProjects/ba1pmc/make_CLS/final_ctkombi.csv \
+  --cnn_path /home/b/Dokumente/cnnges/cnnges.pth \
+  --cnn2_path /home/b/Dokumente/cnnct-xr/cnnct-xr.pth \
+  --cnn3_path /home/b/Dokumente/cnn3/cnn3filter.pth
 
 
 

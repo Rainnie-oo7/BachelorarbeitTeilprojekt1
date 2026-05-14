@@ -36,7 +36,7 @@ def build_image_index(image_dir):
 # CONFIG
 # ============================================================
 
-MODE = "all"
+MODE = "disagreements"
 
 """
 MODES:

@@ -62,6 +62,7 @@ FINAL_CLASSES = [
     "mrt_hirn",
     "xray",
     "xray_fluoroskopie_angiographie"]
+TARGET_CLASS_ONLY = None
 CNN_CLASS_NAMES = [        #strikt Reihenfolge!!!
     'ct',
     'ct_kombimodalitaet_spect+ct_pet+ct',
@@ -1084,148 +1085,183 @@ def get_image_from_row(row):
 # ============================================================
 # Harte Regeln
 # ============================================================
-# Lange RULES MRT HIRN – Sublisten
-MRT_HIRN_T1_LONG = [
-    r"\bbrain\b.*\bt1\b",
-    r"\bhead\b.*\bt1\b",
-    r"\bcerebr\w*\b.*\bt1\b",
-    r"\bcranial\b.*\bt1\b",
-    r"\bt1[- ]weighted\b.*\bbrain\b",
-    r"\bbrain\s+mri\b.*\bt1\b",
-    r"\bbrain\s+magnetic\s+resonance\b",
-    r"\bmra\b",
-    r"\binternal\s+carotid\s+artery\b",
-    r"\bica\b",
-]
-MRT_HIRN_T2_LONG = [
-    r"\bbrain\b.*\bt2\b",
-    r"\bhead\b.*\bt2\b",
-    r"\bcerebr\w*\b.*\bt2\b",
-    r"\bcranial\b.*\bt2\b",
-    r"\bt2[- ]weighted\b.*\bbrain\b",
-    r"\bbrain\s+mri\b.*\bt2\b",
-    r"\bbrain\s+magnetic\s+resonance\b",
-    r"\bmra\b",
-    r"\binternal\s+carotid\s+artery\b",
-    r"\bica\b",
-]
-MRT_HIRN_FLAIR_LONG = [
+
+MRT_HIRN_RULES_LONG = [
+
+    # ---------------------------------------------------
+    # Explizite Brain MRI
+    # ---------------------------------------------------
+
+    r"\bbrain\s+mri\b",
+    r"\bbrain\s+mr\b",
+
+    r"\bcranial\s+mri\b",
+    r"\bcranial\s+mr\b",
+
+    r"\bhead\s+mri\b",
+    r"\bhead\s+mr\b",
+
+    r"\bcerebral\s+mri\b",
+    r"\bcerebral\s+mr\b",
+
+    r"\bintracranial\b.*\bmri\b",
+
+    # ---------------------------------------------------
+    # Neuroanatomie
+    # ---------------------------------------------------
+
+    r"\bhippocamp\w*\b",
+    r"\bventricl\w*\b.*\bbrain\b",
+
+    r"\bcorpus callosum\b",
+    r"\bbasal ganglia\b",
+    r"\bthalam\w*\b",
+    r"\bbrainstem\b",
+    r"\bcerebell\w*\b",
+
+    # ---------------------------------------------------
+    # Neuro-Erkrankungen
+    # ---------------------------------------------------
+
+    r"\bglioblastoma\b",
+    r"\bglioma\b",
+    r"\bmeningioma\b",
+    r"\bastrocytoma\b",
+
+    r"\bmultiple sclerosis\b",
+    r"\bms lesions\b",
+
+    r"\bstroke\b.*\bmri\b",
+    r"\bischemic stroke\b",
+
+    r"\bepilep\w*\b",
+    r"\bneurodegenerative\b",
+
+    # ---------------------------------------------------
+    # MRI-Sequenzen NUR mit Brain-Kontext
+    # ---------------------------------------------------
+
     r"\bbrain\b.*\bflair\b",
-    r"\bcranial\b.*\bflair\b",
-    r"\bcerebr\w*\b.*\bflair\b",
-    r"\bhead\b.*\bflair\b",
     r"\bflair\b.*\bbrain\b",
-    r"\bfluid[- ]attenuated inversion recovery\b",
+
+    r"\bbrain\b.*\bt1\b",
+    r"\bbrain\b.*\bt2\b",
+
+    r"\bcerebral\b.*\bt1\b",
+    r"\bcerebral\b.*\bt2\b",
+
+    r"\bbrain\b.*\bdwi\b",
+    r"\bbrain\b.*\badc\b",
+
+    r"\bdiffusion[- ]weighted\b.*\bbrain\b",
+
+    # ---------------------------------------------------
+    # Neurovascular
+    # ---------------------------------------------------
+
+    r"\bmra\b",
+    r"\bmr angiography\b",
+
+    r"\binternal carotid artery\b",
+    r"\bmiddle cerebral artery\b",
+    r"\bvertebral artery\b",
 ]
-MRT_HIRN_T1_C_LONG = [
-    r"\bbrain\b.*\bt1\s*\+\s*c\b",
-    r"\bbrain\b.*\bt1\s*post[- ]contrast\b",
-    r"\bpost[- ]contrast\b.*\bbrain\b.*\bmri\b",
-    r"\bgadolinium[- ]enhanced\b.*\bbrain\b.*\bmri\b",
-    r"\bcontrast[- ]enhanced\b.*\bbrain\b.*\bmri\b",
-    r"\bt1\s*\+\s*c\b.*\bbrain\b",
-    r"\bt1\s+with\s+contrast\b.*\bbrain\b",
-]
-# RULES MRT BODY – Sublisten
-MRT_PROSTATA_T1_LONG = [
-    r"\bprostat\w*\b.*\bt1\b",
-    r"\bt1[- ]weighted\b.*\bprostat\w*\b",
-    r"\bprostate\s+mri\b.*\bt1\b",
-    r"\bpelvic\s+mri\b.*\bprostat\w*\b.*\bt1\b",
-]
-MRT_PROSTATA_T2_LONG = [
-    r"\bprostat\w*\b.*\bt2\b",
-    r"\bt2[- ]weighted\b.*\bprostat\w*\b",
-    r"\bprostate\s+mri\b.*\bt2\b",
-    r"\bpelvic\s+mri\b.*\bprostat\w*\b.*\bt2\b",
-    r"\bzonal anatomy\b.*\bprostat\w*\b.*\bt2\b",
-]
-MRT_BODY_GENERAL_LONG = [
-    r"\bpelvic\s+mri\b",
-    r"\bpelvic\s+mr\b",
-    r"\bprostate\s+mri\b",
-    r"\bprostate\s+mr\b",
-    r"\bmpmri\b",
-    r"\bmultiparametric\s+mri\b.*\bprostat\w*\b",
+MRT_BODY_RULES_LONG = [
+
+    # ---------------------------------------------------
+    # Allgemeine Body MRI
+    # ---------------------------------------------------
+
     r"\babdominal\s+mri\b",
-    r"\bbreast\s+mri\b",
-    r"\bliver\s+mri\b",
-    r"\bkidney\s+mri\b",
-    r"\brenal\s+mri\b",
-    r"\bspine\s+mri\b",
-    r"\bknee\s+mri\b",
+    r"\bpelvic\s+mri\b",
+
     r"\bcardiac\s+mri\b",
     r"\bheart\s+mri\b",
+
+    r"\bbreast\s+mri\b",
+    r"\bspine\s+mri\b",
+
+    r"\blumbar\s+mri\b",
+    r"\bcervical\s+mri\b",
+
+    r"\bthoracic\s+mri\b",
+
+    r"\bmusculoskeletal\s+mri\b",
+
     r"\bwhole[- ]body\s+mri\b",
 
-    r"\bmri\b.*\bprostat\w*\b",
-    r"\bmr\b.*\bprostat\w*\b",
-    r"\bmri\b.*\bpelvi\w*\b",
-    r"\bmr\b.*\bpelvi\w*\b",
-    r"\bdiffusion[- ]weighted\b.*\bprostat\w*\b",
-    r"\bdwi\b.*\bprostat\w*\b",
-    r"\badc\b.*\bprostat\w*\b",
-    r"\bdynamic contrast[- ]enhanced\b.*\bprostat\w*\b",
-    r"\bdce\b.*\bprostat\w*\b",
+    # ---------------------------------------------------
+    # Organe
+    # ---------------------------------------------------
 
-    r"\babdominal\s+mr\b",
-    r"\bbreast\s+mr\b",
-    r"\bliver\s+mr\b",
-    r"\bkidney\s+mr\b",
-    r"\brenal\s+mr\b",
-    r"\bspine\s+mr\b",
-    r"\bknee\s+mr\b",
-    r"\bcardiac\s+mr\b",
-    r"\bheart\s+mr\b",
+    r"\bliver\s+mri\b",
+    r"\brenal\s+mri\b",
+    r"\bkidney\s+mri\b",
+
+    r"\bpancrea\w*\b.*\bmri\b",
+
+    r"\bprostat\w*\b.*\bmri\b",
+
+    r"\brectal\s+mri\b",
+
+    r"\bpelvi\w*\b.*\bmri\b",
+
+    # ---------------------------------------------------
+    # Gelenke / Orthopädie
+    # ---------------------------------------------------
+
+    r"\bknee\s+mri\b",
+    r"\bshoulder\s+mri\b",
+
+    r"\bhip\s+mri\b",
+
+    r"\bankle\s+mri\b",
+
+    r"\bjoint\s+mri\b",
+
+    # ---------------------------------------------------
+    # Sequenzen MIT Body-Kontext
+    # ---------------------------------------------------
+
+    r"\bspine\b.*\bt1\b",
+    r"\bspine\b.*\bt2\b",
+
+    r"\bprostate\b.*\bt2\b",
+
+    r"\bliver\b.*\bdwi\b",
+
+    r"\bpelvis\b.*\badc\b",
+
+    r"\bcardiac\b.*\bdelayed enhancement\b",
 ]
-
-def interleave_patterns(*pattern_lists):
-    mixed = []
-    for group in zip_longest(*pattern_lists):
-        for pattern in group:
-            if pattern is not None:
-                mixed.append(pattern)
-    return mixed
-# Ich wollte Hirn zusammenfassen und Prostata (auch auf viel Koerper trainiert, hiess aber durch CNN so)
-# Interleave lange Regeln (Kartenmisch-artig) quasi da Reihenfolge jeweiliger Klasse gleich wichtig ist m1 = [a, b] und m2 = [c, d] wird m_hirn = [a, c, b, d]
-MRT_HIRN_RULES_LONG = interleave_patterns(
-    MRT_HIRN_T1_LONG,
-    MRT_HIRN_T2_LONG,
-    MRT_HIRN_FLAIR_LONG,
-    MRT_HIRN_T1_C_LONG,
-)
-MRT_BODY_RULES_LONG = interleave_patterns(
-    MRT_PROSTATA_T1_LONG,
-    MRT_PROSTATA_T2_LONG,
-    MRT_BODY_GENERAL_LONG,
-)
-# Weitere Regeln - lange
 CT_HYBRID_RULES_LONG = [
+    # PET/CT
     r"\bpet\s*/\s*ct\b",
     r"\bpet\s*-\s*ct\b",
     r"\bpetct\b",
-    r"\bfused\s+pet\s*[-/]?\s*ct\b",
-    r"\bhybrid\s+pet\s*[-/]?\s*ct\b",
-    r"\bcombined\s+pet\s*[-/]?\s*ct\b",
-    r"\bco[- ]registered\s+pet\s+(and\s+)?ct\b",
+    r"\bfdg\s*pet\s*/\s*ct\b",
+    r"\bfdg[- ]pet[- ]ct\b",
+    r"\bfused\s+pet\s*/\s*ct\b",
+    r"\bhybrid\s+pet\s*/\s*ct\b",
+    r"\bcombined\s+pet\s*/\s*ct\b",
+    r"\bpet[- ]based\s+ct\b",
+    r"\bpositron emission tomography\b.*\bct\b",
+    # SPECT/CT
     r"\bspect\s*/\s*ct\b",
     r"\bspect\s*-\s*ct\b",
     r"\bspectct\b",
-    r"\bfused\s+spect\s*[-/]?\s*ct\b",
-    r"\bhybrid\s+spect\s*[-/]?\s*ct\b",
-    r"\bcombined\s+spect\s*[-/]?\s*ct\b",
-    r"\bco[- ]registered\s+spect\s+(and\s+)?ct\b",
-    r"\bsingle[- ]photon emission computed tomography\s+(and|with)\s+ct\b",
-    r"\bpositron emission tomography\s+(and|with)\s+computed tomography\b",
+    r"\bfused\s+spect\s*/\s*ct\b",
+    r"\bhybrid\s+spect\s*/\s*ct\b",
+    r"\bsingle[- ]photon emission computed tomography\b.*\bct\b",
+    # Allgemein
+    r"\bmultimodal\b.*\bpet\b.*\bct\b",
+    r"\bco[- ]registered\b.*\bpet\b.*\bct\b",
+    r"\bfusion imaging\b.*\bpet\b.*\bct\b",
 ]
 CT_RULES_LONG = [
-    r"\bct\b",
-    r"\bct scan\b",
     r"\bcomputed tomography\b",
-    r"\bcomputed tomography angiography\b",
-    r"\bcomputed tomograph\w*\b",
+    r"\bct scan\b",
     r"\baxial ct\b",
-    r"\bcta\b",
     r"\bcoronal ct\b",
     r"\bsagittal ct\b",
     r"\bcontrast[- ]enhanced ct\b",
@@ -1236,28 +1272,39 @@ CT_RULES_LONG = [
     r"\bhrct\b",
     r"\bcect\b",
     r"\bhounsfield\b",
+    r"\bcomputed tomography angiography\b",
+    r"\bcta\b",
+    r"\bthoracic ct\b",
+    r"\bchest ct\b",
+    r"\babdominal ct\b",
+    r"\bpelvic ct\b",
+    r"\bwhole[- ]body ct\b",
 ]
 XRAY_ANGIOGRAPHY_RULES_LONG = [
-    r"\bangioplast\w*\b",
-    r"\bangiography\w*\b",
-    r"\bballoon angioplasty\b",
-    r"\bpercutaneous transluminal angioplasty\b",
-    r"\bpta\b",
-    r"\bptca\b",
-    r"\bcoronary angioplasty\b",
-    r"\bstent placement\b",
-    r"\bpercutaneous coronary intervention\b",
-    r"\bpci\b",
+    r"\bangiograph\w*\b",
+    r"\bangioplasty\b",
+    r"\bcoronary angiography\b",
+    r"\bcatheter angiography\b",
+    r"\bdigital subtraction angiography\b",
+    r"\bdsa\b",
     r"\bfluoroscopy\b",
     r"\bfluoroscopic\b",
     r"\bc[- ]arm\b",
     r"\bx[- ]ray guided\b",
+    r"\binterventional radiology\b",
+    r"\bcatheterization\b",
+    r"\bvascular intervention\b",
+    r"\bembolization\b",
+    r"\bcoil embolization\b",
+    r"\bstent placement\b",
+    r"\bpercutaneous coronary intervention\b",
+    r"\bpci\b",
+    r"\bptca\b",
+    r"\bguidewire\b",
+    r"\bcontrast injection\b",
+    r"\bangiographic image\b",
+    r"\broadmap fluoroscopy\b",
     r"\bfluoroscopic guidance\b",
-    r"\breal[- ]time x[- ]ray\b",
-    r"\bangiograph\w*\b",
-    r"\bdigital subtraction angiography\b",
-    r"\bdsa\b",
-    r"\bcatheter angiography\b",
 ]
 XRAY_RULES_LONG = [
     r"\bx[- ]?ray\b",
@@ -1275,19 +1322,20 @@ US_RULES_LONG = [
     r"\bultrasound\b",
     r"\bsonograph\w*\b",
     r"\bultrasonograph\w*\b",
-    r"\bechograph\w*\b",
-    r"\bechocardiograph\w*\b",
-    r"\bultrasonic\b",
     r"\bdoppler\b",
-    r"\bduplex sonograph\w*\b",
-    r"\bendoscopic ultrasound\b",
-    r"\beus\b",
-    r"\bb[- ]mode ultrasound\b",
     r"\bcolor doppler\b",
     r"\bpower doppler\b",
+    r"\bduplex\b",
+    r"\bb[- ]mode\b",
+    r"\bechocardiograph\w*\b",
     r"\btransvaginal\b",
     r"\btransrectal\b",
     r"\btransabdominal\b",
+    r"\bendoscopic ultrasound\b",
+    r"\beus\b",
+    r"\bfetal ultrasound\b",
+    r"\bobstetric ultrasound\b",
+    r"\bcarotid ultrasound\b",
 ]
 #Filter Regeln
 MICROSCOPY_RULES_LONG = [
@@ -1408,18 +1456,22 @@ CHART_RULES_LONG = [
     r"\btimeline\b",
 ]
 LABEL_PRIORITY = {
-    "ct": 100,
+    "ct_kombimodalitaet_spect+ct_pet+ct": 200,
+
+    "xray_fluoroskopie_angiographie": 180,
+
+    "mrt_hirn": 160,
+    "mrt_body": 150,
+
+    "ct": 120,
+    "xray": 100,
     "us": 90,
-    "mrt_hirn": 85,
-    "mrt_body": 80,
-    "xray_fluoroskopie_angiographie": 80,
-    "ct_kombimodalitaet_spect+ct_pet+ct": 70,
-    "xray": 65,
-    "microscopy": 54,
-    "pathology": 50,
-    "surgery_real": 45,
+
+    "microscopy": 50,
+    "pathology": 45,
+    "surgery_real": 40,
     "endoscopy": 35,
-    "chart_or_diagram": 34,
+    "chart_or_diagram": 30,
 }
 # RULES
 RULES_LONG = [
@@ -1715,7 +1767,15 @@ def early_balanced_sampling(ds, per_class, limit=None, early_presample=None):
 
         if rule_pred == "unknown":
             print("Regellabel ist unknown TEXT:", text[:200])
+        # ============================================================
+        # Nur Zielklasse zulassen
+        # ============================================================
 
+        if (
+                TARGET_CLASS_ONLY is not None
+                and rule_pred != TARGET_CLASS_ONLY
+        ):
+            continue
         if len(buckets[rule_pred]) >= per_class:
             continue
 
@@ -1950,98 +2010,59 @@ cnn_mediumfilter, cnn_thresh):
     # =========================
     # RULES
     # =========================
+
     rule_scores = {c: 0.0 for c in FINAL_CLASSES}
+
+    result = {
+        "used_override": False,
+        "override_label": None,
+    }
+
     if r.get("rule_pred") in FINAL_CLASSES:
+
         rule_scores[r["rule_pred"]] = 1.0
         rule_pred = top_label(rule_scores)
-        # Ultraschall wird immer genommen
-        if r.get("rule_pred") == "us":
 
-            final_label = "us"
+        # ====================================================
+        # HARTE OVERRIDES
+        # ====================================================
+
+        OVERRIDE_LABELS = {
+            "us": "rule_us_override",
+            "mrt_body": "rule_mrtbody_override",
+            "mrt_hirn": "rule_mrthirn_override",
+            "ct": "rule_ct_override",
+            "ct_kombimodalitaet_spect+ct_pet+ct":
+                "rule_cthybrid_override",
+            "xray": "rule_xray_override",
+            "xray_fluoroskopie_angiographie":
+                "rule_xrayangio_override",
+        }
+
+        if rule_pred in OVERRIDE_LABELS:
+
+            final_label = rule_pred
             final_conf = 1.0
+
             cnn_conf_final = 1.0
+            cnn_margin = 1.0
 
-            decision_source = "rule_us_override"
-            cnn_pred = "us"
-            cnn_top3 = [("us", 1.0)]
+            cnn_pred = rule_pred
 
-        # Mrt wird immer genommen
-        elif r.get("rule_pred") == "mrt_body":
-            final_label = "mrt_body"
-            final_conf = 1.0
-            cnn_conf_final = 1.0
+            cnn_scores = {
+                rule_pred: 1.0
+            }
 
-            decision_source = "rule_mrtbody_override"
-            cnn_pred = "mrt_body"
-            cnn_top3 = [("mrt_body", 1.0)]
+            cnn_top3 = [
+                (rule_pred, 1.0)
+            ]
 
-        elif r.get("rule_pred") == "mrt_hirn":
-            final_label = "mrt_hirn"
-            final_conf = 1.0
-            cnn_conf_final = 1.0
+            decision_source = OVERRIDE_LABELS[rule_pred]
 
-            decision_source = "rule_mrthirn_override"
-            cnn_pred = "mrt_hirn"
-            cnn_top3 = [("mrt_hirn", 1.0)]
-        else:
-            # ========================================================
-            # CT Regel -> CT/Xray Vergleich, Spezial CNN
-            # ========================================================
-            if r.get("rule_pred") == "ct":
+            result["used_override"] = True
+            result["override_label"] = rule_pred
 
-                ct_top3, ct_scores = predict_with_cnn(
-                    ctx.cnn2,
-                    image,
-                    ctx.transform,
-                    ctx.device,
-                    CNN2_CLASS_NAMES
-                )
 
-                cnn_scores = ct_scores
-                cnn_top3 = ct_top3
-
-                cnn_pred, cnn_conf_final, cnn_margin = get_top_prediction(
-                    cnn_scores
-                )
-
-                # Nur Agreement erlaubt !Rules==CNN!
-                if cnn_pred == "ct":
-
-                    final_label = "ct"
-                    final_conf = cnn_conf_final
-
-                    decision_source = "CONFRM_ct_xray_cnn2"
-
-                else:
-
-                    final_label = "unknown"
-                    final_conf = cnn_conf_final
-
-                    decision_source = "REJCT_ct_xray_cnn2"
-
-            # ========================================================
-            # Normale CNNs
-            # ========================================================
-            else:
-
-                cnn_top3, cnn_full = predict_with_cnn(
-                    ctx.cnn,
-                    image,
-                    ctx.transform,
-                    ctx.device,
-                    CNN_CLASS_NAMES
-                )
-
-                cnn_scores = cnn_full
-
-                cnn_pred, cnn_conf_final, cnn_margin = get_top_prediction(
-                    cnn_scores
-                )
-
-                final_label = cnn_pred
-                final_conf = cnn_conf_final
-
-                decision_source = "cnn"
 
     # =========================
     # CNN3 Filtering + CNN-Uncertainty Filtering
@@ -2139,14 +2160,13 @@ cnn_mediumfilter, cnn_thresh):
 
     cnn_pred_label = final_label
 
-    # CT Spezialfall
-    if decision_source == "CONFRM_ct_xray_cnn2":
+    # Override -> automatisch akzeptieren
+    if result["used_override"]:
+
         agreement_pass = True
 
-    elif decision_source == "REJCT_ct_xray_cnn2":
-        agreement_pass = False
-
     else:
+
         agreement_pass = (
                 rule_pred == cnn_pred_label
                 and cnn_conf_final >= 0.55
@@ -2186,7 +2206,18 @@ cnn_mediumfilter, cnn_thresh):
         )
 
         return r
+    # ============================================================
+    # Nur Zielklasse behalten
+    # ============================================================
 
+    if (
+            TARGET_CLASS_ONLY is not None
+            and final_label != TARGET_CLASS_ONLY
+    ):
+        r["is_filtered"] = True
+        r["filter_reason"] = "not_target_class"
+
+        return r
     r["is_filtered"] = False
 
     r = enrich_debug_fields(
@@ -2608,6 +2639,10 @@ def build_balanced_dataset(
             text, meta = extract_text_from_row(row)
 
             text = normalize_text(text)
+            is_animal, animal_match = contains_animal_terms(text)
+
+            if is_animal:
+                continue
             # Multipanel
             mp = apply_multipanel_ocr_pipeline(text, row)
 
@@ -2696,7 +2731,15 @@ def build_balanced_dataset(
                 continue
 
             label = r.get("final_label")
+            # ============================================================
+            # Nur Zielklasse behalten
+            # ============================================================
 
+            if (
+                    TARGET_CLASS_ONLY is not None
+                    and label != TARGET_CLASS_ONLY
+            ):
+                continue
             # --------------------------------------------
             # Ungültiges Label
             # --------------------------------------------
@@ -3248,13 +3291,13 @@ def parse_args():
     parser.add_argument(
         "--early_presample",
         type=int,
-        default=10000,
+        default=145000,
         help="Nur diese Anzahl Samples in ersten Run (=Phase 2) klassifizieren"
     )
     parser.add_argument(
         "--initial_presample",
         type=int,
-        default=50000,
+        default=145000,
         # default=6000,
         # default=500,
         help="Menge des ersten großes Presample vor Refill"
@@ -3264,7 +3307,7 @@ def parse_args():
         type=int,
         # default=200,
         # default=300,
-        default=25000,
+        default=145000,
         help="Anzahl spätere Nachlade-Chunks Postsample *im* Refill"
     )
     parser.add_argument(
@@ -3289,14 +3332,14 @@ def parse_args():
     parser.add_argument(
         "--cnn3filter",
         type=float,
-        default=0.75,
+        default=0.95,
         help="CNN confidence threshold für sichere Entscheidungen."
     )
     parser.add_argument(
         "--micro_round_failures",
         type=int,
         # default=30,
-        default=500,
+        default=600,
         help="Anzahl erfolgloser Samples bis Micro-Round erhöht wird"
     )
     parser.add_argument(
